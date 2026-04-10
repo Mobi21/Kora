@@ -188,3 +188,6 @@ dashboard/
 # =============================================================================
 
 .worktrees/
+
+# Acceptance test run outputs
+tests/acceptance/output_*/
