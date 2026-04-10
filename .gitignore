@@ -1,0 +1,190 @@
+# =============================================================================
+# Kora .gitignore
+# Pre-public release — covers secrets, PII, dev docs, run artifacts, and caches.
+# =============================================================================
+
+# --- Environments & secrets ---
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+env.bak/
+venv.bak/
+.python-version
+
+# --- Python build / packaging ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+develop-eggs/
+
+# --- Test & lint caches ---
+.pytest_cache/
+.pytest_tmp/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+.hypothesis/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# --- PyInstaller ---
+*.manifest
+*.spec
+
+# --- Installer logs ---
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Tool caches (should never be in repo) ---
+torchinductor_*/
+data-gym-cache/
+
+# --- IDEs and editors ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# --- OS metadata ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+nul
+
+# --- Jupyter / IPython ---
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# --- Translations ---
+*.mo
+*.pot
+
+# =============================================================================
+# Kora runtime data — PII, databases, logs, tokens, memory
+# NEVER commit any of this to a public repo.
+# =============================================================================
+
+# Databases (any location, any extension)
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+*.log
+logs/
+
+# data/ directory — ignore everything sensitive, keep README or similar
+data/
+!data/.gitkeep
+
+# Auto-generated tokens and credentials — NEVER commit
+**/.api_token
+**/.github_token
+**/credentials.json
+**/*.pem
+**/*.key
+**/id_rsa*
+**/id_ed25519*
+**/*.p12
+**/*.pfx
+
+# User model and memory data
+_KoraMemory/
+data_backup_*/
+
+# User profile config (has real PII when populated)
+user_profile.yaml
+data/user_profile.yaml
+
+# =============================================================================
+# Test leak artifacts
+# =============================================================================
+
+# pytest tmp dirs
+pytest-of-*/
+pytest-tmp-*/
+
+# Leaked mock artifacts (aiosqlite/MagicMock repr as filename)
+<AsyncMock*
+<MagicMock*
+MagicMock/
+
+# Acceptance test sandbox (local test data, vault, databases)
+tests/acceptance/.sandbox/
+
+# =============================================================================
+# Development documentation — local only, not shipped in the public repo
+# Keep these files on disk for your own reference; they don't belong in public.
+# =============================================================================
+
+Documentation/
+docs/
+notes/
+_dev/
+.dev/
+
+# Superpowers plans and caches
+.claude/
+!.claude/settings.local.json.example
+
+# =============================================================================
+# Experimental / orphan code not yet ready for public
+# =============================================================================
+
+src/
+dashboard/
+
+# =============================================================================
+# Local git history backup (from pre-public cleanup)
+# =============================================================================
+
+.git.old/
+.git.backup/
+
+# =============================================================================
+# Git worktrees
+# =============================================================================
+
+.worktrees/

@@ -1,0 +1,77 @@
+name: life_management
+display_name: "Life Management (ADHD Tools)"
+
+tools:
+  - log_medication
+  - log_meal
+  - create_reminder
+  - query_reminders
+  - query_medications
+  - query_meals
+  - query_focus_blocks
+  - quick_note
+  - start_focus_block
+  - end_focus_block
+
+discovery_tools: []
+
+guidance: |
+  ## Life Management Tools
+
+  You have ADHD-focused life management tools:
+  - **Medication**: log_medication — log when meds are taken;
+    query_medications — answer "did I take X?" or "when did I last take X?"
+  - **Nutrition**: log_meal — log meals and food intake;
+    query_meals — answer "did I eat today?" or "what have I eaten?"
+  - **Focus**: start_focus_block, end_focus_block — track focus sessions;
+    query_focus_blocks — check if a block is running or review recent work
+  - **Quick capture**: quick_note — use immediately when the user says "note: X" or similar
+  - **Reminders**: create_reminder, query_reminders for specific scheduled nudges and check-ins
+
+  When the user asks about past meds/meals/focus work, always use the matching
+  query_* tool rather than guessing from conversation memory. The write tools
+  (log_*) and the read tools (query_*) share the same tables — querying always
+  reflects reality.
+
+  Proactively offer to log when you detect trackable data (meds taken, money spent,
+  meals eaten, focus sessions). Only when there's clear data -- don't force it.
+  After a successful log, do not log the same event again in the same turn unless the
+  user adds new details or corrects the original event.
+
+  For one-off scheduled reminders or timed check-ins, use create_reminder.
+  For repeating habits, use create_reminder with a note about recurrence.
+  Prefer reasonable defaults from the user's stated
+  routine over repeated time checks. If you need the current time, check it once
+  and then act; do not loop on time queries.
+
+  If the user says to keep life support "in the same loop" as planning, or says
+  they forget lunch / lose focus after context switching, that is a cue to create
+  the reminder/routine support now rather than storing the information as memory.
+
+  **Activation examples (DO log — real events that just happened):**
+  - "I just took my Vyvanse" -> log_medication immediately
+  - "Took my adderall 20mg" (past tense, recent) -> log_medication immediately
+  - "I had a sandwich for lunch" -> log_meal immediately
+  - "Let's do a focus session" -> start_focus_block
+  - "Remind me at 3 PM to take a break" -> create_reminder
+
+  **DO NOT log habit or routine statements.** These describe what the user
+  *usually* does, not what they *just did*. Logging them creates false records.
+  - "I usually take melatonin at night" -> routine, NOT a dose event
+  - "I take adderall every morning" -> routine, NOT a dose event
+  - "My meds are 20mg adderall and 3mg melatonin" -> medication list, NOT doses
+  - "I always have coffee for breakfast" -> routine, NOT a meal event
+  - "I take X daily" / "I typically take X" / "My routine is X" -> all routine
+
+  A loggable event has PAST-TENSE, RECENT phrasing:
+  - "just took", "just had", "took ... five minutes ago", "finished eating",
+    "had ... for lunch", "grabbed ...", "did my meds".
+
+  If a statement is ambiguous (e.g. "I'm going to take my meds"), do NOT log.
+  Wait for the user to confirm the action happened, or ask briefly:
+  "did you just take it, or is that your plan?" before calling log_medication.
+
+  **One rule above all: never tell the user you logged something unless you
+  actually called the log tool in the same turn.** Do not write "✅ logged your
+  adderall" in prose without a corresponding tool call — that is a lie and
+  breaks trust. If the tool isn't available or auth is denied, say so.

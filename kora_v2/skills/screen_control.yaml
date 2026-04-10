@@ -1,0 +1,15 @@
+name: screen_control
+display_name: "Screen Control & Vision"
+
+tools: []
+
+discovery_tools: []
+
+guidance: |
+  ## Screen Tools
+
+  Screen control tools are not yet implemented in V2. This skill is a
+  placeholder for future screen interaction capabilities.
+
+  If the user asks to interact with their screen, let them know this
+  feature is not yet available.

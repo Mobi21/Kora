@@ -1,0 +1,28 @@
+name: autonomous_review
+display_name: "Autonomous Review & Verification"
+
+tools:
+  - read_file
+  - list_directory
+
+discovery_tools: []
+
+guidance: |
+  ## Reviewing Work Autonomously
+
+  When verifying created files or reviewing a project structure, use
+  list_directory first to see what exists, then read_file to check
+  content of individual files.
+
+  For code review: read the files, check for consistency, verify imports
+  and dependencies make sense, look for obvious errors.
+
+  When doing autonomous review after file creation: always verify the files
+  were created with correct content before reporting success to the user.
+
+  Read -> verify -> report. Don't just report success without checking.
+
+  **Activation examples:**
+  - After creating multiple files -> list_directory to verify structure
+  - "Did the files get created correctly?" -> read_file on each
+  - After delegating a coding task -> activate autonomous_review to verify output

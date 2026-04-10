@@ -1,0 +1,34 @@
+name: web_research
+display_name: "Web Research & Browsing"
+
+tools:
+  - search_web
+  - fetch_url
+
+discovery_tools: []
+
+guidance: |
+  ## Web Tools
+
+  You have web access via two tools:
+
+  **search_web**: Finding information, current events, research. Returns search
+  result snippets with titles and URLs.
+  **fetch_url**: Reading web pages — fetches text content from a URL. Use after
+  search_web to read full articles or pages.
+
+  **When to use which:**
+  - Finding information → search_web first, then fetch_url to read results
+  - Reading a specific URL → fetch_url directly
+
+  **Privacy rules — NEVER do these without the user doing it themselves:**
+  - Enter passwords or login credentials
+  - Enter payment/financial information
+  - Accept terms of service or legal agreements
+  - Post content publicly on behalf of the user
+  - Download files without explicit permission
+
+  **Activation examples:**
+  - "What's the latest on LangGraph?" -> search_web first, then fetch_url
+  - "Read this URL for me: ..." -> fetch_url
+  - "Find Python async best practices" -> search_web

@@ -1,0 +1,53 @@
+name: file_creation
+display_name: "File Creation & Management"
+
+tools:
+  - write_file
+  - create_directory
+  - read_file
+  - list_directory
+  - file_exists
+
+discovery_tools: []
+
+guidance: |
+  ## Working with Files
+
+  Always read existing files before modifying them — never overwrite blindly.
+
+  Create directories before writing files to them. Use create_directory
+  first, then write_file.
+
+  Use relative paths from the project root when possible. Check
+  list_directory to see what exists in a directory.
+
+  When building multi-file projects: plan the structure first, then create
+  files systematically. Use list_directory to verify structure.
+
+  Read files before editing to preserve existing content. For large edits,
+  read -> modify in memory -> write the complete new version.
+
+  ## Enumerate before summarizing
+
+  Before producing any status summary, weekly review, project recap, or
+  other "comprehensive" answer that might reference files you wrote
+  earlier: **always call list_directory on the relevant working
+  directories first**, then read the files you find.
+
+  Synthesizing a review from conversation memory alone is unreliable —
+  conversations compact and daemon restarts wipe in-session context, but
+  files on disk don't lie. If the user asks "what did we do?" or "give
+  me a status", the correct sequence is:
+
+      list_directory(path="/tmp")   # or the project's working dir
+      read_file(path=each_relevant_file)
+      ... then write the summary
+
+  Never claim a file doesn't exist without first listing the directory.
+  Never say "I only have data on one project" before enumerating.
+
+  **Activation examples:**
+  - "Create a Python script that..." -> file_creation for simple self-contained scripts
+  - "Build this config file structure" -> create_directory then write_file
+  - Small single-file edits -> file_creation (use code_work for multi-file)
+  - "Give me a status / weekly review" -> list_directory first, then summarize

@@ -1,0 +1,30 @@
+name: project_planning
+display_name: "Project Planning & Task Management"
+
+tools:
+  - create_reminder
+  - query_reminders
+
+discovery_tools: []
+
+guidance: |
+  ## Project Planning & Task Management
+
+  Use create_reminder for one-off scheduled reminders or timed check-ins.
+  Use query_reminders to list existing reminders and their status.
+
+  If the user says they want actual structure inside Kora, do the writes now:
+  create the reminder in the same turn instead of only discussing options or
+  asking whether they want it created.
+
+  If the user already gave enough detail for a reminder setup, make the first
+  pass immediately. Only ask a follow-up if a missing decision genuinely blocks
+  the next write.
+
+  For complex multi-step work, use dispatch_worker to delegate to specialized
+  worker agents (planner, executor, reviewer).
+
+  **Activation examples:**
+  - "Remind me at 3 PM to take lunch" -> create_reminder
+  - "What reminders do I have?" -> query_reminders
+  - "I want to build a portfolio website" -> dispatch_worker with planner

@@ -1,0 +1,105 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kora-v2"
+version = "2.0.0a1"
+description = "An autonomous AI companion with genuine personality, emotional states, and comprehensive memory"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.12"
+authors = [
+    {name = "Kora Team"}
+]
+keywords = ["ai", "companion", "llm", "local-first", "memory"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "pydantic~=2.12.5",
+    "pydantic-settings~=2.13.0",
+    "python-dotenv~=1.0.1",
+    "aiosqlite~=0.22.1",
+    "anthropic~=0.83.0",
+    "sentence-transformers>=3.0.0,<4.0",
+    "einops>=0.7.0",
+    "tiktoken~=0.8.0",
+    "httpx~=0.28.0",
+    "rich>=13.0,<14.0",
+    "langgraph~=1.0.9",
+    "langgraph-checkpoint-sqlite>=3.0.0,<4.0.0",
+    "structlog~=25.1.0",
+    "sqlite-vec~=0.1.6",
+    "pysqlite3-binary~=0.6.0",
+    "fastapi>=0.100.0,<1.0",
+    "uvicorn[standard]>=0.20.0,<1.0",
+    "mcp>=1.26.0",
+    "PyYAML>=6.0",
+    "watchdog>=4.0.0,<7.0.0",
+    "websockets>=12.0,<16.0",
+    "pystray>=0.19.0",
+    "Pillow>=10.0.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+screen = [
+    "pyautogui>=0.9.54",
+    "rapidocr-onnxruntime>=1.3.0",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-AppKit>=10.0; sys_platform == 'darwin'",
+    "pywinauto>=0.6.8; sys_platform == 'win32'",
+]
+dev = [
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.23.0,<1.0",
+    "ruff>=0.9.0",
+    "mypy>=1.13.0",
+]
+
+[project.scripts]
+kora = "kora_v2.daemon.launcher:main"
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/kora"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kora_v2*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+markers = [
+    "slow: marks tests as slow",
+    "integration: marks tests as integration tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["kora_v2"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

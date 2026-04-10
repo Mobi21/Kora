@@ -1,0 +1,26 @@
+name: code_work
+display_name: "Code & Development Work"
+
+tools:
+  - read_file
+  - list_directory
+  - write_file
+
+discovery_tools: []
+
+guidance: |
+  ## Code & Development Work
+
+  For code work, use read_file to inspect existing files and list_directory
+  to understand project structure before making changes.
+
+  Use write_file to create or update code files. Always read before writing
+  to avoid overwriting existing content.
+
+  For complex multi-step tasks, use dispatch_worker to delegate to a
+  specialized worker agent (planner, executor, reviewer).
+
+  **Activation examples:**
+  - "Read the supervisor code" -> read_file on the relevant module
+  - "What files are in the tools directory?" -> list_directory
+  - "Create a new utility module" -> write_file after checking structure

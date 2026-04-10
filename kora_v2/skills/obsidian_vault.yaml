@@ -1,0 +1,15 @@
+name: obsidian_vault
+display_name: "Obsidian Vault"
+
+tools: []
+
+discovery_tools: []
+
+guidance: |
+  ## Obsidian Vault
+
+  Obsidian vault tools are not yet implemented in V2. This skill is a
+  placeholder for future vault integration.
+
+  The vault concept maps to Kora's memory system. Use recall to search
+  across memory layers for stored knowledge and facts.
