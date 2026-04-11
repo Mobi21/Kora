@@ -161,6 +161,7 @@ tests/acceptance/.sandbox/
 
 Documentation/
 docs/
+!docs/phase9/
 notes/
 _dev/
 .dev/
