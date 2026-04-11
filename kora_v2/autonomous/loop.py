@@ -22,6 +22,20 @@ Usage::
     task = asyncio.create_task(loop.run())
     # Later, from the main conversation thread:
     loop.request_interruption()
+
+Synchronous-write hedge
+-----------------------
+
+The main conversation may write a deliverable file *synchronously* while
+this background loop is still producing its own version of the same
+artifact. This is intentional — ADHD users cannot afford a multi-minute
+wait with no visible output, so the foreground path hedges with a
+best-effort draft and discloses that the background loop is still
+running. When the loop's own execute_step writes the same path, it MUST
+NOT clobber an existing file; execute_step and its worker dispatch are
+expected to honor ``merge_strategy="keep_existing"`` semantics by
+reading before writing. A future refactor that removes the foreground
+hedge must also document the user-facing wait behavior it replaces.
 """
 from __future__ import annotations
 

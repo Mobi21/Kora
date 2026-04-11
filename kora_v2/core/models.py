@@ -4,10 +4,27 @@ These models are the data contracts between the supervisor, workers,
 tools, and infrastructure. All typed, all validated.
 """
 
+import json
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
+
+
+def _coerce_to_list(value: Any) -> Any:
+    # Executor LLMs occasionally return list-valued fields as a JSON-encoded
+    # string (``"[{...}]"``) instead of a real array. Coerce once here so a
+    # single repair retry does not turn into a full re-prompt round-trip.
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return value
+            if isinstance(parsed, list):
+                return parsed
+    return value
 
 # --- Emotion & Energy ---
 
@@ -175,8 +192,14 @@ class ExecutionInput(BaseModel):
 
 class ExecutionOutput(BaseModel):
     result: str
-    tool_calls_made: list[ToolCallRecord] = []
-    artifacts: list[Artifact] = []
+    tool_calls_made: Annotated[
+        list[ToolCallRecord],
+        BeforeValidator(_coerce_to_list),
+    ] = []
+    artifacts: Annotated[
+        list[Artifact],
+        BeforeValidator(_coerce_to_list),
+    ] = []
     success: bool
     confidence: float = Field(ge=0.0, le=1.0)
     error: str | None = None

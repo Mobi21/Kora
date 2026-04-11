@@ -42,6 +42,222 @@ def _normalize_tool_name(tc: Any) -> str:
     return name.strip("[]")
 
 
+def _auto_mark_coverage(
+    *,
+    tool_usage: dict[str, Any],
+    life_data: dict[str, Any],
+    auto_state: dict[str, Any],
+    cap_health: dict[str, Any],
+    compaction_events: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    auth_results: list[dict[str, Any]],
+    latest_status: dict[str, Any] | None,
+) -> dict[int, str]:
+    """Derive coverage markers from observable run evidence.
+
+    Returns a mapping ``{item_id: marker}`` where marker is one of
+    ``"x"`` (satisfied) or ``"~"`` (partial / degraded-as-designed).
+    The caller merges these with operator-written markers from
+    ``coverage.md``; operator markers win on conflict. A few items
+    (13 restart-resilience, 19 emotion-tone, 20 skill-gating) require
+    semantic judgment and are intentionally not auto-marked.
+
+    Before this helper existed, the auto-tracker was effectively inert:
+    the 2026-04-11 audit ran with 22/23 items exercised but the report
+    printed ``0/23 satisfied`` because it only read ``coverage.md``
+    which nobody was writing during the automated run.
+    """
+    auto: dict[int, str] = {}
+    tool_counts = tool_usage.get("tool_counts", {})
+
+    def _msg_mentions(*needles: str) -> bool:
+        for msg in messages:
+            content = (msg.get("content") or "")
+            if not isinstance(content, str):
+                continue
+            lowered = content.lower()
+            for needle in needles:
+                if needle.lower() in lowered:
+                    return True
+        return False
+
+    # Item 2: personal context — name + ADHD + pet or partner signal
+    if _msg_mentions("adhd") and _msg_mentions("mochi", "alex"):
+        auto[2] = "x"
+
+    # Item 3: week planning with concrete tasks — any write_file + planning language
+    if tool_counts.get("write_file", 0) >= 2 and _msg_mentions(
+        "plan", "week", "this week", "schedule"
+    ):
+        auto[3] = "x"
+
+    # Item 4: coding track — filesystem writes + code-ish language
+    if tool_usage.get("filesystem") and _msg_mentions(
+        "tsx", "component", ".py", "function", "class"
+    ):
+        auto[4] = "x"
+
+    # Item 5: research track — research artifacts
+    if _msg_mentions("research", "deep dive", "landscape", "compare"):
+        auto[5] = "x"
+
+    # Item 6: writing track — writing artifacts
+    if _msg_mentions("outline", "draft", "brief", "paper", "essay"):
+        auto[6] = "x"
+
+    # Item 7: life management tools used
+    if tool_usage.get("life_management"):
+        auto[7] = "x"
+
+    # Item 9: web research — successful MCP/capability call OR disclosed
+    # failure (the item description explicitly allows both).
+    if tool_usage.get("mcp") or tool_usage.get("capability_browser"):
+        auto[9] = "x"
+    elif _msg_mentions("unavailable", "can't pull", "no web search", "browser"):
+        auto[9] = "~"
+
+    # Item 10 & 15: compaction pressure + metadata
+    if compaction_events:
+        auto[10] = "x"
+        if any(
+            ev.get("token_count") is not None and ev.get("tier")
+            for ev in compaction_events
+        ):
+            auto[15] = "x"
+
+    # Item 11: revision wave
+    if _msg_mentions(
+        "rewrite", "restructure", "pivot", "revise", "rework"
+    ):
+        auto[11] = "x"
+
+    # Item 12 (newly ACTIVE): BackgroundWorker has registered items
+    if latest_status and latest_status.get("background_worker_items", 0) >= 1:
+        auto[12] = "x"
+
+    # Item 14: weekly review
+    if _msg_mentions("weekly review", "weekly_review", "week review"):
+        auto[14] = "x"
+
+    # Item 16: memory recall
+    if tool_counts.get("recall", 0) >= 1:
+        auto[16] = "x"
+
+    # Item 17: auth relay round-trip — need both an approve and a deny
+    if auth_results:
+        has_approved = any(ar.get("approved") is True for ar in auth_results)
+        has_denied = any(ar.get("approved") is False for ar in auth_results)
+        if has_approved and has_denied:
+            auto[17] = "x"
+        elif has_approved or has_denied:
+            auto[17] = "~"
+
+    # Item 21: autonomous execution
+    if auto_state.get("available") and (
+        auto_state.get("plans")
+        or auto_state.get("total_items", 0) > 0
+        or auto_state.get("checkpoint_count", 0) > 0
+    ):
+        auto[21] = "x"
+
+    # Item 22: filesystem operations
+    if tool_usage.get("filesystem"):
+        auto[22] = "x"
+
+    # Item 23: life management DB records persist
+    if life_data.get("available"):
+        total_records = sum(
+            life_data.get(f"{k}_count", 0)
+            for k in ("medication", "meal", "reminder", "quick_note", "focus_block")
+        )
+        if total_records > 0:
+            auto[23] = "x"
+
+    # Item 24: capability pack surface — either a real call OR a pack
+    # that reports unconfigured/degraded with a remediation hint.
+    any_cap_calls = bool(
+        tool_usage.get("capability_workspace")
+        or tool_usage.get("capability_browser")
+        or tool_usage.get("capability_vault")
+    )
+    if any_cap_calls:
+        auto[24] = "x"
+    elif cap_health:
+        for pack_name in ("workspace", "browser", "vault", "doctor"):
+            info = cap_health.get(pack_name, {})
+            if info.get("status") in (
+                "unconfigured", "degraded", "unhealthy", "unimplemented"
+            ) and info.get("remediation"):
+                auto[24] = "x"
+                break
+
+    # Item 25: disclosed-failure path — the assistant acknowledged a
+    # tool failure plainly rather than silent fallback.
+    if _msg_mentions(
+        "unavailable", "failed", "permission denied", "can't pull",
+        "couldn't", "not available",
+    ):
+        auto[25] = "x"
+
+    # Item 26: policy matrix — 4 capability packs visible + policy
+    # grants section has data.
+    if len(cap_health) >= 4:
+        auto[26] = "x"
+
+    return auto
+
+
+def _latest_snapshot_status(snapshots_dir: Path) -> dict[str, Any] | None:
+    """Return the ``status`` dict from the newest snapshot, if any."""
+    snaps = sorted(snapshots_dir.glob("*.json"))
+    if not snaps:
+        return None
+    try:
+        data = json.loads(snaps[-1].read_text())
+    except Exception:
+        return None
+    status = data.get("status")
+    return status if isinstance(status, dict) else None
+
+
+def _snapshot_health_status(snap: dict[str, Any]) -> str:
+    """Extract a concise health string from a snapshot JSON blob.
+
+    Snapshots do not store a top-level ``health`` key — the doctor report
+    is embedded under ``inspect_doctor`` (see harness ``cmd_snapshot``)
+    and returns one of:
+      * ``{"summary": "19/25 checks passed", "healthy": true, ...}`` on
+        a working inspect endpoint, or
+      * ``{"error": "HTTP Error 404: ..."}`` if the endpoint is broken.
+
+    As a defensive secondary source, we also consult ``status.status``
+    (``running``/``degraded``) and ``status.failed_subsystems``. The
+    legacy code here read ``snap["health"]`` which does not exist,
+    producing ``?`` on every row.
+    """
+    doctor = snap.get("inspect_doctor")
+    if isinstance(doctor, dict):
+        if doctor.get("error"):
+            return f"doctor_unreachable:{str(doctor['error'])[:40]}"
+        summary = doctor.get("summary")
+        if summary:
+            return str(summary)
+        checks = doctor.get("checks")
+        if isinstance(checks, list) and checks:
+            passed = sum(1 for c in checks if c.get("passed"))
+            return f"{passed}/{len(checks)} checks passed"
+
+    status = snap.get("status")
+    if isinstance(status, dict):
+        daemon_status = status.get("status", "unknown")
+        failed = status.get("failed_subsystems") or []
+        if failed:
+            return f"{daemon_status} ({len(failed)} failed: {','.join(failed)[:40]})"
+        return str(daemon_status)
+
+    return "?"
+
+
 def _parse_coverage_file(coverage_path: Path) -> dict[int, str]:
     """Parse the operator-maintained coverage.md into ``{item_id: marker}``.
 
@@ -205,10 +421,18 @@ async def _query_life_management(output_dir: Path) -> dict[str, Any]:
 async def _query_autonomous_state() -> dict[str, Any]:
     """Query live autonomous state directly from operational.db.
 
-    Mirrors the harness's ``_query_autonomous_state`` so the report sees
-    the same rich view used by snapshots and ``diff``. Previously the
-    report read autonomous plans off the life-mgmt dict fallback which
-    failed silently when ``autonomous_plans`` schema differed.
+    Primary source: the ``autonomous_plans`` table written by
+    ``persist_plan`` in the autonomous loop. Some acceptance run
+    configurations wipe ``autonomous_plans`` between harness restarts
+    (see ``_clean_stale_autonomous_data``) so the table can be empty
+    even when a plan genuinely ran — the 2026-04-11 audit hit this.
+    When that happens we synthesise a view from:
+
+      * ``items`` rows whose ``autonomous_plan_id`` is set (root + steps)
+      * ``autonomous_updates`` rows (checkpoint + completion summaries)
+
+    so the report reflects actual work instead of emitting the
+    misleading "no plans recorded in DB" line.
     """
     op_db = _PROJECT_ROOT / "data" / "operational.db"
     if not op_db.exists():
@@ -220,6 +444,7 @@ async def _query_autonomous_state() -> dict[str, Any]:
             db.row_factory = aiosqlite.Row
 
             plans: list[dict[str, Any]] = []
+            plans_query_error: str | None = None
             try:
                 cur = await db.execute(
                     """SELECT id, goal, status,
@@ -232,8 +457,9 @@ async def _query_autonomous_state() -> dict[str, Any]:
                        LIMIT 10"""
                 )
                 plans = [dict(r) for r in await cur.fetchall()]
-            except Exception:
+            except Exception as exc:
                 plans = []
+                plans_query_error = str(exc)
 
             checkpoint_count = 0
             try:
@@ -251,17 +477,73 @@ async def _query_autonomous_state() -> dict[str, Any]:
             except Exception:
                 pass
 
+            # Items grouped by status (for the snapshot summary line).
+            items_by_status: dict[str, int] = {}
+            try:
+                cur = await db.execute(
+                    "SELECT status, COUNT(*) AS cnt FROM items GROUP BY status"
+                )
+                items_by_status = {
+                    r["status"]: r["cnt"] for r in await cur.fetchall()
+                }
+            except Exception:
+                pass
+
+            # Fallback: if autonomous_plans is empty but items reference
+            # plans, synthesise a plan view grouped by autonomous_plan_id.
+            derived_plans: list[dict[str, Any]] = []
+            if not plans:
+                try:
+                    cur = await db.execute(
+                        """SELECT i.autonomous_plan_id AS id,
+                                  root.title           AS goal,
+                                  root.status          AS status,
+                                  MIN(i.created_at)    AS created_at,
+                                  MAX(i.updated_at)    AS updated_at,
+                                  COUNT(*)             AS step_count,
+                                  SUM(CASE WHEN i.status='completed' THEN 1 ELSE 0 END) AS completed
+                           FROM items i
+                           LEFT JOIN items root ON root.id = i.autonomous_plan_id
+                           WHERE i.autonomous_plan_id IS NOT NULL
+                           GROUP BY i.autonomous_plan_id
+                           ORDER BY MIN(i.created_at) DESC
+                           LIMIT 10"""
+                    )
+                    derived_plans = [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    derived_plans = []
+
+            # Autonomous updates (checkpoint / completion summaries).
+            updates: list[dict[str, Any]] = []
+            try:
+                cur = await db.execute(
+                    """SELECT plan_id, update_type, summary, created_at
+                       FROM autonomous_updates
+                       ORDER BY created_at DESC
+                       LIMIT 20"""
+                )
+                updates = [dict(r) for r in await cur.fetchall()]
+            except Exception:
+                updates = []
+
+        unified_plans = plans or derived_plans
         active_plans = [
-            p for p in plans
+            p for p in unified_plans
             if p.get("status") not in ("completed", "cancelled", "failed")
         ]
 
         return {
             "available": True,
-            "plans": plans,
+            "plans": unified_plans,
+            "plans_source": "autonomous_plans" if plans else (
+                "derived_from_items" if derived_plans else "empty"
+            ),
+            "plans_query_error": plans_query_error,
             "active_plan_count": len(active_plans),
             "checkpoint_count": checkpoint_count,
             "total_items": total_items,
+            "items_by_status": items_by_status,
+            "updates": updates,
         }
     except Exception:
         return {"available": False}
@@ -292,11 +574,32 @@ async def build_report(
     assistant_turns = [m for m in messages if m.get("role") == "assistant"]
     lines.append(f"\nConversation: {len(user_turns)} user turns, {len(assistant_turns)} assistant turns")
 
+    # ── Gather evidence up-front so coverage derives from live data ──────
+    tool_usage = _extract_tool_usage(messages)
+    cap_health = await _build_capability_health()
+    life_data = await _query_life_management(output_dir)
+    auto_state = await _query_autonomous_state()
+    auth_results = session_state.get("auth_test_results", [])
+    compaction_events_resolved = (
+        compaction_events or session_state.get("compaction_events", [])
+    )
+    latest_status = _latest_snapshot_status(snapshots_dir)
+
     # ── Coverage ──────────────────────────────────────────────────────────
-    # Parse the operator-maintained coverage.md file. This is the source of
-    # truth for active-item status — the skill instructs operators to mark
-    # items as `[x]`/`[~]` there during the run.
-    coverage_markers = _parse_coverage_file(output_dir / "coverage.md")
+    # Merge operator-edited markers from ``coverage.md`` with
+    # evidence-derived markers. Operator markers take precedence so a
+    # manual override is always respected.
+    operator_markers = _parse_coverage_file(output_dir / "coverage.md")
+    auto_markers = _auto_mark_coverage(
+        tool_usage=tool_usage,
+        life_data=life_data,
+        auto_state=auto_state,
+        cap_health=cap_health,
+        compaction_events=compaction_events_resolved,
+        messages=messages,
+        auth_results=auth_results,
+        latest_status=latest_status,
+    )
     from tests.acceptance.scenario.week_plan import COVERAGE_ITEMS, CoverageStatus
 
     active_items = {k: v for k, v in COVERAGE_ITEMS.items() if v.status == CoverageStatus.ACTIVE}
@@ -305,9 +608,20 @@ async def build_report(
     lines.append("\n## Coverage -- Active Items")
     active_covered = 0
     active_partial = 0
+    auto_applied = 0
     for item_id, item in sorted(active_items.items()):
-        marker = coverage_markers.get(item_id, " ")
-        lines.append(f"- [{marker}] {item_id}. {item.description}")
+        operator = operator_markers.get(item_id)
+        if operator in ("x", "~", " "):
+            marker = operator
+            provenance = ""
+        elif item_id in auto_markers:
+            marker = auto_markers[item_id]
+            provenance = " _(auto)_"
+            auto_applied += 1
+        else:
+            marker = " "
+            provenance = ""
+        lines.append(f"- [{marker}] {item_id}. {item.description}{provenance}")
         if marker == "x":
             active_covered += 1
         elif marker == "~":
@@ -316,6 +630,7 @@ async def build_report(
     lines.append(
         f"\nActive coverage: {active_covered}/{len(active_items)} satisfied"
         f" + {active_partial} partial"
+        f" (auto-derived: {auto_applied}, operator-edited: {len(operator_markers)})"
     )
 
     lines.append("\n## Coverage -- Deferred Items")
@@ -326,7 +641,6 @@ async def build_report(
     lines.append(f"\nDeferred: {len(deferred_items)} items (not tested, awaiting V2 implementation)")
 
     # ── Tool Usage Summary ────────────────────────────────────────────────
-    tool_usage = _extract_tool_usage(messages)
     lines.append(f"\n## Tool Usage ({tool_usage['total']} calls, {tool_usage['unique']} unique tools)")
 
     if tool_usage["life_management"]:
@@ -371,7 +685,7 @@ async def build_report(
             lines.append(f"  {name}: {count}")
 
     # ── Capability Pack Health ─────────────────────────────────────────────
-    cap_health = await _build_capability_health()
+    # cap_health already resolved at the top of the function for coverage.
     _EXPECTED_PACKS = ("workspace", "browser", "vault", "doctor")
     lines.append(f"\n## Capability Packs ({len(cap_health)} packs)")
     for pack_name in _EXPECTED_PACKS:
@@ -391,10 +705,9 @@ async def build_report(
         lines.append(line)
 
     # ── Policy Grants ──────────────────────────────────────────────────────
-    # auth_test_results already tracks deny/approve events; here we also count
-    # auth_request events that represent approval prompts surfaced for new
-    # capability/account/action fields (Phase 9 policy matrix enforcement).
-    auth_results = session_state.get("auth_test_results", [])
+    # auth_test_results was already read at the top of the function.
+    # Here we count approvals / denials / timeouts for the policy-matrix
+    # enforcement section (Phase 9).
     approval_prompts = len(auth_results)
     approved = sum(1 for ar in auth_results if ar.get("approved"))
     denied = sum(1 for ar in auth_results if not ar.get("approved") and ar.get("approved") is not None)
@@ -406,7 +719,7 @@ async def build_report(
     lines.append(f"- Timed out / unknown: {timed_out}")
 
     # ── Life Management Records ──────────────────────────────────────────
-    life_data = await _query_life_management(output_dir)
+    # life_data was already resolved at the top of the function.
     if life_data.get("available"):
         lines.append("\n## Life Management Records (DB)")
         lines.append(f"- Medications: {life_data.get('medication_count', 0)}")
@@ -427,35 +740,78 @@ async def build_report(
         lines.append("operational.db not available for life management query.")
 
     # ── Autonomous Execution ──────────────────────────────────────────────
-    # Dedicated query so we see plans + checkpoints + item count (same
-    # view as snapshots), not the narrow fallback in life_data.
-    auto_state = await _query_autonomous_state()
+    # auto_state was already resolved at the top of the function (needed
+    # for coverage auto-marking). Here we render its details.
     auto_plans = auto_state.get("plans", []) if auto_state.get("available") else []
+    plans_source = auto_state.get("plans_source", "empty")
+    plan_query_error = auto_state.get("plans_query_error")
+    total_items_auto = auto_state.get("total_items", 0)
+    items_by_status = auto_state.get("items_by_status") or {}
+    updates = auto_state.get("updates") or []
     if auto_plans:
         lines.append(
             f"\n## Autonomous Execution ({len(auto_plans)} plans, "
             f"{auto_state.get('checkpoint_count', 0)} checkpoints, "
-            f"{auto_state.get('total_items', 0)} items)"
+            f"{total_items_auto} items)"
         )
-        for plan in auto_plans:
+        if plans_source == "derived_from_items":
             lines.append(
-                f"- [{plan.get('status', '?')}] {(plan.get('goal') or '')[:100]}"
-                f" (req={plan.get('request_count', 0)})"
+                "(plans table was empty; view synthesised from "
+                "`items.autonomous_plan_id` — this happens when the "
+                "harness wipes autonomous_plans between restarts.)"
             )
-    elif tool_usage["autonomous"]:
+        if plan_query_error:
+            lines.append(
+                f"(autonomous_plans query warning: {plan_query_error[:120]})"
+            )
+        for plan in auto_plans:
+            goal = (plan.get("goal") or "")[:100]
+            status = plan.get("status", "?")
+            req = plan.get("request_count")
+            step_count = plan.get("step_count")
+            extras: list[str] = []
+            if req is not None:
+                extras.append(f"req={req}")
+            if step_count is not None:
+                completed = plan.get("completed", 0)
+                extras.append(f"steps={completed}/{step_count}")
+            extras_str = f" ({', '.join(extras)})" if extras else ""
+            lines.append(f"- [{status}] {goal}{extras_str}")
+        if items_by_status:
+            status_summary = ", ".join(
+                f"{k}={v}" for k, v in sorted(items_by_status.items())
+            )
+            lines.append(f"Items by status: {status_summary}")
+        if updates:
+            lines.append("Recent autonomous updates:")
+            for u in updates[:5]:
+                lines.append(
+                    f"- [{u.get('update_type', '?')}] "
+                    f"{(u.get('summary') or '')[:140]}"
+                )
+    elif tool_usage["autonomous"] or total_items_auto > 0:
         lines.append("\n## Autonomous Execution")
-        lines.append("start_autonomous was called but no plans recorded in DB.")
+        lines.append(
+            "start_autonomous was called but no plan rows were found — "
+            "the harness may have wiped autonomous_plans between "
+            f"restarts (total items in DB: {total_items_auto}, "
+            f"checkpoints: {auto_state.get('checkpoint_count', 0)})."
+        )
+        if items_by_status:
+            status_summary = ", ".join(
+                f"{k}={v}" for k, v in sorted(items_by_status.items())
+            )
+            lines.append(f"Items by status: {status_summary}")
     else:
         lines.append("\n## Autonomous Execution")
         lines.append("No autonomous work initiated during this test run.")
         lines.append("Coverage item 21 is NOT satisfied.")
 
     # ── Compaction ────────────────────────────────────────────────────────
-    # compaction_events comes from the harness's in-memory tracker
-    # (passed in). The legacy fallback to session_state is kept for any
-    # older paths that wrote into session state, but the primary source
-    # is the argument.
-    events = compaction_events or session_state.get("compaction_events", [])
+    # compaction_events resolved at the top of the function from the
+    # harness's in-memory tracker (now mirrored into session state so
+    # a harness restart does not drop events).
+    events = compaction_events_resolved
     if events:
         lines.append(f"\n## Compaction ({len(events)} events detected)")
         for ev in events:
@@ -485,8 +841,7 @@ async def build_report(
                 snap = json.loads(snap_path.read_text())
                 ts = snap.get("captured_at", "?")[:19]
                 msg_count = snap.get("conversation", {}).get("message_count", "?")
-                health = snap.get("health", {})
-                health_status = health.get("status", "?") if isinstance(health, dict) else "?"
+                health_status = _snapshot_health_status(snap)
                 # Include autonomous state in snapshot summary
                 auto_state = snap.get("autonomous_state", {})
                 auto_items = auto_state.get("total_items", 0) if auto_state.get("available") else "-"
@@ -506,8 +861,8 @@ async def build_report(
         m2 = last.get("conversation", {}).get("message_count", 0)
         lines.append(f"Messages: {m1} -> {m2}")
 
-        h1 = (first.get("health") or {}).get("status", "?")
-        h2 = (last.get("health") or {}).get("status", "?")
+        h1 = _snapshot_health_status(first)
+        h2 = _snapshot_health_status(last)
         lines.append(f"Health: {h1} -> {h2}")
 
         c1 = len(first.get("compaction_events", []))

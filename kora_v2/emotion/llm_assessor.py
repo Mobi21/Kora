@@ -9,14 +9,30 @@ on any parse error.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+from collections import OrderedDict
 
 import structlog
+from pydantic import BaseModel, Field, ValidationError
 
 from kora_v2.core.models import EmotionalState
 
 logger = structlog.get_logger()
+
+
+class PADResponse(BaseModel):
+    """Structured PAD output expected from the LLM.
+
+    Field bounds mirror ``EmotionalState`` so the LLM's response matches
+    the downstream contract. Extra keys are ignored so the model tolerates
+    optional fields like ``reasoning``.
+    """
+    valence: float = Field(ge=-1.0, le=1.0)
+    arousal: float = Field(ge=0.0, le=1.0)
+    dominance: float = Field(ge=0.0, le=1.0)
+    mood_label: str = "neutral"
 
 _SYSTEM_PROMPT = """You are an emotion analysis system. Analyse the emotional state expressed in the conversation messages provided.
 
@@ -64,32 +80,71 @@ def _parse_pad_json(text: str) -> dict | None:
     return None
 
 
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
 class LLMEmotionAssessor:
     """Async LLM-based PAD emotion assessor.
 
     Used when fast tier confidence is low or a large PAD shift is detected.
     Falls back to the current_state (with halved confidence) on any error.
+
+    Includes an in-process LRU cache keyed on the hash of the message
+    window so the 40% timeout rate observed in the 2026-04-11 acceptance
+    run is bounded: repeated assessments over the same recent-message
+    window (common in harness scenarios and during rapid-fire turns)
+    reuse the previous result instead of re-paying a 30s LLM call.
     """
 
-    # Emotion assessment is supplementary — if the LLM is cold (first call)
-    # we should fall back quickly rather than blocking the turn for 120s.
-    DEFAULT_TIMEOUT: float = 15.0
+    # Default timeout — raised from 15s after the 2026-04-11 acceptance
+    # run saw ~40% of calls time out at 15s on MiniMax cold-start.
+    # Emotion assessment is supplementary so a longer wait is acceptable
+    # as long as the cache keeps repeat-call cost near zero.
+    DEFAULT_TIMEOUT: float = 30.0
 
-    def __init__(self, llm, *, timeout: float | None = None) -> None:
+    # Cache capacity — 32 windows covers the typical harness scenario
+    # without consuming meaningful memory (~3 KB total).
+    CACHE_CAPACITY: int = 32
+
+    def __init__(
+        self,
+        llm,
+        *,
+        timeout: float | None = None,
+        cache_capacity: int | None = None,
+    ) -> None:
         """Initialise with an LLM provider.
 
         Args:
             llm: Any provider with an async ``generate(messages, system_prompt, temperature)``
                  method (e.g. MiniMaxProvider or a mock).
             timeout: Maximum seconds to wait for the LLM response before
-                     falling back.  Defaults to ``DEFAULT_TIMEOUT`` (15 s).
+                     falling back.  Defaults to ``DEFAULT_TIMEOUT`` (30 s).
+            cache_capacity: Max number of cached message-window → PAD
+                     entries. Defaults to ``CACHE_CAPACITY`` (32).
         """
         self.llm = llm
         self.timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
+        self._cache_capacity = (
+            cache_capacity if cache_capacity is not None else self.CACHE_CAPACITY
+        )
+        self._cache: OrderedDict[str, EmotionalState] = OrderedDict()
+
+    @staticmethod
+    def _window_key(recent_messages: list[str]) -> str:
+        """Stable hash of the last-5-message window used as cache key."""
+        joined = "\u0001".join(recent_messages[-5:])
+        return hashlib.sha256(joined.encode("utf-8", errors="replace")).hexdigest()
+
+    def _cache_get(self, key: str) -> EmotionalState | None:
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        self._cache.move_to_end(key)
+        return entry
+
+    def _cache_put(self, key: str, value: EmotionalState) -> None:
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        while len(self._cache) > self._cache_capacity:
+            self._cache.popitem(last=False)
 
     async def assess(
         self,
@@ -105,13 +160,72 @@ class LLMEmotionAssessor:
         Returns:
             EmotionalState with source="llm".
         """
+        cache_key = self._window_key(recent_messages)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            logger.debug("LLMEmotionAssessor.cache_hit", key=cache_key[:12])
+            return cached
+
         messages_text = "\n".join(
             f"Message {i + 1}: {msg}" for i, msg in enumerate(recent_messages[-5:])
         )
-        user_message = f"Analyse the emotional state in these messages:\n\n{messages_text}"
 
+        raw = await self._call_llm(
+            user_message=f"Analyse the emotional state in these messages:\n\n{messages_text}",
+            repair_hint=None,
+        )
+        if raw is None:
+            return self._fallback(current_state)
+
+        pad = self._parse_and_validate(raw)
+        if pad is None:
+            # Single repair retry with explicit schema correction.
+            retry_user = (
+                f"Your previous response did not match the required schema. "
+                f"Return ONLY a JSON object with keys valence, arousal, "
+                f"dominance, mood_label. Analyse these messages:\n\n{messages_text}"
+            )
+            raw_retry = await self._call_llm(
+                user_message=retry_user,
+                repair_hint="schema_repair",
+            )
+            if raw_retry is None:
+                return self._fallback(current_state)
+            pad = self._parse_and_validate(raw_retry)
+            if pad is None:
+                logger.warning(
+                    "LLMEmotionAssessor: repair retry failed, falling back",
+                    response_preview=str(raw_retry)[:120],
+                )
+                return self._fallback(current_state)
+
+        result = EmotionalState(
+            valence=pad.valence,
+            arousal=pad.arousal,
+            dominance=pad.dominance,
+            mood_label=pad.mood_label,
+            confidence=0.85,
+            source="llm",
+        )
+        self._cache_put(cache_key, result)
+        logger.debug(
+            "LLMEmotionAssessor.assess",
+            valence=round(pad.valence, 3),
+            arousal=round(pad.arousal, 3),
+            dominance=round(pad.dominance, 3),
+            mood_label=pad.mood_label,
+        )
+        return result
+
+    async def _call_llm(
+        self, *, user_message: str, repair_hint: str | None
+    ) -> str | None:
+        """Invoke the LLM with the standard system prompt and timeout.
+
+        Returns the raw response text, or ``None`` on timeout/error.
+        """
         try:
-            raw = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self.llm.generate(
                     messages=[{"role": "user", "content": user_message}],
                     system_prompt=_SYSTEM_PROMPT,
@@ -119,58 +233,52 @@ class LLMEmotionAssessor:
                 ),
                 timeout=self.timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "LLMEmotionAssessor: LLM call timed out, falling back",
                 timeout=self.timeout,
+                repair=repair_hint,
             )
-            return self._fallback(current_state)
+            return None
         except Exception as e:
-            logger.warning("LLMEmotionAssessor: LLM call failed, falling back", error=str(e))
-            return self._fallback(current_state)
+            logger.warning(
+                "LLMEmotionAssessor: LLM call failed, falling back",
+                error=str(e),
+                repair=repair_hint,
+            )
+            return None
 
+    @staticmethod
+    def _parse_and_validate(raw: str) -> PADResponse | None:
+        """Parse the LLM response and validate against ``PADResponse``.
+
+        Returns ``None`` if either parse or schema validation fails; the
+        caller decides whether to retry or fall back.
+        """
         parsed = _parse_pad_json(raw)
         if parsed is None:
-            logger.warning(
-                "LLMEmotionAssessor: could not parse JSON response, falling back",
-                response_preview=str(raw)[:120],
-            )
-            return self._fallback(current_state)
-
+            return None
+        # Coerce a common drift case: ``{"messages": [{...}, ...]}`` batched
+        # analysis → take the first entry. This handles the 2026-04-11
+        # audit's observed schema drift without a repair round-trip.
+        if (
+            "valence" not in parsed
+            and isinstance(parsed.get("messages"), list)
+            and parsed["messages"]
+            and isinstance(parsed["messages"][0], dict)
+        ):
+            parsed = parsed["messages"][0]
         try:
-            valence = float(parsed["valence"])
-            arousal = float(parsed["arousal"])
-            dominance = float(parsed["dominance"])
-            mood_label = str(parsed.get("mood_label", "neutral"))
-
-            valence = _clamp(valence, -1.0, 1.0)
-            arousal = _clamp(arousal, 0.0, 1.0)
-            dominance = _clamp(dominance, 0.0, 1.0)
-
-        except (KeyError, TypeError, ValueError) as e:
+            return PADResponse.model_validate(parsed)
+        except ValidationError as exc:
             logger.warning(
-                "LLMEmotionAssessor: missing/invalid PAD fields, falling back",
-                error=str(e),
-                parsed=parsed,
+                "LLMEmotionAssessor: PAD validation failed",
+                error=str(exc)[:200],
+                parsed_keys=list(parsed.keys())
+                if isinstance(parsed, dict)
+                else type(parsed).__name__,
             )
-            return self._fallback(current_state)
-
-        logger.debug(
-            "LLMEmotionAssessor.assess",
-            valence=round(valence, 3),
-            arousal=round(arousal, 3),
-            dominance=round(dominance, 3),
-            mood_label=mood_label,
-        )
-
-        return EmotionalState(
-            valence=valence,
-            arousal=arousal,
-            dominance=dominance,
-            mood_label=mood_label,
-            confidence=0.85,
-            source="llm",
-        )
+            return None
 
     def _fallback(self, current_state: EmotionalState) -> EmotionalState:
         """Return current_state with halved confidence and source='llm'."""

@@ -35,8 +35,26 @@ from kora_v2.llm.types import GenerationResult
 
 log = structlog.get_logger(__name__)
 
-# Maximum think -> tool_loop -> think iterations to prevent infinite loops
-_MAX_TOOL_ITERATIONS = 8
+# Maximum think -> tool_loop -> think iterations to prevent infinite loops.
+# Raised from 8 to 12 after the 2026-04-11 acceptance run hit the cap
+# during legitimate exploration (10 list_directory calls to anchor a
+# project path). 12 gives honest exploration headroom; the fallback
+# below turns the cap from a conversational dead end into a clarifying
+# question so the user never sees a bail string.
+_MAX_TOOL_ITERATIONS = 12
+
+# Instructional suffix injected into the next think() call when the
+# iteration cap has been hit. Forces the model to stop tool-calling
+# and ask one focused clarifying question instead of bailing out.
+_ITERATION_CAP_CLARIFY_SUFFIX = (
+    "IMPORTANT: You have exhausted your tool-exploration budget for this "
+    "turn. Do NOT call any more tools. Review what you have learned so "
+    "far, then reply with ONE short, focused question to the user that "
+    "would unblock your next concrete action (for example: asking for a "
+    "file path, a preference, or a decision). Be specific. Do not "
+    "apologize or describe the search you attempted — just ask the "
+    "question plainly."
+)
 
 # Core skills that must always be visible to the LLM, even if the skill
 # loader found zero skills on disk (cold start, missing YAML, parse error).
@@ -198,6 +216,8 @@ async def think(
     state: SupervisorState,
     container: Any,
     tools: list[dict[str, Any]] | None = None,
+    *,
+    extra_system_suffix: str | None = None,
 ) -> dict[str, Any]:
     """Single LLM call with frozen prefix + dynamic suffix + tools.
 
@@ -209,7 +229,13 @@ async def think(
         state: Current supervisor state.
         container: Service container with ``llm`` attribute.
         tools: Tool definitions to pass to the LLM. Defaults to
-            ``SUPERVISOR_TOOLS`` for backward compatibility.
+            ``SUPERVISOR_TOOLS`` for backward compatibility. Pass an
+            empty list to force a text-only turn (used by the tool
+            iteration cap fallback so the model cannot keep exploring).
+        extra_system_suffix: Optional additional instruction appended
+            to the system prompt for this single call only. Used by the
+            iteration-cap fallback to instruct the model to ask one
+            clarifying question instead of continuing to tool-call.
     """
     active_tools = tools if tools is not None else SUPERVISOR_TOOLS
     # Assemble system prompt
@@ -218,6 +244,8 @@ async def think(
     system_prompt = frozen_prefix
     if suffix:
         system_prompt = f"{frozen_prefix}\n\n{suffix}"
+    if extra_system_suffix:
+        system_prompt = f"{system_prompt}\n\n{extra_system_suffix}".strip()
 
     # Extract messages for the LLM.
     # Apply tool-pair integrity sanitization here (not in the reducer):
@@ -774,13 +802,39 @@ def build_supervisor_graph(container: Any) -> Any:
                 "max_tool_iterations_reached",
                 iterations=iteration_count["value"],
             )
-            return {
-                "response_content": (
-                    "I've been going back and forth too many times on this. "
-                    "Let me give you what I have so far."
-                ),
-                "_pending_tool_calls": [],
-            }
+            # Cap-hit fallback: re-enter think() with tool calls disabled
+            # and a clarifying-question instruction so the user gets a
+            # focused question instead of a "giving up" bail string.
+            clarify_update = await think(
+                state,
+                container,
+                tools=[],
+                extra_system_suffix=_ITERATION_CAP_CLARIFY_SUFFIX,
+            )
+            clarify_update["_pending_tool_calls"] = []
+            # Defensive: strip any stray tool_calls the model might have
+            # produced despite the empty tools list.
+            msgs = clarify_update.get("messages") or []
+            sanitized: list[dict[str, Any]] = []
+            for m in msgs:
+                if isinstance(m, dict) and m.get("tool_calls"):
+                    m = {**m, "tool_calls": []}
+                sanitized.append(m)
+            if sanitized:
+                clarify_update["messages"] = sanitized
+            # Final floor: if the LLM produced nothing at all, emit a
+            # brief neutral prompt so the turn does not return empty.
+            if not clarify_update.get("response_content"):
+                fallback_text = (
+                    "I need a bit more direction to move forward — "
+                    "could you point me at the specific place or file "
+                    "you want me to work in?"
+                )
+                clarify_update["response_content"] = fallback_text
+                clarify_update["messages"] = [
+                    {"role": "assistant", "content": fallback_text}
+                ]
+            return clarify_update
         return await think(state, container, tools=available_tools)
 
     async def _tool_loop(state: SupervisorState) -> dict[str, Any]:

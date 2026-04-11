@@ -276,7 +276,7 @@ class SessionManager:
             try:
                 await scanner.scan(messages)
             except Exception:
-                log.debug("signal_scanner_failed_at_session_end")
+                log.warning("signal_scanner_failed_at_session_end", exc_info=True)
 
         # Step 2: Save emotional state + session end record
         settings = getattr(self.container, 'settings', None)
@@ -410,7 +410,7 @@ class SessionManager:
             )
             return result.get("response_content") or "Hey! What's up?"
         except Exception:
-            log.warning("greeting_generation_failed")
+            log.warning("greeting_generation_failed", exc_info=True)
             return "Hey! What's on your mind?"
 
     def get_restart_context(self) -> str:

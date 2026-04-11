@@ -144,12 +144,17 @@ COVERAGE_ITEMS: dict[int, CoverageItem] = {
         CoverageStatus.DEFERRED,
         "executor harness exists but planner/reviewer .py files are missing",
     ),
-    12: CoverageItem(
-        "Monitored idle with grounded follow-through",
-        CoverageStatus.DEFERRED,
-        "V2 BackgroundWorker has zero registered work items",
-    ),
 }
+
+# Item 12 is ACTIVE (promoted from DEFERRED): BackgroundWorker registers
+# 5 work items in ``kora_v2/daemon/server.py`` (memory_consolidation,
+# signal_scanner, autonomous_update_delivery, session_bridge_pruning,
+# skill_refinement). The acceptance report derives satisfaction from
+# the daemon status endpoint's ``background_worker_items`` count.
+COVERAGE_ITEMS[12] = CoverageItem(
+    "Monitored idle with grounded follow-through via BackgroundWorker",
+    CoverageStatus.ACTIVE,
+)
 
 # Convenience accessors
 ACTIVE_ITEMS = {k: v for k, v in COVERAGE_ITEMS.items() if v.status == CoverageStatus.ACTIVE}
