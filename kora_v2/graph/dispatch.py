@@ -743,29 +743,6 @@ async def _execute_start_autonomous(
 # Web Tools — search_web + fetch_url (Workstream 2)
 # =====================================================================
 
-# A tiny HTML-stripper used only in the urllib fallback path of fetch_url.
-_HTML_TAG_RE = None  # lazily compiled
-
-
-def _strip_html(raw: str) -> str:
-    """Best-effort HTML → text reduction for the urllib fallback."""
-    import re as _re
-
-    global _HTML_TAG_RE
-    if _HTML_TAG_RE is None:
-        _HTML_TAG_RE = _re.compile(r"<[^>]+>")
-
-    # Drop script/style blocks first so their contents don't leak.
-    no_scripts = _re.sub(
-        r"<(script|style)[^>]*>.*?</\1>",
-        " ",
-        raw,
-        flags=_re.IGNORECASE | _re.DOTALL,
-    )
-    stripped = _HTML_TAG_RE.sub(" ", no_scripts)
-    # Collapse whitespace.
-    return _re.sub(r"\s+", " ", stripped).strip()
-
 
 def _mcp_manager(container: Any | None) -> Any | None:
     if container is None:
@@ -949,23 +926,4 @@ async def _execute_fetch_url(
             "recoverable": True,
             "next_options": ["browser.open"],
         })
-
-
-def _urllib_fetch_text(url: str, timeout: float = 10.0) -> str:
-    """Blocking helper: fetch URL with urllib and strip HTML."""
-    import urllib.request
-
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Kora/2.0 (+https://localhost) Python-urllib"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        raw_bytes = resp.read()
-        charset = resp.headers.get_content_charset() or "utf-8"
-        try:
-            raw = raw_bytes.decode(charset, errors="replace")
-        except LookupError:
-            raw = raw_bytes.decode("utf-8", errors="replace")
-
-    return _strip_html(raw)
 
