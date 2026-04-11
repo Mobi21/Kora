@@ -8,6 +8,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,7 +16,6 @@ import pytest
 from kora_v2.core.models import EmotionalState
 from kora_v2.emotion.fast_assessor import FastEmotionAssessor, _pad_to_mood
 from kora_v2.emotion.llm_assessor import LLMEmotionAssessor, should_trigger_llm_assessment
-
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -216,6 +216,117 @@ class TestLLMEmotionAssessor:
         assert result.valence == pytest.approx(current.valence, abs=0.01)
         assert result.confidence == pytest.approx(current.confidence / 2, abs=0.01)
         assert result.source == "llm"
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_skips_llm_call(self):
+        """Second call with identical message window reuses cached result."""
+        llm_response = (
+            '{"valence": 0.2, "arousal": 0.4, "dominance": 0.5, "mood_label": "calm"}'
+        )
+        llm = self._make_mock_llm(llm_response)
+        assessor = LLMEmotionAssessor(llm)
+        current = _neutral_state()
+
+        result_1 = await assessor.assess(["hello world"], current)
+        result_2 = await assessor.assess(["hello world"], current)
+
+        # Same result, but only one actual LLM call
+        assert result_1.valence == result_2.valence
+        assert result_1.mood_label == result_2.mood_label
+        assert llm.generate.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_on_different_window(self):
+        """Different message windows get distinct LLM calls."""
+        llm_response = (
+            '{"valence": 0.1, "arousal": 0.3, "dominance": 0.5, "mood_label": "neutral"}'
+        )
+        llm = self._make_mock_llm(llm_response)
+        assessor = LLMEmotionAssessor(llm)
+        current = _neutral_state()
+
+        await assessor.assess(["message one"], current)
+        await assessor.assess(["message two"], current)
+
+        assert llm.generate.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_schema_drift_batched_shape_handled(self):
+        """LLM returning {'messages': [{...}]} batch shape is coerced to first entry."""
+        batched_response = json.dumps({
+            "messages": [
+                {
+                    "valence": 0.3,
+                    "arousal": 0.4,
+                    "dominance": 0.6,
+                    "mood_label": "content",
+                }
+            ]
+        })
+        llm = self._make_mock_llm(batched_response)
+        assessor = LLMEmotionAssessor(llm)
+        current = _neutral_state()
+
+        result = await assessor.assess(["some message"], current)
+
+        # Drift is coerced in _parse_and_validate without repair retry,
+        # so only one LLM call should have happened
+        assert result.source == "llm"
+        assert result.valence == pytest.approx(0.3, abs=0.01)
+        assert result.mood_label == "content"
+        assert llm.generate.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_repair_retry_on_invalid_schema(self):
+        """Invalid schema on first attempt triggers one repair retry."""
+        responses = [
+            # First: valid JSON but missing required fields
+            '{"mood": "happy", "energy": "high"}',
+            # Repair retry: correct schema
+            '{"valence": 0.5, "arousal": 0.6, "dominance": 0.5, "mood_label": "happy"}',
+        ]
+        call_count = {"n": 0}
+
+        async def _sequenced_generate(**kwargs):
+            idx = call_count["n"]
+            call_count["n"] += 1
+            return responses[idx]
+
+        llm = MagicMock()
+        llm.generate = _sequenced_generate
+        assessor = LLMEmotionAssessor(llm)
+        current = _neutral_state()
+
+        result = await assessor.assess(["something"], current)
+
+        # Repair retry succeeded → proper emotional state
+        assert result.source == "llm"
+        assert result.valence == pytest.approx(0.5, abs=0.01)
+        assert call_count["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_repair_retry_failure_falls_back(self):
+        """Both attempts failing → fallback to current_state with halved confidence."""
+        responses = [
+            '{"not": "valid"}',
+            '{"still": "wrong"}',
+        ]
+        call_count = {"n": 0}
+
+        async def _sequenced_generate(**kwargs):
+            idx = call_count["n"]
+            call_count["n"] += 1
+            return responses[idx]
+
+        llm = MagicMock()
+        llm.generate = _sequenced_generate
+        assessor = LLMEmotionAssessor(llm)
+        current = _negative_state()
+
+        result = await assessor.assess(["something"], current)
+
+        assert result.confidence == pytest.approx(current.confidence / 2, abs=0.01)
+        assert call_count["n"] == 2
 
     @pytest.mark.asyncio
     async def test_should_trigger(self):

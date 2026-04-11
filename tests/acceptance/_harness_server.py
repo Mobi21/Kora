@@ -132,7 +132,15 @@ def _rest_get(path: str, port: int, host: str, token: str) -> dict[str, Any] | N
 # ── Test data cleanup ────────────────────────────────────────────────────────
 
 async def _clean_stale_autonomous_data(db_path: Path) -> None:
-    """Wipe stale autonomous data from previous test runs."""
+    """Wipe stale autonomous data from previous test runs.
+
+    The previous implementation only wiped ``autonomous_plans`` and
+    ``autonomous_checkpoints``, which left orphan rows in ``items``,
+    ``autonomous_updates``, and ``item_state_history``. That caused the
+    2026-04-11 acceptance report to say "no plans in DB" while the
+    items table still showed work from a previous run — confusingly
+    mixing old and new state. Always clean the full set atomically.
+    """
     if not db_path.exists():
         return
     try:
@@ -141,7 +149,16 @@ async def _clean_stale_autonomous_data(db_path: Path) -> None:
         return
     try:
         async with aiosqlite.connect(str(db_path)) as db:
-            for table in ("autonomous_plans", "autonomous_checkpoints"):
+            # Order matters for FK-respecting deletes: children first.
+            for table in (
+                "item_state_history",
+                "item_artifact_links",
+                "item_deps",
+                "items",
+                "autonomous_updates",
+                "autonomous_checkpoints",
+                "autonomous_plans",
+            ):
                 try:
                     await db.execute(f"DELETE FROM {table}")
                 except Exception:
@@ -173,8 +190,14 @@ class HarnessServer:
         # Auth test mode: "auto" (approve all), "deny_once" (deny first, approve rest)
         self._auth_mode: str = "auto"
         self._auth_deny_count: int = 0
-        # Compaction tracking
-        self._compaction_events: list[dict[str, Any]] = []
+        # Compaction tracking — restored from session state so a daemon
+        # or harness restart does not wipe the accumulated count. The
+        # 2026-04-11 audit saw compaction-status return 25 events while
+        # the final report only captured 2 because this list was an
+        # in-memory field that got reset on restart.
+        self._compaction_events: list[dict[str, Any]] = list(
+            self._state.get("compaction_events") or []
+        )
 
     # ── Connection management ─────────────────────────────────────────────
 
@@ -302,11 +325,20 @@ class HarnessServer:
             # Track compaction events
             compaction_tier = meta.get("compaction_tier")
             if compaction_tier and compaction_tier != "none":
-                self._compaction_events.append({
+                event = {
                     "tier": compaction_tier,
                     "token_count": meta.get("token_count"),
                     "ts": datetime.now(UTC).isoformat(),
-                })
+                }
+                self._compaction_events.append(event)
+                # Mirror to session state so restarts do not drop events.
+                self._state["compaction_events"] = list(self._compaction_events)
+                try:
+                    _save_session(self._state)
+                except Exception:
+                    # Best-effort persistence — fall through rather than
+                    # blocking the response pipeline on disk failure.
+                    pass
                 self._response_data["compaction_tier"] = compaction_tier
             if self._response_ready:
                 self._response_ready.set()
