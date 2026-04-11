@@ -10,8 +10,9 @@ Real subprocess-backed stdio MCP:
   callers via ``asyncio.Future`` keyed by request id.
 * ``ensure_server_running`` performs the JSON-RPC handshake and caches
   the server's ``tools/list``.
-* ``call_tool`` sends ``tools/call`` and returns the joined text of
-  the ``content[*].text`` items in the result.
+* ``call_tool`` sends ``tools/call`` and returns a structured
+  :class:`~kora_v2.mcp.results.MCPToolResult`.  Use
+  ``call_tool_text`` for the legacy joined-text string.
 
 Failures (missing binary, timeout, crash) set the server to FAILED
 and surface as :class:`MCPServerUnavailableError` on the next call;
@@ -30,6 +31,7 @@ from pydantic import BaseModel, ConfigDict
 
 from kora_v2.core.exceptions import KoraError
 from kora_v2.core.settings import MCPSettings
+from kora_v2.mcp.results import MCPToolResult
 
 logger = structlog.get_logger()
 
@@ -471,12 +473,17 @@ class MCPManager:
         server: str,
         tool: str,
         args: dict[str, Any] | None = None,
-    ) -> Any:
-        """Invoke a tool on an MCP server and return the text result.
+    ) -> MCPToolResult:
+        """Invoke a tool on an MCP server and return a structured result.
 
-        Ensures the server is running first (lazy start). Returns the
-        concatenated text from ``result.content[*]``. If the server is
-        FAILED this raises :class:`MCPServerUnavailableError`.
+        Ensures the server is running first (lazy start). Returns an
+        :class:`~kora_v2.mcp.results.MCPToolResult` which exposes
+        ``.text`` for legacy text access, ``.structured_data`` for
+        parsed JSON, ``.is_error`` for the MCP isError flag, and
+        ``.raw`` for the full payload.
+
+        If the server is FAILED this raises
+        :class:`MCPServerUnavailableError`.
         """
         await self.ensure_server_running(server)
 
@@ -498,26 +505,28 @@ class MCPManager:
             )
 
         logger.info("mcp.tool.call", server=server, tool=tool)
-        result = await self._send_request(
+        raw_result = await self._send_request(
             info,
             method="tools/call",
             params={"name": tool, "arguments": args or {}},
             timeout=_DEFAULT_CALL_TIMEOUT,
         )
 
-        # Extract text content from result.
-        content = result.get("content") or []
-        if not isinstance(content, list):
-            return result
-        text_parts: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "text":
-                text_parts.append(str(item.get("text", "")))
-        if text_parts:
-            return "\n".join(text_parts)
-        return result
+        return MCPToolResult.from_mcp(server=server, tool=tool, raw=raw_result)
+
+    async def call_tool_text(
+        self,
+        server: str,
+        tool: str,
+        args: dict[str, Any] | None = None,
+    ) -> str:
+        """Invoke a tool and return the joined text — backwards-compatible shim.
+
+        Equivalent to ``(await call_tool(...)).text``.  Use this where
+        the caller only needs a plain string.
+        """
+        result = await self.call_tool(server, tool, args)
+        return result.text
 
     async def health_check(self, name: str) -> bool:
         """Return True if the server is RUNNING."""

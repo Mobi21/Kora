@@ -12,7 +12,19 @@ from kora_v2.graph.dispatch import (
     _resolve_auth_context,
     execute_tool,
 )
+from kora_v2.mcp.results import MCPContentBlock, MCPToolResult
 from kora_v2.tools.types import AuthLevel
+
+
+def _mk_result(text: str, **kwargs: object) -> MCPToolResult:
+    """Build a minimal MCPToolResult with a single text block."""
+    return MCPToolResult(
+        server=str(kwargs.get("server", "test")),
+        tool=str(kwargs.get("tool", "test")),
+        is_error=bool(kwargs.get("is_error", False)),
+        content=[MCPContentBlock(type="text", text=text)],
+        raw={},
+    )
 
 
 class TestToolDefinitions:
@@ -130,7 +142,9 @@ class TestSearchWebWithMCP:
         container.mcp_manager.get_server_info = MagicMock(
             return_value=MagicMock(name="brave_info")
         )
-        container.mcp_manager.call_tool = AsyncMock(return_value=brave_payload)
+        container.mcp_manager.call_tool = AsyncMock(
+            return_value=_mk_result(brave_payload, server="brave_search", tool="brave_web_search")
+        )
         container.settings.security.auth_mode = "trust_all"
         container.session_manager = None
 
@@ -220,7 +234,7 @@ class TestFetchUrlFallback:
             return_value=MagicMock(name="fetch_info")
         )
         container.mcp_manager.call_tool = AsyncMock(
-            return_value="Fetched article body text."
+            return_value=_mk_result("Fetched article body text.", server="fetch", tool="fetch")
         )
         container.settings.security.auth_mode = "trust_all"
         container.session_manager = None

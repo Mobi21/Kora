@@ -822,7 +822,7 @@ async def _execute_search_web(
         return await _search_web_fallback(query, count)
 
     try:
-        raw = await mcp.call_tool(
+        mcp_result = await mcp.call_tool(
             "brave_search",
             "brave_web_search",
             {"query": query, "count": count},
@@ -831,6 +831,9 @@ async def _execute_search_web(
         log.warning("search_web_mcp_failed", error=str(exc), query=query[:80])
         return await _search_web_fallback(query, count)
 
+    # Prefer structured_data if the server returned a native JSON block;
+    # otherwise fall back to the joined text (which brave returns as JSON-in-text).
+    raw: Any = mcp_result.structured_data or mcp_result.text
     results = _parse_brave_results(raw, count)
     return json.dumps({"results": results, "query": query})
 
@@ -891,8 +894,8 @@ async def _execute_fetch_url(
             fetch_info = None
         if fetch_info is not None:
             try:
-                raw = await mcp.call_tool("fetch", "fetch", {"url": url})
-                text = raw if isinstance(raw, str) else json.dumps(raw)
+                fetch_result = await mcp.call_tool("fetch", "fetch", {"url": url})
+                text = fetch_result.text
                 truncated = text[:max_chars]
                 return json.dumps({
                     "url": url,

@@ -13,8 +13,10 @@ from kora_v2.mcp.manager import (
     MCPServerUnavailableError,
     MCPToolNotFoundError,
 )
+from kora_v2.mcp.results import MCPContentBlock, MCPToolResult
 
 __all__ = [
+    "MCPContentBlock",
     "MCPError",
     "MCPManager",
     "MCPServerInfo",
@@ -22,4 +24,5 @@ __all__ = [
     "MCPServerState",
     "MCPServerUnavailableError",
     "MCPToolNotFoundError",
+    "MCPToolResult",
 ]
