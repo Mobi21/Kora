@@ -69,7 +69,7 @@ dev = [
 kora = "kora_v2.daemon.launcher:main"
 
 [project.urls]
-"Homepage" = "https://github.com/yourusername/kora"
+"Homepage" = "https://github.com/Mobi21/Kora"
 
 [tool.setuptools.packages.find]
 where = ["."]

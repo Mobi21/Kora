@@ -20,6 +20,7 @@ WebSocket envelope protocol::
 from __future__ import annotations
 
 import asyncio
+import hmac
 import secrets
 import uuid
 from pathlib import Path
@@ -92,7 +93,7 @@ async def verify_token(authorization: str | None = Header(None)) -> None:
     if len(parts) != 2 or parts[0].lower() != "bearer":
         raise HTTPException(status_code=401, detail="Invalid Authorization header format")
 
-    if parts[1] != _api_token:
+    if not hmac.compare_digest(parts[1], _api_token):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 

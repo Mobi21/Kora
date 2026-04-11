@@ -129,9 +129,8 @@ kora_v2/
 └── tools/         # recall(), filesystem, life-management tools, registry
 
 tests/             # unit / integration / acceptance / fixtures
-Documentation/     # PRD, specs, reviews (rearchitecture/)
-_KoraMemory/       # canonical memory (markdown + YAML) — gitignored
-data/              # lockfile, token, logs, databases — gitignored
+_KoraMemory/       # canonical memory (markdown + YAML) — gitignored, created at runtime
+data/              # lockfile, token, logs, databases — gitignored, created at runtime
 ```
 
 ## Development commands
@@ -149,13 +148,6 @@ data/              # lockfile, token, logs, databases — gitignored
 # Import sanity
 .venv/bin/python -c "import kora_v2"
 ```
-
-## Documentation
-
-- **PRD (source of truth):** `Documentation/plans/rearchitecture/PRD/`
-- **Implementation specs:** `Documentation/plans/rearchitecture/specs/`
-- **Review outputs:** `Documentation/plans/rearchitecture/reviews/`
-- **Development guide:** `CLAUDE.md`
 
 ## Security & constraints
 

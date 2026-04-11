@@ -165,6 +165,10 @@ notes/
 _dev/
 .dev/
 
+# AI agent working guides — local-only reference files
+CLAUDE.md
+AGENTS.md
+
 # Superpowers plans and caches
 .claude/
 !.claude/settings.local.json.example

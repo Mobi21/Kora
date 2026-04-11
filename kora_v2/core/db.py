@@ -6,9 +6,12 @@ metrics, autonomous checkpoints, notifications, telemetry, and audit log.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import aiosqlite
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # ── Schema DDL ───────────────────────────────────────────────────────────
 
@@ -415,6 +418,8 @@ async def _ensure_columns(
     migrations: tuple[tuple[str, str], ...],
 ) -> None:
     """Apply additive column migrations for an existing table."""
+    if not _IDENTIFIER_RE.match(table):
+        raise ValueError(f"Invalid table identifier: {table!r}")
     async with db.execute(f"PRAGMA table_info({table})") as cursor:
         rows = await cursor.fetchall()
     existing = {row[1] for row in rows}
