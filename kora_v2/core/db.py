@@ -390,6 +390,11 @@ _PERMISSION_GRANT_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("reason", "ALTER TABLE permission_grants ADD COLUMN reason TEXT"),
     ("provenance", "ALTER TABLE permission_grants ADD COLUMN provenance TEXT"),
     ("recorded_by", "ALTER TABLE permission_grants ADD COLUMN recorded_by TEXT"),
+    # Phase 9 Task 4: capability/account/action/resource scoping
+    ("capability", "ALTER TABLE permission_grants ADD COLUMN capability TEXT"),
+    ("account", "ALTER TABLE permission_grants ADD COLUMN account TEXT"),
+    ("action_key", "ALTER TABLE permission_grants ADD COLUMN action_key TEXT"),
+    ("resource", "ALTER TABLE permission_grants ADD COLUMN resource TEXT"),
 )
 
 _AUTONOMOUS_PLAN_MIGRATIONS: tuple[tuple[str, str], ...] = (
@@ -444,6 +449,11 @@ async def init_operational_db(db_path: Path) -> None:
         await _ensure_columns(db, "turn_traces", _TURN_TRACE_MIGRATIONS)
         await _ensure_columns(db, "permission_grants", _PERMISSION_GRANT_MIGRATIONS)
         await _ensure_columns(db, "autonomous_plans", _AUTONOMOUS_PLAN_MIGRATIONS)
+        # Phase 9 Task 4: index on capability-scoped columns (idempotent via IF NOT EXISTS)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_permission_grants_capability "
+            "ON permission_grants(capability, account, action_key)"
+        )
         await db.execute("PRAGMA journal_mode=WAL")
         await db.commit()
 

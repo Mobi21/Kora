@@ -10,6 +10,15 @@ from kora_v2.capabilities.base import (
 )
 from kora_v2.capabilities.browser import BrowserCapability
 from kora_v2.capabilities.doctor import DoctorCapability
+from kora_v2.capabilities.policy import (
+    ApprovalMode,
+    Decision,
+    PolicyKey,
+    PolicyMatrix,
+    PolicyRule,
+    SessionState,
+    TaskState,
+)
 from kora_v2.capabilities.registry import (
     ActionRegistry,
     CapabilityRegistry,
@@ -29,12 +38,19 @@ register_capability(DoctorCapability())
 __all__ = [
     "Action",
     "ActionRegistry",
+    "ApprovalMode",
     "CapabilityHealth",
     "CapabilityPack",
     "CapabilityRegistry",
+    "Decision",
     "HealthStatus",
     "Policy",
+    "PolicyKey",
+    "PolicyMatrix",
+    "PolicyRule",
+    "SessionState",
     "StructuredFailure",
+    "TaskState",
     "get_all_capabilities",
     "get_default_registry",
     "register_capability",

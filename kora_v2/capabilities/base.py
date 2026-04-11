@@ -10,6 +10,15 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from kora_v2.capabilities.registry import ActionRegistry
 
+# Re-export the real policy types so importers can use either base.py or policy.py.
+from kora_v2.capabilities.policy import (
+    PolicyMatrix,
+)
+
+# Backwards-compat alias: code that referenced the old stub ``Policy`` dataclass
+# now resolves to the real ``PolicyMatrix`` implementation.
+Policy = PolicyMatrix
+
 
 class HealthStatus(StrEnum):
     OK = "ok"
@@ -47,14 +56,6 @@ class Action:
     requires_approval: bool = False
     read_only: bool = True
     handler: Callable[..., Awaitable[Any]] | None = None  # set by implementation tasks
-
-
-@dataclass
-class Policy:
-    """Base policy — concrete capability policies subclass or compose this."""
-
-    default_approval_mode: str = "never_ask"  # actual PolicyMatrix comes in Task 4
-    deny_list: list[str] = field(default_factory=list)  # action names that are hard-disabled
 
 
 class CapabilityPack:
