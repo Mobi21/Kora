@@ -35,11 +35,14 @@ def _build_offline_container():
     return Container(get_settings())
 
 
-async def _run(topic: str) -> int:
-    """Run the inspector for *topic* and print JSON to stdout.
+async def _run(topic: str, *, as_json: bool = False) -> int:
+    """Run the inspector for *topic* and print to stdout.
+
+    For the ``doctor`` topic the output is human-readable by default;
+    pass ``--json`` to get raw JSON instead.
 
     Returns:
-        0 on success, 1 on error.
+        0 on success, 1 on error, 2 if doctor reports unhealthy.
     """
     try:
         container = _build_offline_container()
@@ -54,7 +57,7 @@ async def _run(topic: str) -> int:
         )
         return 1
 
-    from kora_v2.runtime.inspector import RuntimeInspector
+    from kora_v2.runtime.inspector import RuntimeInspector, doctor_report_lines
 
     inspector = RuntimeInspector(container)
 
@@ -64,7 +67,11 @@ async def _run(topic: str) -> int:
         print(f"error: inspector raised an exception: {exc}", file=sys.stderr)
         return 1
 
-    print(json.dumps(result, indent=2, default=str))
+    if topic == "doctor" and not as_json:
+        lines = doctor_report_lines(result)
+        print("\n".join(lines))
+    else:
+        print(json.dumps(result, indent=2, default=str))
 
     # Exit non-zero if the doctor topic reports unhealthy
     if topic in ("doctor",) and result.get("healthy") is False:
@@ -87,13 +94,26 @@ def main() -> None:
 
     if len(sys.argv) < 2:
         print(
-            f"usage: python -m kora_v2.runtime <topic>\n"
+            f"usage: python -m kora_v2.runtime <topic> [--json]\n"
             f"topics: {', '.join(valid_topics)}",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    topic = sys.argv[1]
+    # Parse args: topic is first positional; --json is an optional flag
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    positional = [a for a in args if not a.startswith("--")]
+
+    if not positional:
+        print(
+            f"usage: python -m kora_v2.runtime <topic> [--json]\n"
+            f"topics: {', '.join(valid_topics)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    topic = positional[0]
     if topic not in valid_topics:
         print(
             f"error: unknown topic '{topic}'\n"
@@ -102,7 +122,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    rc = asyncio.run(_run(topic))
+    rc = asyncio.run(_run(topic, as_json=as_json))
     sys.exit(rc)
 
 
