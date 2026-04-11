@@ -170,6 +170,16 @@ class SecuritySettings(BaseModel):
     auth_mode: str = "prompt"  # "prompt" = normal flow, "trust_all" = skip ASK_FIRST prompts
 
 
+# ── Browser ──────────────────────────────────────────────────────────────
+
+class BrowserSettings(BaseModel):
+    """Agent-browser integration."""
+
+    enabled: bool = False
+    binary_path: str = ""  # empty = auto-detect on PATH
+    default_profile: str = ""  # empty = use browser default
+
+
 # ── Vault ────────────────────────────────────────────────────────────────
 
 class VaultSettings(BaseModel):
@@ -200,6 +210,7 @@ class Settings(BaseSettings):
     mcp: MCPSettings = MCPSettings()
     security: SecuritySettings = SecuritySettings()
     vault: VaultSettings = VaultSettings()
+    browser: BrowserSettings = BrowserSettings()
 
     model_config = SettingsConfigDict(
         toml_file=Path("~/.kora/settings.toml").expanduser(),
@@ -244,6 +255,8 @@ class Settings(BaseSettings):
         )
         if self.vault.path:
             self.vault.path = str(Path(self.vault.path).expanduser())
+        if self.browser.binary_path:
+            self.browser.binary_path = str(Path(self.browser.binary_path).expanduser())
         return self
 
     # ── Derived helpers ──────────────────────────────────────────────

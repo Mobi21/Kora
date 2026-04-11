@@ -735,3 +735,13 @@ class RuntimeInspector:
             "criteria": results,
             "runtime": runtime_metadata(),
         }
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────
+# Supports: python -m kora_v2.runtime.inspector <topic>
+# The __main__.py package entry also handles: python -m kora_v2.runtime <topic>
+
+if __name__ == "__main__":
+    from kora_v2.runtime.__main__ import main
+
+    main()
