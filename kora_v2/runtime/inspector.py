@@ -559,7 +559,7 @@ class RuntimeInspector:
                 getattr(_st, "__version__", "unknown"),
             )
         except ImportError:
-            _check("sentence_transformers_importable", True, "not installed")
+            _check("sentence_transformers_importable", True, "optional — not installed (vector search degraded)")
 
         # sqlite_vec loadable
         try:

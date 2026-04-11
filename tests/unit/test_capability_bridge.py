@@ -216,3 +216,114 @@ class TestExecuteCapabilityAction:
         parsed = json.loads(result)
         assert parsed["opened"] is True
         browser_action.handler.assert_awaited_once()
+
+
+class TestUnboundCapabilityHandler:
+    """Handlers on unbound capabilities return structured failures, not exceptions."""
+
+    @pytest.mark.asyncio
+    async def test_unbound_workspace_returns_capability_not_configured(self) -> None:
+        """WorkspaceCapability without bind() should return a structured failure."""
+        from kora_v2.capabilities.workspace import WorkspaceCapability
+        from kora_v2.capabilities.registry import ActionRegistry
+        from kora_v2.capabilities.policy import SessionState
+
+        # Instantiate without calling .bind() — settings and mcp_manager are None
+        cap = WorkspaceCapability()
+        registry = ActionRegistry()
+        cap.register_actions(registry)
+
+        # Grab the handler for a read action
+        action = registry.get("workspace.gmail.search")
+        assert action is not None, "workspace.gmail.search must be registered"
+        assert action.handler is not None, "handler must be set"
+
+        session = SessionState(session_id="test-unbound")
+        result = await action.handler(session=session, task=None, query="test")
+
+        # Must return a StructuredFailure, not raise
+        assert isinstance(result, StructuredFailure), (
+            f"Expected StructuredFailure, got {type(result)}: {result!r}"
+        )
+        assert result.reason == "capability_not_configured"
+        assert result.recoverable is False
+        assert result.capability == "workspace"
+
+    @pytest.mark.asyncio
+    async def test_unbound_workspace_via_execute_returns_error_json(self) -> None:
+        """execute_capability_action on an unbound WorkspaceCapability returns error JSON."""
+        from kora_v2.capabilities.workspace import WorkspaceCapability
+        from kora_v2.capabilities.registry import ActionRegistry
+
+        cap = WorkspaceCapability()
+        registry = ActionRegistry()
+        cap.register_actions(registry)
+        action = registry.get("workspace.gmail.search")
+        assert action is not None
+
+        # Patch the registry so execute_capability_action uses our unbound action
+        with patch("kora_v2.graph.capability_bridge._get_action_registry") as mock_registry_fn:
+            mock_registry_fn.return_value = registry
+
+            result = await execute_capability_action(
+                "workspace.gmail.search", {"query": "hello"}, container=None
+            )
+
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed.get("error") is True
+        assert parsed["reason"] == "capability_not_configured"
+        assert parsed["capability"] == "workspace"
+
+    @pytest.mark.asyncio
+    async def test_unbound_browser_returns_capability_not_configured(self) -> None:
+        """BrowserCapability without bind() should return a structured failure."""
+        from kora_v2.capabilities.browser import BrowserCapability
+        from kora_v2.capabilities.registry import ActionRegistry
+        from kora_v2.capabilities.policy import SessionState
+
+        cap = BrowserCapability()
+        registry = ActionRegistry()
+        cap.register_actions(registry)
+
+        action = registry.get("browser.open")
+        assert action is not None
+        assert action.handler is not None
+
+        session = SessionState(session_id="test-unbound-browser")
+        result = await action.handler(session=session, task=None, url="https://example.com")
+
+        assert isinstance(result, StructuredFailure), (
+            f"Expected StructuredFailure, got {type(result)}: {result!r}"
+        )
+        assert result.reason == "capability_not_configured"
+        assert result.recoverable is False
+        assert result.capability == "browser"
+
+    @pytest.mark.asyncio
+    async def test_unbound_vault_returns_capability_not_configured(self) -> None:
+        """VaultCapability without bind() should return a structured failure."""
+        from kora_v2.capabilities.vault import VaultCapability
+        from kora_v2.capabilities.registry import ActionRegistry
+        from kora_v2.capabilities.policy import SessionState
+
+        cap = VaultCapability()
+        registry = ActionRegistry()
+        cap.register_actions(registry)
+
+        action = registry.get("vault.write_note")
+        assert action is not None
+        assert action.handler is not None
+
+        session = SessionState(session_id="test-unbound-vault")
+        result = await action.handler(
+            session=session, task=None,
+            relative_path="test.md", content="hello"
+        )
+
+        assert isinstance(result, StructuredFailure), (
+            f"Expected StructuredFailure, got {type(result)}: {result!r}"
+        )
+        assert result.reason == "capability_not_configured"
+        assert result.recoverable is False
+        assert result.capability == "vault"

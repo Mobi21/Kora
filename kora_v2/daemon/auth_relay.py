@@ -84,6 +84,7 @@ class AuthRelay:
         self._request_policy_keys: dict[str, PolicyKey] = {}  # req_id -> PolicyKey (policy path)
         self._session_grants: set[str] = set()
         self._broadcast: Callable[[dict], Awaitable[None]] | None = None
+        self._last_scope: dict[str, str] = {}
 
     def set_broadcast(self, fn: Callable[[dict], Awaitable[None]]) -> None:
         """Set the broadcast function for sending auth_request messages."""
@@ -290,7 +291,7 @@ class AuthRelay:
                 )
 
             # Retrieve the scope recorded by receive_response
-            scope = getattr(self, "_last_scope", {}).get(req_id, "allow_once")
+            scope = self._last_scope.get(req_id, "allow_once")
             serial = policy_key.serialize()
 
             if scope == "allow_session":
@@ -327,8 +328,7 @@ class AuthRelay:
             self._request_tools.pop(req_id, None)
             self._request_policy_keys.pop(req_id, None)
             self._decisions.pop(req_id, None)
-            if hasattr(self, "_last_scope"):
-                self._last_scope.pop(req_id, None)  # type: ignore[attr-defined]
+            self._last_scope.pop(req_id, None)
 
     # ------------------------------------------------------------------
     # Response handler (shared by both paths)
@@ -364,8 +364,6 @@ class AuthRelay:
 
             # Policy path: stash scope so request_permission_with_policy can read it
             elif scope in ("allow_session", "allow_task"):
-                if not hasattr(self, "_last_scope"):
-                    self._last_scope: dict[str, str] = {}
                 self._last_scope[request_id] = scope
                 log.info("auth_policy_scope_stashed", request_id=request_id, scope=scope)
 

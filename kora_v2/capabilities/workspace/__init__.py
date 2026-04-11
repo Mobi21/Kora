@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from kora_v2.capabilities.base import CapabilityHealth, CapabilityPack, HealthStatus
+from kora_v2.capabilities.base import (
+    CapabilityHealth,
+    CapabilityPack,
+    HealthStatus,
+    StructuredFailure,
+)
 from kora_v2.capabilities.policy import PolicyMatrix, SessionState, TaskState
 from kora_v2.capabilities.registry import ActionRegistry
 from kora_v2.capabilities.workspace.actions import (
@@ -58,6 +63,154 @@ _ACTION_METADATA: list[tuple[str, str, bool, bool]] = [
     ("workspace.docs.update",           "Update a Google Doc",                False, True),
     ("workspace.tasks.create",          "Create a Google Task",               False, True),
 ]
+
+# ── JSON schemas for each action (keyed by full action name) ─────────────────
+_WORKSPACE_ACTION_SCHEMAS: dict[str, dict] = {
+    "workspace.gmail.search": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Gmail search query string"},
+            "max_results": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100},
+        },
+        "required": ["query"],
+    },
+    "workspace.gmail.get_message": {
+        "type": "object",
+        "properties": {
+            "message_id": {"type": "string", "description": "Gmail message ID"},
+        },
+        "required": ["message_id"],
+    },
+    "workspace.gmail.draft": {
+        "type": "object",
+        "properties": {
+            "to": {"type": "string", "description": "Recipient email address"},
+            "subject": {"type": "string", "description": "Email subject"},
+            "body": {"type": "string", "description": "Email body text"},
+        },
+        "required": ["to", "subject", "body"],
+    },
+    "workspace.gmail.send": {
+        "type": "object",
+        "properties": {
+            "to": {"type": "string", "description": "Recipient email address"},
+            "subject": {"type": "string", "description": "Email subject"},
+            "body": {"type": "string", "description": "Email body text"},
+        },
+        "required": ["to", "subject", "body"],
+    },
+    "workspace.calendar.list": {
+        "type": "object",
+        "properties": {
+            "time_min": {"type": "string", "description": "Start of time range (RFC3339)"},
+            "time_max": {"type": "string", "description": "End of time range (RFC3339)"},
+            "calendar_id": {"type": "string", "description": "Calendar ID (defaults to primary)"},
+        },
+    },
+    "workspace.calendar.get_event": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "description": "Calendar event ID"},
+            "calendar_id": {"type": "string", "description": "Calendar ID (defaults to primary)"},
+        },
+        "required": ["event_id"],
+    },
+    "workspace.calendar.create_event": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "description": "Event title / summary"},
+            "start": {"type": "string", "description": "Start time (RFC3339)"},
+            "end": {"type": "string", "description": "End time (RFC3339)"},
+            "description": {"type": "string", "description": "Event description"},
+            "attendees": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of attendee email addresses",
+            },
+            "calendar_id": {"type": "string", "description": "Calendar ID (defaults to primary)"},
+        },
+        "required": ["summary", "start", "end"],
+    },
+    "workspace.calendar.update_event": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "description": "Calendar event ID"},
+            "updates": {"type": "object", "description": "Fields to update"},
+            "calendar_id": {"type": "string", "description": "Calendar ID (defaults to primary)"},
+        },
+        "required": ["event_id", "updates"],
+    },
+    "workspace.calendar.delete_event": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "description": "Calendar event ID"},
+            "calendar_id": {"type": "string", "description": "Calendar ID (defaults to primary)"},
+        },
+        "required": ["event_id"],
+    },
+    "workspace.drive.search": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Drive search query string"},
+            "max_results": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100},
+        },
+        "required": ["query"],
+    },
+    "workspace.drive.get_file": {
+        "type": "object",
+        "properties": {
+            "file_id": {"type": "string", "description": "Drive file ID"},
+        },
+        "required": ["file_id"],
+    },
+    "workspace.drive.upload": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Filename for the uploaded file"},
+            "content": {"type": "string", "description": "File content (text)"},
+            "mime_type": {"type": "string", "default": "text/plain", "description": "MIME type"},
+        },
+        "required": ["name", "content"],
+    },
+    "workspace.docs.read": {
+        "type": "object",
+        "properties": {
+            "document_id": {"type": "string", "description": "Google Docs document ID"},
+        },
+        "required": ["document_id"],
+    },
+    "workspace.docs.create": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Document title"},
+            "content": {"type": "string", "description": "Initial document content"},
+        },
+        "required": ["title"],
+    },
+    "workspace.docs.update": {
+        "type": "object",
+        "properties": {
+            "document_id": {"type": "string", "description": "Google Docs document ID"},
+            "updates": {"type": "object", "description": "Fields/requests to apply"},
+        },
+        "required": ["document_id", "updates"],
+    },
+    "workspace.tasks.list": {
+        "type": "object",
+        "properties": {
+            "list_id": {"type": "string", "description": "Task list ID (defaults to primary)"},
+        },
+    },
+    "workspace.tasks.create": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Task title"},
+            "list_id": {"type": "string", "description": "Task list ID (defaults to primary)"},
+            "notes": {"type": "string", "description": "Additional notes for the task"},
+        },
+        "required": ["title"],
+    },
+}
 
 # Map full action names → callable coroutine functions
 _ACTION_HANDLERS: dict[str, Any] = {
@@ -122,12 +275,24 @@ class WorkspaceCapability(CapabilityPack):
 
             # Build a closure that captures the current capability instance
             # and constructs a WorkspaceActionContext on each call.
-            def _make_handler(fn: Any, cap_instance: WorkspaceCapability) -> Any:
+            def _make_handler(fn: Any, cap_instance: WorkspaceCapability, action_name: str) -> Any:
                 async def _handler(
                     session: SessionState,
                     task: TaskState | None = None,
                     **kwargs: Any,
                 ) -> Any:
+                    if cap_instance._settings is None or cap_instance._mcp_manager is None:
+                        return StructuredFailure(
+                            capability="workspace",
+                            action=action_name,
+                            path="capability.unbound",
+                            reason="capability_not_configured",
+                            user_message=(
+                                "The workspace capability is not yet configured. "
+                                "Run the daemon doctor to see remediation."
+                            ),
+                            recoverable=False,
+                        )
                     ctx = cap_instance.make_context(session=session, task=task)
                     return await fn(ctx, **kwargs)
 
@@ -137,10 +302,10 @@ class WorkspaceCapability(CapabilityPack):
                 name=full_name,
                 description=description,
                 capability=cap_name,
-                input_schema={"type": "object", "properties": {}},
+                input_schema=_WORKSPACE_ACTION_SCHEMAS.get(full_name, {"type": "object", "properties": {}}),
                 requires_approval=requires_approval,
                 read_only=read_only,
-                handler=_make_handler(handler_fn, self) if handler_fn else None,
+                handler=_make_handler(handler_fn, self, full_name) if handler_fn else None,
             )
             registry.register(action)
 

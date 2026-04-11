@@ -3,7 +3,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from kora_v2.capabilities.base import Action, CapabilityHealth, CapabilityPack, HealthStatus
+from kora_v2.capabilities.base import (
+    Action,
+    CapabilityHealth,
+    CapabilityPack,
+    HealthStatus,
+    StructuredFailure,
+)
 from kora_v2.capabilities.browser.actions import (
     BrowserActionContext,
     browser_click,
@@ -42,6 +48,80 @@ _ACTION_METADATA: list[tuple[str, str, bool, bool]] = [
     ("browser.type",            "Type text into an element in the browser",         False, False),
     ("browser.fill",            "Fill an element with a value in the browser",      False, False),
 ]
+
+# ── JSON schemas for each action (keyed by full action name) ─────────────────
+_BROWSER_ACTION_SCHEMAS: dict[str, dict] = {
+    "browser.open": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "URL to open in the browser"},
+        },
+        "required": ["url"],
+    },
+    "browser.snapshot": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session ID"},
+        },
+        "required": ["session_id"],
+    },
+    "browser.screenshot": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session ID"},
+            "out_path": {"type": "string", "description": "Output file path for the screenshot (optional)"},
+        },
+        "required": ["session_id"],
+    },
+    "browser.clip_page": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session ID"},
+        },
+        "required": ["session_id"],
+    },
+    "browser.clip_selection": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session ID"},
+            "ref": {"type": "string", "description": "Element reference ID to clip"},
+        },
+        "required": ["session_id", "ref"],
+    },
+    "browser.close": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session ID to close"},
+        },
+        "required": ["session_id"],
+    },
+    "browser.click": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session ID"},
+            "ref": {"type": "string", "description": "Element reference ID to click"},
+        },
+        "required": ["session_id", "ref"],
+    },
+    "browser.type": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session ID"},
+            "ref": {"type": "string", "description": "Element reference ID"},
+            "text": {"type": "string", "description": "Text to type into the element"},
+        },
+        "required": ["session_id", "ref", "text"],
+    },
+    "browser.fill": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session ID"},
+            "ref": {"type": "string", "description": "Element reference ID"},
+            "value": {"type": "string", "description": "Value to fill into the element"},
+        },
+        "required": ["session_id", "ref", "value"],
+    },
+}
 
 # Map full action names → callable coroutine functions
 _ACTION_HANDLERS: dict[str, Any] = {
@@ -93,12 +173,24 @@ class BrowserCapability(CapabilityPack):
         for full_name, description, read_only, requires_approval in _ACTION_METADATA:
             handler_fn = _ACTION_HANDLERS.get(full_name)
 
-            def _make_handler(fn: Any, cap: BrowserCapability) -> Any:
+            def _make_handler(fn: Any, cap: BrowserCapability, action_name: str) -> Any:
                 async def _handler(
                     session: SessionState,
                     task: TaskState | None = None,
                     **call_kwargs: Any,
                 ) -> Any:
+                    if cap._config is None:
+                        return StructuredFailure(
+                            capability="browser",
+                            action=action_name,
+                            path="capability.unbound",
+                            reason="capability_not_configured",
+                            user_message=(
+                                "The browser capability is not yet configured. "
+                                "Run the daemon doctor to see remediation."
+                            ),
+                            recoverable=False,
+                        )
                     ctx = cap.make_context(session=session, task=task)
                     return await fn(ctx, **call_kwargs)
 
@@ -108,10 +200,10 @@ class BrowserCapability(CapabilityPack):
                 name=full_name,
                 description=description,
                 capability=self.name,
-                input_schema={"type": "object", "properties": {}},
+                input_schema=_BROWSER_ACTION_SCHEMAS.get(full_name, {"type": "object", "properties": {}}),
                 requires_approval=requires_approval,
                 read_only=read_only,
-                handler=_make_handler(handler_fn, cap_instance) if handler_fn else None,
+                handler=_make_handler(handler_fn, cap_instance, full_name) if handler_fn else None,
             )
             registry.register(action)
 

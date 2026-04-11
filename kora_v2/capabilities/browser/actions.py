@@ -1,6 +1,7 @@
 """Browser capability actions."""
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -289,9 +290,8 @@ async def browser_screenshot(
     import tempfile
 
     if out_path is None:
-        out_path = str(
-            tempfile.mktemp(suffix=".png", prefix="kora_browser_")
-        )
+        fd, out_path = tempfile.mkstemp(suffix=".png", prefix="kora_browser_")
+        os.close(fd)  # we just want the path; agent-browser will overwrite it
 
     try:
         return await ctx.binary.session_screenshot(session_id, out_path)
