@@ -18,6 +18,9 @@ Topics
 from __future__ import annotations
 
 import importlib
+import os
+import shutil
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -523,6 +526,199 @@ class RuntimeInspector:
             except ImportError as exc:
                 _check(f"module_{attr}", False, str(exc))
 
+        # ── 7. Dependency / install sanity ────────────────────────────────
+
+        # python_version_ok
+        vi = sys.version_info
+        _check(
+            "python_version_ok",
+            vi >= (3, 12),
+            f"{vi.major}.{vi.minor}.{vi.micro}",
+        )
+
+        # pysqlite3_swap — did kora_v2 replace stdlib sqlite3 with pysqlite3?
+        try:
+            import kora_v2  # noqa: F401 — side-effect: may swap sqlite3
+
+            sqlite3_mod = sys.modules.get("sqlite3")
+            is_pysqlite3 = sqlite3_mod is not None and getattr(
+                sqlite3_mod, "__file__", ""
+            ) and "pysqlite3" in str(getattr(sqlite3_mod, "__file__", ""))
+            detail = "pysqlite3 active" if is_pysqlite3 else "stdlib sqlite3 (fallback)"
+            _check("pysqlite3_swap", True, detail)
+        except Exception as exc:
+            _check("pysqlite3_swap", False, str(exc))
+
+        # sentence_transformers importable (soft)
+        try:
+            import sentence_transformers as _st
+
+            _check(
+                "sentence_transformers_importable",
+                True,
+                getattr(_st, "__version__", "unknown"),
+            )
+        except ImportError:
+            _check("sentence_transformers_importable", True, "optional — not installed (vector search degraded)")
+
+        # sqlite_vec loadable
+        try:
+            import sqlite_vec
+
+            loadable_path = sqlite_vec.loadable_path()
+            _check("sqlite_vec_loadable", True, str(loadable_path))
+        except ImportError:
+            _check("sqlite_vec_loadable", False, "sqlite_vec not installed")
+        except Exception as exc:
+            _check("sqlite_vec_loadable", False, str(exc))
+
+        # ── 8. MCP servers ────────────────────────────────────────────────
+
+        mcp_servers = self.container.settings.mcp.servers
+        if not mcp_servers:
+            _check("mcp_servers_configured", True, "no MCP servers configured")
+        else:
+            mcp_manager = getattr(self.container, "_mcp_manager", None)
+            for srv_name in mcp_servers:
+                # Confirm registration
+                _check(f"mcp_server_{srv_name}_configured", True, "registered")
+                # Check running state — read-only, do NOT start server
+                if mcp_manager is not None:
+                    try:
+                        info = mcp_manager.get_server_info(srv_name)
+                        if info is not None:
+                            state = str(getattr(info, "state", "unknown"))
+                            running = state == "running"
+                            _check(
+                                f"mcp_server_{srv_name}_running",
+                                running,
+                                f"state={state}",
+                            )
+                        else:
+                            _check(
+                                f"mcp_server_{srv_name}_running",
+                                True,
+                                "not yet started (lazy startup)",
+                            )
+                    except Exception as exc:
+                        _check(
+                            f"mcp_server_{srv_name}_running",
+                            True,
+                            f"not yet started: {exc}",
+                        )
+                else:
+                    _check(
+                        f"mcp_server_{srv_name}_running",
+                        True,
+                        "not yet started (lazy startup)",
+                    )
+
+            # mcp_tool_discovery — report tool count per running server
+            if mcp_manager is not None:
+                try:
+                    servers_info = mcp_manager.list_servers()
+                    running_servers = [
+                        s for s in servers_info
+                        if str(getattr(s, "state", "")) == "running"
+                    ]
+                    if running_servers:
+                        parts = [
+                            f"{s.name}={len(s.tools)}" for s in running_servers
+                        ]
+                        _check("mcp_tool_discovery", True, ", ".join(parts))
+                    else:
+                        _check(
+                            "mcp_tool_discovery",
+                            True,
+                            "no servers running yet (lazy startup)",
+                        )
+                except Exception as exc:
+                    _check("mcp_tool_discovery", True, f"manager query failed: {exc}")
+            else:
+                _check(
+                    "mcp_tool_discovery",
+                    True,
+                    "mcp_manager not initialised (lazy startup)",
+                )
+
+        # ── 9. Capability packs ───────────────────────────────────────────
+
+        try:
+            from kora_v2.capabilities import get_all_capabilities
+            from kora_v2.capabilities.base import HealthStatus
+
+            packs = get_all_capabilities()
+            _check(
+                "capability_registry_ok",
+                len(packs) >= 4,
+                f"{len(packs)} packs registered",
+            )
+            for pack in packs:
+                try:
+                    health = await pack.health_check()
+                    pack_passed = health.status != HealthStatus.UNHEALTHY
+                    _check(
+                        f"capability_{pack.name}",
+                        pack_passed,
+                        f"{health.status}: {health.summary}",
+                    )
+                except Exception as pack_exc:
+                    _check(f"capability_{pack.name}", False, str(pack_exc))
+        except Exception as cap_exc:
+            _check("capability_registry_ok", False, str(cap_exc))
+
+        # ── 10. Agent-browser binary presence ────────────────────────────
+
+        try:
+            binary_path = self.container.settings.browser.binary_path
+            resolved: str | None = None
+            if binary_path:
+                # Explicit path configured — verify it actually exists on disk
+                if Path(binary_path).exists():
+                    resolved = binary_path
+                # else: resolved stays None → check fails with "not found"
+            if resolved is None:
+                # Fall back to PATH search
+                resolved = shutil.which("agent-browser")
+            _check(
+                "agent_browser_present",
+                resolved is not None,
+                resolved if resolved else "not found on PATH",
+            )
+        except Exception as exc:
+            _check("agent_browser_present", False, str(exc))
+
+        # ── 11. Vault mirror path ─────────────────────────────────────────
+
+        try:
+            vault_enabled = self.container.settings.vault.enabled
+            vault_path_str = self.container.settings.vault.path
+
+            if not vault_enabled:
+                _check("vault_enabled", True, "vault disabled")
+            else:
+                vault_path = Path(vault_path_str) if vault_path_str else None
+                if vault_path is None or not vault_path_str:
+                    _check("vault_path_configured", False, f"path={vault_path_str!r}")
+                elif not vault_path.exists():
+                    _check(
+                        "vault_path_configured",
+                        False,
+                        f"path={vault_path_str!r} does not exist",
+                    )
+                elif not vault_path.is_dir():
+                    _check(
+                        "vault_path_configured",
+                        False,
+                        f"path={vault_path_str!r} is not a directory",
+                    )
+                elif os.access(str(vault_path), os.W_OK):
+                    _check("vault_writable", True, vault_path_str)
+                else:
+                    _check("vault_writable", False, "not writable")
+        except Exception as exc:
+            _check("vault_enabled", False, str(exc))
+
         passed = sum(1 for c in checks if c["passed"])
         total = len(checks)
         return {
@@ -735,3 +931,59 @@ class RuntimeInspector:
             "criteria": results,
             "runtime": runtime_metadata(),
         }
+
+
+# ── Doctor pretty-printer ─────────────────────────────────────────────────
+
+
+def doctor_report_lines(report: dict[str, Any]) -> list[str]:
+    """Render a doctor report dict as a list of human-readable strings.
+
+    Example output::
+
+        Doctor: 18/22 checks passed  [DEGRADED]
+          ✓ operational_db_schema (tables=26)
+          ✓ python_version_ok (3.12.3)
+          ✗ capability_workspace (unimplemented — not yet implemented)
+
+    Parameters
+    ----------
+    report:
+        The dict returned by :meth:`RuntimeInspector.doctor`.
+
+    Returns
+    -------
+    list[str]
+        One line per item, suitable for ``print("\\n".join(lines))``.
+    """
+    checks: list[dict[str, Any]] = report.get("checks", [])
+    if not checks:
+        summary = report.get("summary", "no checks")
+        return [f"Doctor: {summary}"]
+
+    summary = report.get("summary", "")
+    healthy = report.get("healthy", False)
+    status_label = "OK" if healthy else "DEGRADED"
+
+    lines: list[str] = [f"Doctor: {summary}  [{status_label}]"]
+    for check in checks:
+        name = check.get("name", "?")
+        passed = check.get("passed", False)
+        detail = check.get("detail", "")
+        tick = "\u2713" if passed else "\u2717"
+        line = f"  {tick} {name}"
+        if detail:
+            line += f" ({detail})"
+        lines.append(line)
+
+    return lines
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────
+# Supports: python -m kora_v2.runtime.inspector <topic>
+# The __main__.py package entry also handles: python -m kora_v2.runtime <topic>
+
+if __name__ == "__main__":
+    from kora_v2.runtime.__main__ import main
+
+    main()

@@ -1,0 +1,72 @@
+name: workspace_capability
+display_name: "Google Workspace (Gmail, Calendar, Drive, Docs, Tasks)"
+
+activation: always
+
+tools:
+  # Reads — no approval required
+  - workspace.gmail.search
+  - workspace.gmail.get_message
+  - workspace.calendar.list
+  - workspace.calendar.get_event
+  - workspace.drive.search
+  - workspace.drive.get_file
+  - workspace.docs.read
+  - workspace.tasks.list
+  # Writes — require explicit approval
+  - workspace.gmail.draft
+  - workspace.gmail.send
+  - workspace.calendar.create_event
+  - workspace.calendar.update_event
+  - workspace.calendar.delete_event
+  - workspace.drive.upload
+  - workspace.docs.create
+  - workspace.docs.update
+  - workspace.tasks.create
+
+discovery_tools:
+  - workspace.gmail.search
+  - workspace.calendar.list
+  - workspace.drive.search
+  - workspace.tasks.list
+
+guidance: |
+  ## Google Workspace Tools
+
+  You have access to Gmail, Calendar, Drive, Docs, and Tasks via the
+  workspace capability pack. These tools call the Google Workspace MCP
+  server and require that the user has authenticated.
+
+  **Read actions (no approval needed):**
+  - ``workspace.gmail.search`` — search the user's Gmail inbox
+  - ``workspace.gmail.get_message`` — read a specific Gmail message by ID
+  - ``workspace.calendar.list`` — list upcoming calendar events
+  - ``workspace.calendar.get_event`` — get a specific calendar event by ID
+  - ``workspace.drive.search`` — search Google Drive files
+  - ``workspace.drive.get_file`` — read a Drive file's content
+  - ``workspace.docs.read`` — read a Google Doc
+  - ``workspace.tasks.list`` — list Google Tasks
+
+  **Write actions (require explicit user approval before executing):**
+  - ``workspace.gmail.draft`` — create a Gmail draft
+  - ``workspace.gmail.send`` — send an email
+  - ``workspace.calendar.create_event`` — create a calendar event
+  - ``workspace.calendar.update_event`` — update a calendar event
+  - ``workspace.calendar.delete_event`` — delete a calendar event
+  - ``workspace.drive.upload`` — upload a file to Drive
+  - ``workspace.docs.create`` — create a new Google Doc
+  - ``workspace.docs.update`` — update a Google Doc
+  - ``workspace.tasks.create`` — create a new Google Task
+
+  **When these tools fail:**
+  If a workspace tool returns an error, acknowledge it to the user and name
+  the failed path. You may use ``browser.open`` to read Google content after
+  acknowledging the MCP failure. Never silently write to the user's Google
+  account using the browser — that requires explicit approval.
+
+  **Activation examples:**
+  - "Check my emails from today" → workspace.gmail.search
+  - "What's on my calendar this week?" → workspace.calendar.list
+  - "Search my Drive for the Q1 report" → workspace.drive.search
+  - "Draft a reply to that email" → workspace.gmail.draft (requires approval)
+  - "Schedule a meeting for tomorrow at 3pm" → workspace.calendar.create_event

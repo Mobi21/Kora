@@ -90,9 +90,21 @@ def _extract_tool_usage(messages: list[dict[str, Any]]) -> dict[str, Any]:
         "start_focus_block", "end_focus_block",
     }
     fs_tools = {"read_file", "write_file", "list_directory", "create_directory", "file_exists"}
+    # Legacy MCP tool names — kept for backward-compat; capability tools go in their own buckets
     mcp_tools = {"search_web", "fetch_url"}
     auto_tools = {"start_autonomous"}
     memory_tools = {"recall"}
+
+    # Capability-pack buckets: any tool name starting with the pack prefix.
+    capability_workspace = sorted(
+        t for t in tool_counts if t.startswith("workspace.")
+    )
+    capability_browser = sorted(
+        t for t in tool_counts if t.startswith("browser.")
+    )
+    capability_vault = sorted(
+        t for t in tool_counts if t.startswith("vault.")
+    )
 
     return {
         "tool_counts": tool_counts,
@@ -103,7 +115,43 @@ def _extract_tool_usage(messages: list[dict[str, Any]]) -> dict[str, Any]:
         "mcp": sorted(t for t in tool_counts if t in mcp_tools),
         "autonomous": sorted(t for t in tool_counts if t in auto_tools),
         "memory": sorted(t for t in tool_counts if t in memory_tools),
+        # Phase 9 capability-pack buckets
+        "capability_workspace": capability_workspace,
+        "capability_browser": capability_browser,
+        "capability_vault": capability_vault,
     }
+
+
+async def _build_capability_health() -> dict[str, Any]:
+    """Invoke each registered capability pack's health_check() and return results.
+
+    Returns a dict keyed by pack name containing serialisable CapabilityHealth data.
+    Falls back gracefully if the capabilities package is not importable.
+    """
+    try:
+        from kora_v2.capabilities.registry import get_all_capabilities
+    except ImportError:
+        return {}
+
+    results: dict[str, Any] = {}
+    packs = get_all_capabilities()
+    for pack in packs:
+        try:
+            health = await pack.health_check()
+            results[pack.name] = {
+                "status": str(health.status),
+                "summary": health.summary,
+                "remediation": health.remediation,
+                "details": health.details,
+            }
+        except Exception as exc:
+            results[pack.name] = {
+                "status": "error",
+                "summary": f"health_check() raised: {exc}",
+                "remediation": None,
+                "details": {},
+            }
+    return results
 
 
 async def _query_life_management(output_dir: Path) -> dict[str, Any]:
@@ -301,11 +349,61 @@ async def build_report(
     else:
         lines.append("- Autonomous: (no tools called)")
 
+    if tool_usage["capability_workspace"]:
+        lines.append(f"- Capability (workspace): {', '.join(tool_usage['capability_workspace'])}")
+    else:
+        lines.append("- Capability (workspace): (no calls)")
+
+    if tool_usage["capability_browser"]:
+        lines.append(f"- Capability (browser): {', '.join(tool_usage['capability_browser'])}")
+    else:
+        lines.append("- Capability (browser): (no calls)")
+
+    if tool_usage["capability_vault"]:
+        lines.append(f"- Capability (vault): {', '.join(tool_usage['capability_vault'])}")
+    else:
+        lines.append("- Capability (vault): (no calls)")
+
     if tool_usage["tool_counts"]:
         lines.append("")
         lines.append("Call counts:")
         for name, count in sorted(tool_usage["tool_counts"].items(), key=lambda x: -x[1]):
             lines.append(f"  {name}: {count}")
+
+    # ── Capability Pack Health ─────────────────────────────────────────────
+    cap_health = await _build_capability_health()
+    _EXPECTED_PACKS = ("workspace", "browser", "vault", "doctor")
+    lines.append(f"\n## Capability Packs ({len(cap_health)} packs)")
+    for pack_name in _EXPECTED_PACKS:
+        info = cap_health.get(pack_name, {})
+        status = info.get("status", "unknown")
+        summary = info.get("summary", "(not registered)")
+        remediation = info.get("remediation")
+        # Count capability actions in this pack from tool_counts
+        pack_calls = sum(
+            count
+            for tool_name, count in tool_usage["tool_counts"].items()
+            if tool_name.startswith(f"{pack_name}.")
+        )
+        line = f"- {pack_name}: status={status} calls={pack_calls} — {summary}"
+        if remediation:
+            line += f"\n  Remediation: {remediation}"
+        lines.append(line)
+
+    # ── Policy Grants ──────────────────────────────────────────────────────
+    # auth_test_results already tracks deny/approve events; here we also count
+    # auth_request events that represent approval prompts surfaced for new
+    # capability/account/action fields (Phase 9 policy matrix enforcement).
+    auth_results = session_state.get("auth_test_results", [])
+    approval_prompts = len(auth_results)
+    approved = sum(1 for ar in auth_results if ar.get("approved"))
+    denied = sum(1 for ar in auth_results if not ar.get("approved") and ar.get("approved") is not None)
+    timed_out = approval_prompts - approved - denied
+
+    lines.append(f"\n## Policy Grants ({approval_prompts} approval prompts)")
+    lines.append(f"- Approved: {approved}")
+    lines.append(f"- Denied: {denied}")
+    lines.append(f"- Timed out / unknown: {timed_out}")
 
     # ── Life Management Records ──────────────────────────────────────────
     life_data = await _query_life_management(output_dir)
@@ -370,13 +468,13 @@ async def build_report(
         lines.append("\n## Compaction")
         lines.append("No compaction events detected during the test run.")
 
-    # ── Auth Test Results ─────────────────────────────────────────────────
-    auth_results = session_state.get("auth_test_results", [])
+    # ── Auth Test Results (detail log) ───────────────────────────────────────
+    # auth_results was already fetched for the Policy Grants summary above.
     if auth_results:
         lines.append(f"\n## Auth Relay Test ({len(auth_results)} events)")
         for ar in auth_results:
-            status = "APPROVED" if ar.get("approved") else "DENIED"
-            lines.append(f"- [{status}] tool={ar.get('tool')} risk={ar.get('risk')} at {ar.get('ts', '?')}")
+            ar_status = "APPROVED" if ar.get("approved") else "DENIED"
+            lines.append(f"- [{ar_status}] tool={ar.get('tool')} risk={ar.get('risk')} at {ar.get('ts', '?')}")
 
     # ── Snapshots summary ─────────────────────────────────────────────────
     snapshots = sorted(snapshots_dir.glob("*.json"))
@@ -440,6 +538,24 @@ async def build_report(
         gap_warnings.append("No MCP/web tools used (item 9)")
     if not tool_usage["autonomous"]:
         gap_warnings.append("No autonomous work started (item 21)")
+    # Phase 9 capability-pack gap check (item 24)
+    any_cap_calls = (
+        tool_usage["capability_workspace"]
+        or tool_usage["capability_browser"]
+        or tool_usage["capability_vault"]
+    )
+    if not any_cap_calls:
+        # Check if at least one pack is UNCONFIGURED/DEGRADED (still satisfies item 24)
+        cap_gap = True
+        for pack_name in ("workspace", "browser", "vault"):
+            info = cap_health.get(pack_name, {})
+            if info.get("status") in ("unconfigured", "degraded", "unhealthy", "unimplemented"):
+                cap_gap = False
+                break
+        if cap_gap:
+            gap_warnings.append(
+                "No capability-pack tool calls and no degraded/unconfigured packs (item 24)"
+            )
 
     if gap_warnings:
         lines.append(f"\n## Coverage Gap Warnings ({len(gap_warnings)})")

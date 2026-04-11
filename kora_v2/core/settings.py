@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
@@ -170,6 +170,19 @@ class SecuritySettings(BaseModel):
     auth_mode: str = "prompt"  # "prompt" = normal flow, "trust_all" = skip ASK_FIRST prompts
 
 
+# ── Browser ──────────────────────────────────────────────────────────────
+
+class BrowserSettings(BaseModel):
+    """Agent-browser integration."""
+
+    enabled: bool = False
+    binary_path: str = ""  # empty = auto-detect on PATH
+    default_profile: str = ""  # empty = use browser default
+    clip_target: str = "vault"  # "vault" | "memory" | "both" | "none"
+    max_session_duration_seconds: int = 3600
+    command_timeout_seconds: int = 30
+
+
 # ── Vault ────────────────────────────────────────────────────────────────
 
 class VaultSettings(BaseModel):
@@ -177,6 +190,15 @@ class VaultSettings(BaseModel):
 
     enabled: bool = True
     path: str = ""
+
+
+# ── Workspace config default factory ─────────────────────────────────────────
+# Imported lazily via a factory to keep settings.py free of capability imports
+# while still allowing WorkspaceConfig to be declared on Settings.
+
+def _workspace_config_default() -> Any:
+    from kora_v2.capabilities.workspace.config import WorkspaceConfig  # noqa: PLC0415
+    return WorkspaceConfig()
 
 
 # ── Root ─────────────────────────────────────────────────────────────────
@@ -200,6 +222,8 @@ class Settings(BaseSettings):
     mcp: MCPSettings = MCPSettings()
     security: SecuritySettings = SecuritySettings()
     vault: VaultSettings = VaultSettings()
+    browser: BrowserSettings = BrowserSettings()
+    workspace: Any = Field(default_factory=_workspace_config_default)
 
     model_config = SettingsConfigDict(
         toml_file=Path("~/.kora/settings.toml").expanduser(),
@@ -244,6 +268,8 @@ class Settings(BaseSettings):
         )
         if self.vault.path:
             self.vault.path = str(Path(self.vault.path).expanduser())
+        if self.browser.binary_path:
+            self.browser.binary_path = str(Path(self.browser.binary_path).expanduser())
         return self
 
     # ── Derived helpers ──────────────────────────────────────────────

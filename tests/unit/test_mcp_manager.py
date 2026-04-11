@@ -7,7 +7,7 @@ at a command that cannot exist on the filesystem.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,6 +18,7 @@ from kora_v2.mcp.manager import (
     MCPServerState,
     MCPServerUnavailableError,
 )
+from kora_v2.mcp.results import MCPToolResult
 
 
 def _settings(servers: dict[str, MCPServerConfig] | None = None) -> MCPSettings:
@@ -174,3 +175,90 @@ class TestHealthCheck:
         })
         manager = MCPManager(settings)
         assert await manager.health_check("svc") is False
+
+
+class TestCallToolStructuredResult:
+    """call_tool returns MCPToolResult; call_tool_text returns str."""
+
+    def _running_manager(self, server_name: str = "srv") -> MCPManager:
+        """Return a manager with a server in RUNNING state (no real process)."""
+        settings = _settings({
+            server_name: MCPServerConfig(command="fake-mcp"),
+        })
+        manager = MCPManager(settings)
+        info = manager.get_server_info(server_name)
+        assert info is not None
+        info.state = MCPServerState.RUNNING
+        info.tools = ["my_tool"]
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_call_tool_returns_mcp_tool_result(self) -> None:
+        manager = self._running_manager()
+        raw_response = {
+            "content": [{"type": "text", "text": "hello from mcp"}],
+            "isError": False,
+        }
+        with patch.object(
+            manager,
+            "_send_request",
+            new=AsyncMock(return_value=raw_response),
+        ):
+            result = await manager.call_tool("srv", "my_tool", {})
+
+        assert isinstance(result, MCPToolResult)
+        assert result.server == "srv"
+        assert result.tool == "my_tool"
+        assert result.is_error is False
+        assert result.text == "hello from mcp"
+
+    @pytest.mark.asyncio
+    async def test_call_tool_propagates_is_error(self) -> None:
+        manager = self._running_manager()
+        raw_response = {
+            "content": [{"type": "text", "text": "boom"}],
+            "isError": True,
+        }
+        with patch.object(
+            manager,
+            "_send_request",
+            new=AsyncMock(return_value=raw_response),
+        ):
+            result = await manager.call_tool("srv", "my_tool", {})
+
+        assert isinstance(result, MCPToolResult)
+        assert result.is_error is True
+        assert result.text == "boom"
+
+    @pytest.mark.asyncio
+    async def test_call_tool_text_returns_string(self) -> None:
+        manager = self._running_manager()
+        raw_response = {
+            "content": [{"type": "text", "text": "string result"}],
+        }
+        with patch.object(
+            manager,
+            "_send_request",
+            new=AsyncMock(return_value=raw_response),
+        ):
+            text = await manager.call_tool_text("srv", "my_tool", {})
+
+        assert isinstance(text, str)
+        assert text == "string result"
+
+    @pytest.mark.asyncio
+    async def test_call_tool_structured_data(self) -> None:
+        """structured_data surfaces JSON embedded in a text block."""
+        import json as _json
+        manager = self._running_manager()
+        payload = _json.dumps({"key": "value"})
+        raw_response = {"content": [{"type": "text", "text": payload}]}
+        with patch.object(
+            manager,
+            "_send_request",
+            new=AsyncMock(return_value=raw_response),
+        ):
+            result = await manager.call_tool("srv", "my_tool", {})
+
+        assert result.structured_data == {"key": "value"}
+        assert result.first_json == {"key": "value"}

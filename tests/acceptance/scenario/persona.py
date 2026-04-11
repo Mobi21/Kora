@@ -99,11 +99,16 @@ EVENING_MESSAGES = [
     "alright wrapping up. took my melatonin 3mg. what should i focus on tomorrow morning when i'm fresh?",
 ]
 
-# Research trigger messages — should naturally invoke search_web
+# Research trigger messages — should naturally invoke search_web or browser.open fallback
 RESEARCH_TRIGGERS = [
     "hey can you look up what the best developer productivity tools are right now? like what's actually popular in 2025/2026?",
     "search for local-first productivity apps — i want to know what's out there for privacy-focused tools",
     "can you research what focus timer apps developers actually use? find me some real options",
+]
+
+# Workspace capability trigger messages — naturally invoke calendar or email actions
+WORKSPACE_TRIGGERS = [
+    "hey can you check my calendar for this week? i want to see if i have any conflicts with the project deadlines",
 ]
 
 # File operation trigger messages — should naturally invoke filesystem tools

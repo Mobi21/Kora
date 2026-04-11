@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -12,7 +12,19 @@ from kora_v2.graph.dispatch import (
     _resolve_auth_context,
     execute_tool,
 )
+from kora_v2.mcp.results import MCPContentBlock, MCPToolResult
 from kora_v2.tools.types import AuthLevel
+
+
+def _mk_result(text: str, **kwargs: object) -> MCPToolResult:
+    """Build a minimal MCPToolResult with a single text block."""
+    return MCPToolResult(
+        server=str(kwargs.get("server", "test")),
+        tool=str(kwargs.get("tool", "test")),
+        is_error=bool(kwargs.get("is_error", False)),
+        content=[MCPContentBlock(type="text", text=text)],
+        raw={},
+    )
 
 
 class TestToolDefinitions:
@@ -56,21 +68,30 @@ class TestAuthContext:
 
 
 class TestSearchWebUnavailable:
-    """Without a configured brave_search MCP, search_web falls back to DuckDuckGo."""
+    """Without a configured brave_search MCP, search_web returns an explicit failure dict.
+
+    The silent DuckDuckGo fallback was removed in Task 9. All unavailable-MCP
+    paths now return a structured failure with ``degraded: true`` and
+    ``next_options: ["browser.open"]`` so the model can acknowledge the failure
+    and use an approved alternative.
+    """
 
     @pytest.mark.asyncio
-    async def test_no_container_uses_fallback(self) -> None:
+    async def test_no_container_returns_explicit_failure(self) -> None:
         result = await execute_tool(
             "search_web",
             {"query": "weather today", "count": 3},
             container=None,
         )
         parsed = json.loads(result)
-        # Fallback either returns results or an error with source="fallback"
-        assert "source" in parsed or "error" in parsed
+        # Must be an explicit failure, NOT a DuckDuckGo fallback result
+        assert parsed.get("degraded") is True
+        assert parsed.get("results") == []
+        assert parsed.get("source") != "fallback"
+        assert "browser.open" in parsed.get("next_options", [])
 
     @pytest.mark.asyncio
-    async def test_no_mcp_manager_uses_fallback(self) -> None:
+    async def test_no_mcp_manager_returns_explicit_failure(self) -> None:
         container = MagicMock()
         container.mcp_manager = None
         container.settings.security.auth_mode = "trust_all"
@@ -81,10 +102,11 @@ class TestSearchWebUnavailable:
             container=container,
         )
         parsed = json.loads(result)
-        assert "source" in parsed or "error" in parsed
+        assert parsed.get("degraded") is True
+        assert "browser.open" in parsed.get("next_options", [])
 
     @pytest.mark.asyncio
-    async def test_brave_search_not_configured_uses_fallback(self) -> None:
+    async def test_brave_search_not_configured_returns_explicit_failure(self) -> None:
         container = MagicMock()
         container.mcp_manager.get_server_info = MagicMock(return_value=None)
         container.settings.security.auth_mode = "trust_all"
@@ -95,7 +117,8 @@ class TestSearchWebUnavailable:
             container=container,
         )
         parsed = json.loads(result)
-        assert "source" in parsed or "error" in parsed
+        assert parsed.get("degraded") is True
+        assert parsed["failed_path"] == "mcp.brave_search.brave_web_search"
 
     @pytest.mark.asyncio
     async def test_empty_query_returns_error(self) -> None:
@@ -130,7 +153,9 @@ class TestSearchWebWithMCP:
         container.mcp_manager.get_server_info = MagicMock(
             return_value=MagicMock(name="brave_info")
         )
-        container.mcp_manager.call_tool = AsyncMock(return_value=brave_payload)
+        container.mcp_manager.call_tool = AsyncMock(
+            return_value=_mk_result(brave_payload, server="brave_search", tool="brave_web_search")
+        )
         container.settings.security.auth_mode = "trust_all"
         container.session_manager = None
 
@@ -146,50 +171,27 @@ class TestSearchWebWithMCP:
         container.mcp_manager.call_tool.assert_awaited_once()
 
 
-class TestFetchUrlFallback:
-    """fetch_url falls back to urllib when MCP is unavailable."""
+class TestFetchUrlNoFallback:
+    """fetch_url returns explicit failure dicts when MCP is unavailable.
+
+    The urllib fallback was removed in Task 9.  All unavailable-MCP paths now
+    return a structured failure with ``degraded: true`` and
+    ``next_options: ["browser.open"]``.
+    """
 
     @pytest.mark.asyncio
-    async def test_urllib_fallback_strips_tags(self) -> None:
-        html = (
-            b"<html><head><title>T</title>"
-            b"<script>var x=1;</script></head>"
-            b"<body><p>Hello <b>world</b>!</p></body></html>"
+    async def test_no_container_returns_explicit_failure(self) -> None:
+        result = await execute_tool(
+            "fetch_url",
+            {"url": "https://example.com/page", "max_chars": 500},
+            container=None,
         )
-
-        class FakeResp:
-            def __init__(self, data: bytes) -> None:
-                self._data = data
-                self.headers = MagicMock()
-                self.headers.get_content_charset = MagicMock(return_value="utf-8")
-
-            def read(self) -> bytes:
-                return self._data
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        with patch("urllib.request.urlopen", return_value=FakeResp(html)):
-            result = await execute_tool(
-                "fetch_url",
-                {"url": "https://example.com/page", "max_chars": 500},
-                container=None,
-            )
-
         parsed = json.loads(result)
-        assert parsed["url"] == "https://example.com/page"
-        assert "Hello" in parsed["content"]
-        assert "world" in parsed["content"]
-        # HTML tags must not leak into content.
-        assert "<b>" not in parsed["content"]
-        assert "<script>" not in parsed["content"]
-        # Script contents must have been removed.
-        assert "var x=1" not in parsed["content"]
-        assert parsed["chars"] == len(parsed["content"])
-        assert parsed.get("source") == "urllib"
+        # Must be an explicit failure, NOT a urllib-scraped result
+        assert parsed.get("degraded") is True
+        assert parsed.get("source") != "urllib"
+        assert parsed["failed_path"] == "mcp.fetch.fetch"
+        assert "browser.open" in parsed.get("next_options", [])
 
     @pytest.mark.asyncio
     async def test_missing_url_returns_error(self) -> None:
@@ -199,19 +201,19 @@ class TestFetchUrlFallback:
         assert parsed["chars"] == 0
 
     @pytest.mark.asyncio
-    async def test_urllib_network_error_returns_error(self) -> None:
-        with patch(
-            "urllib.request.urlopen",
-            side_effect=OSError("connection refused"),
-        ):
-            result = await execute_tool(
-                "fetch_url",
-                {"url": "https://nowhere.invalid"},
-                container=None,
-            )
+    async def test_fetch_server_missing_returns_explicit_failure(self) -> None:
+        container = MagicMock()
+        container.mcp_manager.get_server_info = MagicMock(return_value=None)
+        container.settings.security.auth_mode = "trust_all"
+        container.session_manager = None
+        result = await execute_tool(
+            "fetch_url",
+            {"url": "https://nowhere.invalid"},
+            container=container,
+        )
         parsed = json.loads(result)
-        assert "error" in parsed
-        assert "connection refused" in parsed["error"]
+        assert parsed.get("degraded") is True
+        assert parsed["failed_path"] == "mcp.fetch.fetch"
 
     @pytest.mark.asyncio
     async def test_uses_mcp_when_available(self) -> None:
@@ -220,7 +222,7 @@ class TestFetchUrlFallback:
             return_value=MagicMock(name="fetch_info")
         )
         container.mcp_manager.call_tool = AsyncMock(
-            return_value="Fetched article body text."
+            return_value=_mk_result("Fetched article body text.", server="fetch", tool="fetch")
         )
         container.settings.security.auth_mode = "trust_all"
         container.session_manager = None
