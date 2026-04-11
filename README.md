@@ -52,21 +52,29 @@ Those four pillars read as ADHD-aware once they're put together: Kora passively 
 
 ## Quickstart
 
-Requires Python 3.12+.
+Requires Python 3.12+. On macOS, ensure your system sqlite3 is 3.38 or newer
+(`sqlite3 --version`); macOS Ventura+ ships 3.39+ which is sufficient.
 
 ```bash
 git clone <this-repo> kora && cd kora
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/python -c "import kora_v2; print('ok')"
 
 cp .env.example .env
 # Edit .env and set MINIMAX_API_KEY
 ```
 
-Run the tests to confirm the install works:
+Or use the automated bootstrap script (also prints non-Python prerequisites):
 
 ```bash
-.venv/bin/python -m pytest tests/ -v
+bash scripts/bootstrap_tooling.sh
+```
+
+Run the unit tests to confirm the install works:
+
+```bash
+.venv/bin/python -m pytest tests/unit -q
 ```
 
 ## Running Kora
