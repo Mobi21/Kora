@@ -178,6 +178,9 @@ class BrowserSettings(BaseModel):
     enabled: bool = False
     binary_path: str = ""  # empty = auto-detect on PATH
     default_profile: str = ""  # empty = use browser default
+    clip_target: str = "vault"  # "vault" | "memory" | "both" | "none"
+    max_session_duration_seconds: int = 3600
+    command_timeout_seconds: int = 30
 
 
 # ── Vault ────────────────────────────────────────────────────────────────

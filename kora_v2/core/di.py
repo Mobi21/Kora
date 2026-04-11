@@ -274,12 +274,30 @@ class Container:
         any exception is logged at debug level and never crashes the daemon.
         """
         try:
+            import inspect
+
             from kora_v2.capabilities.registry import get_all_capabilities
             for pack in get_all_capabilities():
                 bind_fn = getattr(pack, "bind", None)
                 if callable(bind_fn):
                     try:
-                        bind_fn(self.settings, self._mcp_manager)
+                        # Prefer keyword-argument style so packs can accept
+                        # only the deps they need via **kwargs.
+                        sig = inspect.signature(bind_fn)
+                        params = sig.parameters
+                        has_var_keyword = any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in params.values()
+                        )
+                        if has_var_keyword:
+                            # Pack accepts **kwargs — pass everything by name.
+                            bind_fn(
+                                settings=self.settings,
+                                mcp_manager=self._mcp_manager,
+                            )
+                        else:
+                            # Legacy packs accept (settings, mcp_manager) positionally.
+                            bind_fn(self.settings, self._mcp_manager)
                         log.debug(
                             "capability_bound",
                             pack=pack.name,

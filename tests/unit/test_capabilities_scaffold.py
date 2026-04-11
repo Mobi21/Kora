@@ -51,12 +51,13 @@ async def test_workspace_health_check_is_not_ok_without_binding() -> None:
     assert health.summary.strip() != ""
 
 
-async def test_browser_health_check_is_unimplemented() -> None:
-    registry = get_default_registry()
-    pack = registry.get("browser")
-    assert pack is not None
+async def test_browser_health_check_is_not_ok_without_binding() -> None:
+    """Browser capability is now real; without binding it returns UNCONFIGURED."""
+    from kora_v2.capabilities.browser import BrowserCapability
+    # Create a fresh, unbound instance (not the global registry one).
+    pack = BrowserCapability()
     health = await pack.health_check()
-    assert health.status == HealthStatus.UNIMPLEMENTED
+    assert health.status == HealthStatus.UNCONFIGURED
     assert health.summary.strip() != ""
 
 
