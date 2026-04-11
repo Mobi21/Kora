@@ -61,12 +61,13 @@ async def test_browser_health_check_is_not_ok_without_binding() -> None:
     assert health.summary.strip() != ""
 
 
-async def test_vault_health_check_is_unimplemented() -> None:
-    registry = get_default_registry()
-    pack = registry.get("vault")
-    assert pack is not None
+async def test_vault_health_check_is_not_ok_without_binding() -> None:
+    """Vault capability is now real; without binding it returns UNCONFIGURED."""
+    from kora_v2.capabilities.vault import VaultCapability
+    # Create a fresh, unbound instance (not the global registry one).
+    pack = VaultCapability()
     health = await pack.health_check()
-    assert health.status == HealthStatus.UNIMPLEMENTED
+    assert health.status == HealthStatus.UNCONFIGURED
     assert health.summary.strip() != ""
 
 
