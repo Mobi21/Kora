@@ -956,6 +956,40 @@ class HarnessServer:
             "memory_tools_used": sorted(set(tool_counts) & memory_tools),
         }
 
+    async def cmd_capability_health_check(self) -> dict[str, Any]:
+        """Invoke each capability pack's health_check() and return results.
+
+        Read-only — does not start any MCP servers or spawn binaries beyond
+        what health_check() itself does.  Returns a dict with pack names as
+        keys and CapabilityHealth data as values.
+        """
+        try:
+            from kora_v2.capabilities.registry import get_all_capabilities
+        except ImportError:
+            return {"error": "kora_v2.capabilities not importable"}
+
+        results: dict[str, Any] = {}
+        packs = get_all_capabilities()
+        for pack in packs:
+            try:
+                health = await pack.health_check()
+                results[pack.name] = {
+                    "status": str(health.status),
+                    "summary": health.summary,
+                    "remediation": health.remediation,
+                    "details": health.details,
+                }
+            except Exception as exc:
+                results[pack.name] = {
+                    "status": "error",
+                    "summary": f"health_check() raised: {exc}",
+                    "remediation": None,
+                    "details": {},
+                }
+
+        _log_event({"event": "capability_health_check", "packs": list(results.keys())})
+        return results
+
     async def cmd_stop_server(self) -> dict[str, Any]:
         """Shut down the harness server."""
         self._running = False
@@ -1008,6 +1042,8 @@ class HarnessServer:
                 result = await self.cmd_monitor()
             elif cmd == "report":
                 result = await self.cmd_report()
+            elif cmd == "capability-health-check":
+                result = await self.cmd_capability_health_check()
             elif cmd == "stop":
                 result = await self.cmd_stop_server()
             elif cmd == "ping":

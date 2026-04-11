@@ -54,7 +54,9 @@ COVERAGE_ITEMS: dict[int, CoverageItem] = {
         CoverageStatus.ACTIVE,
     ),
     9: CoverageItem(
-        "Web search/fetch used via MCP (search_web or fetch_url called during research)",
+        "Web research via capability or legacy tool — either a successful MCP-backed search/fetch "
+        "completes, or an explicit MCP failure is surfaced and the model chooses a next step "
+        "(e.g., `browser.open`) without silent fallback.",
         CoverageStatus.ACTIVE,
     ),
     10: CoverageItem(
@@ -109,6 +111,25 @@ COVERAGE_ITEMS: dict[int, CoverageItem] = {
     ),
     23: CoverageItem(
         "Life management DB records persist (medication_log, meal_log, reminders queryable after creation)",
+        CoverageStatus.ACTIVE,
+    ),
+
+    # --- Phase 9 capability-pack items ---
+    24: CoverageItem(
+        "Capability pack surface — at least one of `workspace.*`, `browser.*`, or `vault.*` tool calls "
+        "appears in the report's capability_* bucket, OR the capability-health-check shows at least "
+        "one pack is UNCONFIGURED/DEGRADED with a remediation hint.",
+        CoverageStatus.ACTIVE,
+    ),
+    25: CoverageItem(
+        "Disclosed-failure path — if any MCP tool fails during the run, the assistant's user-visible "
+        "reply acknowledges the failure plainly (grep for 'MCP' or 'unavailable' or 'failed' in an "
+        "assistant message following a tool error event).",
+        CoverageStatus.ACTIVE,
+    ),
+    26: CoverageItem(
+        "Policy matrix enforcement — the harness's capability-health-check command returns 4 packs "
+        "and the policy section of the report is present.",
         CoverageStatus.ACTIVE,
     ),
 
@@ -438,12 +459,13 @@ FAST_PLAN = {
                 "description": "Extended exchange with research, file ops, and compaction",
                 "goals": [
                     "Deep technical engagement on all 3 tracks",
-                    "Ask to search for tools online (triggers search_web)",
+                    "Ask to search for tools online (triggers search_web or browser.open fallback)",
+                    "Ask to check calendar or email (may trigger workspace capability)",
                     "Ask to create a notes file (triggers write_file)",
                     "Push toward compaction threshold",
                     "Observe emotional adaptation",
                 ],
-                "coverage_items": [4, 5, 6, 9, 10, 15, 19, 22],
+                "coverage_items": [4, 5, 6, 9, 10, 15, 19, 22, 24],
             },
             {
                 "name": "recall_and_life",
