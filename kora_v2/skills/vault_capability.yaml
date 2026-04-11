@@ -1,0 +1,41 @@
+name: vault_capability
+display_name: "Vault (Filesystem Mirror for Clips & Notes)"
+
+activation: always
+
+tools:
+  - vault.write_note
+  - vault.write_clip
+  - vault.read_note
+
+discovery_tools:
+  - vault.read_note
+
+guidance: |
+  ## Vault Capability Tools
+
+  You have access to a local filesystem vault for persisting notes and web
+  clips. The vault is a mirror target — content written here is saved to
+  the user's configured local path (e.g., an Obsidian vault).
+
+  **Actions:**
+  - ``vault.write_note`` — write a markdown note to the vault; provide a
+    ``title`` and ``content``; optionally specify a ``subdir``
+  - ``vault.write_clip`` — write a web clip (URL + extracted content) to the
+    vault's clips directory; provide a ``url`` and ``content``
+  - ``vault.read_note`` — read a note from the vault by ``path``
+
+  **When to use:**
+  - User asks to save a note, memo, or draft to the vault
+  - After using ``browser.clip_page``, save the clip using ``vault.write_clip``
+  - User wants to read a previously saved note
+
+  **Note on Obsidian:**
+  The vault_capability replaces the older obsidian_vault skill stub. If the
+  user has configured a vault path pointing to their Obsidian folder, notes
+  written via vault.write_note will appear directly in Obsidian.
+
+  **Activation examples:**
+  - "Save this as a note" → vault.write_note
+  - "Clip this page to my vault" → browser.clip_page then vault.write_clip
+  - "Read my note on project X" → vault.read_note

@@ -1,0 +1,61 @@
+name: browser_capability
+display_name: "Browser Automation (Headless)"
+
+activation: always
+
+tools:
+  # Read / navigation — no approval required
+  - browser.open
+  - browser.snapshot
+  - browser.screenshot
+  - browser.clip_page
+  - browser.clip_selection
+  - browser.close
+  # Interaction — may require approval on protected domains
+  - browser.click
+  - browser.type
+  - browser.fill
+
+discovery_tools:
+  - browser.open
+  - browser.clip_page
+
+guidance: |
+  ## Browser Capability Tools
+
+  You have access to headless browser automation via the browser capability
+  pack. Use these tools to open web pages, take snapshots, and interact with
+  content that cannot be fetched via the fetch MCP server.
+
+  **Navigation / read actions (no approval needed):**
+  - ``browser.open`` — open a new browser session at a URL; returns page title
+    and a brief DOM summary
+  - ``browser.snapshot`` — take a DOM snapshot of the current page
+  - ``browser.screenshot`` — take a screenshot of the current page
+  - ``browser.clip_page`` — clip the full page content to structured data
+  - ``browser.clip_selection`` — clip a specific element to structured data
+  - ``browser.close`` — close the browser session
+
+  **Interaction actions (use with care; may touch user data):**
+  - ``browser.click`` — click an element
+  - ``browser.type`` — type text into an element
+  - ``browser.fill`` — fill a form element with a value
+
+  **Primary use case — web-search fallback:**
+  When ``search_web`` or ``fetch_url`` returns a degraded/error result with
+  ``"next_options": ["browser.open"]``, acknowledge the MCP failure to the
+  user and then use ``browser.open`` to read the target URL directly.
+
+  **Privacy constraints:**
+  - NEVER use ``browser.click``, ``browser.type``, or ``browser.fill`` to
+    perform writes on the user's personal accounts (Gmail, Calendar, social
+    media) without explicit user approval.
+  - NEVER enter passwords, payment information, or accept terms of service
+    on behalf of the user.
+  - NEVER post content publicly without explicit user approval.
+
+  **Activation examples:**
+  - "Open https://example.com and tell me what it says" → browser.open then
+    browser.clip_page
+  - MCP web-search failed → browser.open as fallback (after acknowledging)
+  - "Take a screenshot of that page" → browser.screenshot

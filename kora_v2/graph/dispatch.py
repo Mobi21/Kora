@@ -324,6 +324,20 @@ def get_available_tools(
         # ToolRegistry may not have any tools loaded yet -- that's fine
         log.debug("get_available_tools_registry_skip")
 
+    # Merge in capability-pack actions (workspace, browser, vault, ...).
+    # These are always included; the model's skill guidance controls when to
+    # invoke them.  Duplicates are skipped to keep the list clean.
+    try:
+        from kora_v2.graph.capability_bridge import collect_capability_tools
+
+        for cap_tool in collect_capability_tools(container):
+            if cap_tool["name"] in seen_names:
+                continue
+            tools.append(cap_tool)
+            seen_names.add(cap_tool["name"])
+    except Exception:  # noqa: BLE001
+        log.debug("get_available_tools_capability_skip")
+
     return tools
 
 
@@ -436,6 +450,15 @@ async def execute_tool(
 
     if tool_name == "fetch_url":
         return await _execute_fetch_url(tool_args, container)
+
+    # Capability-pack actions: names contain a dot and start with a known
+    # capability prefix (e.g. "workspace.gmail.search", "browser.open").
+    if "." in tool_name:
+        from kora_v2.graph.capability_bridge import execute_capability_action
+
+        cap_result = await execute_capability_action(tool_name, tool_args, container)
+        if cap_result is not None:
+            return cap_result
 
     # Fallback: check ToolRegistry for dynamically registered tools
     from kora_v2.tools.registry import ToolRegistry
@@ -750,56 +773,36 @@ def _mcp_manager(container: Any | None) -> Any | None:
     return getattr(container, "mcp_manager", None)
 
 
-async def _search_web_fallback(query: str, count: int) -> str:
-    """Best-effort web search via DuckDuckGo HTML when MCP is unavailable."""
-    import re as _re
-    import urllib.parse
+def _search_web_mcp_unavailable(query: str, reason: str = "brave_search server unavailable") -> str:
+    """Return an explicit structured failure when the MCP web-search path is unavailable.
 
-    encoded = urllib.parse.quote_plus(query)
-    url = f"https://html.duckduckgo.com/html/?q={encoded}"
-
-    try:
-        raw_html = await asyncio.to_thread(_urllib_fetch_text, url)
-    except Exception as exc:
-        log.warning("search_web_fallback_fetch_failed", error=str(exc))
-        return json.dumps({
-            "results": [],
-            "error": f"Search fallback failed: {exc}",
-            "source": "fallback",
-        })
-
-    # Parse DuckDuckGo HTML results.
-    results: list[dict[str, str]] = []
-    result_blocks = _re.findall(
-        r'<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?'
-        r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
-        raw_html,
-        _re.DOTALL,
-    )
-
-    for href, title_html, snippet_html in result_blocks[:count]:
-        title = _re.sub(r"<[^>]+>", "", title_html).strip()
-        snippet = _re.sub(r"<[^>]+>", "", snippet_html).strip()
-        if "/l/?uddg=" in href:
-            match = _re.search(r"uddg=([^&]+)", href)
-            actual_url = urllib.parse.unquote(match.group(1)) if match else href
-        else:
-            actual_url = href
-        results.append({
-            "title": title,
-            "url": actual_url,
-            "description": snippet,
-        })
-
-    log.info("search_web_using_fallback", query=query[:80], result_count=len(results))
-    return json.dumps({"results": results, "query": query, "source": "fallback"})
+    This replaces the old silent DuckDuckGo fallback. The model is instructed
+    (via the supervisor prompt) to handle this and can naturally choose
+    ``browser.open`` as an alternative for read access.
+    """
+    log.info("search_web_mcp_unavailable", query=query[:80], reason=reason)
+    return json.dumps({
+        "results": [],
+        "query": query,
+        "error": f"MCP web-search path failed: {reason}",
+        "failed_path": "mcp.brave_search.brave_web_search",
+        "degraded": True,
+        "recoverable": True,
+        "next_options": ["browser.open"],
+    })
 
 
 async def _execute_search_web(
     tool_args: dict[str, Any],
     container: Any | None,
 ) -> str:
-    """Run a web search via brave_search MCP when configured."""
+    """Run a web search via brave_search MCP when configured.
+
+    When the MCP path is unavailable or fails, returns an explicit structured
+    failure dict instead of silently falling back to DuckDuckGo.  The model
+    reads the ``next_options`` field and can choose ``browser.open`` for read
+    continuity after acknowledging the failure.
+    """
     query = str(tool_args.get("query", "")).strip()
     count = int(tool_args.get("count", 5) or 5)
     count = max(1, min(count, 10))
@@ -810,7 +813,7 @@ async def _execute_search_web(
     mcp = _mcp_manager(container)
     if mcp is None:
         log.info("search_web_no_mcp_manager", query=query[:80])
-        return await _search_web_fallback(query, count)
+        return _search_web_mcp_unavailable(query, "no MCP manager configured")
 
     # Check whether brave_search is in the configured server set.
     try:
@@ -819,7 +822,7 @@ async def _execute_search_web(
         server_info = None
     if server_info is None:
         log.info("search_web_no_brave_search_server", query=query[:80])
-        return await _search_web_fallback(query, count)
+        return _search_web_mcp_unavailable(query, "brave_search server unavailable")
 
     try:
         mcp_result = await mcp.call_tool(
@@ -829,7 +832,7 @@ async def _execute_search_web(
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("search_web_mcp_failed", error=str(exc), query=query[:80])
-        return await _search_web_fallback(query, count)
+        return _search_web_mcp_unavailable(query, f"brave_search call failed: {exc}")
 
     # Prefer structured_data if the server returned a native JSON block;
     # otherwise fall back to the joined text (which brave returns as JSON-in-text).
@@ -878,7 +881,13 @@ async def _execute_fetch_url(
     tool_args: dict[str, Any],
     container: Any | None,
 ) -> str:
-    """Fetch a URL via the fetch MCP server, falling back to urllib."""
+    """Fetch a URL via the fetch MCP server.
+
+    When the MCP fetch server is unavailable or the call fails, returns an
+    explicit structured failure dict instead of silently falling back to
+    urllib.  The model is told to acknowledge the failure and can choose
+    ``browser.open`` as an alternative.
+    """
     url = str(tool_args.get("url", "")).strip()
     max_chars = int(tool_args.get("max_chars", 8000) or 8000)
     max_chars = max(256, min(max_chars, 200_000))
@@ -887,49 +896,59 @@ async def _execute_fetch_url(
         return json.dumps({"error": "url is required", "url": "", "content": "", "chars": 0})
 
     mcp = _mcp_manager(container)
-    if mcp is not None:
-        try:
-            fetch_info = mcp.get_server_info("fetch")
-        except Exception:  # noqa: BLE001
-            fetch_info = None
-        if fetch_info is not None:
-            try:
-                fetch_result = await mcp.call_tool("fetch", "fetch", {"url": url})
-                text = fetch_result.text
-                truncated = text[:max_chars]
-                return json.dumps({
-                    "url": url,
-                    "content": truncated,
-                    "chars": len(truncated),
-                    "source": "mcp",
-                })
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "fetch_url_mcp_failed",
-                    error=str(exc),
-                    url=url[:120],
-                )
-                # Fall through to urllib fallback.
-
-    # urllib fallback — blocking, so run in a thread.
-    try:
-        text = await asyncio.to_thread(_urllib_fetch_text, url)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("fetch_url_urllib_failed", error=str(exc), url=url[:120])
+    if mcp is None:
+        log.info("fetch_url_no_mcp_manager", url=url[:120])
         return json.dumps({
             "url": url,
             "content": "",
             "chars": 0,
-            "error": f"fetch failed: {exc}",
+            "error": "MCP fetch path failed: no MCP manager configured",
+            "failed_path": "mcp.fetch.fetch",
+            "degraded": True,
+            "recoverable": True,
+            "next_options": ["browser.open"],
         })
 
-    truncated = text[:max_chars]
-    return json.dumps({
-        "url": url,
-        "content": truncated,
-        "chars": len(truncated),
-        "source": "urllib",
-    })
+    try:
+        fetch_info = mcp.get_server_info("fetch")
+    except Exception:  # noqa: BLE001
+        fetch_info = None
+
+    if fetch_info is None:
+        log.info("fetch_url_no_fetch_server", url=url[:120])
+        return json.dumps({
+            "url": url,
+            "content": "",
+            "chars": 0,
+            "error": "MCP fetch path failed: fetch server unavailable",
+            "failed_path": "mcp.fetch.fetch",
+            "degraded": True,
+            "recoverable": True,
+            "next_options": ["browser.open"],
+        })
+
+    try:
+        fetch_result = await mcp.call_tool("fetch", "fetch", {"url": url})
+        text = fetch_result.text
+        truncated = text[:max_chars]
+        return json.dumps({
+            "url": url,
+            "content": truncated,
+            "chars": len(truncated),
+            "source": "mcp",
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.warning("fetch_url_mcp_failed", error=str(exc), url=url[:120])
+        return json.dumps({
+            "url": url,
+            "content": "",
+            "chars": 0,
+            "error": f"MCP fetch path failed: {exc}",
+            "failed_path": "mcp.fetch.fetch",
+            "degraded": True,
+            "recoverable": True,
+            "next_options": ["browser.open"],
+        })
 
 
 def _urllib_fetch_text(url: str, timeout: float = 10.0) -> str:

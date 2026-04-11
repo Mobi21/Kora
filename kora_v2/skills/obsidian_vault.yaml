@@ -8,8 +8,12 @@ discovery_tools: []
 guidance: |
   ## Obsidian Vault
 
-  Obsidian vault tools are not yet implemented in V2. This skill is a
-  placeholder for future vault integration.
+  Obsidian vault integration is now handled by the ``vault_capability`` skill
+  and the ``vault.*`` capability pack actions (``vault.write_note``,
+  ``vault.write_clip``, ``vault.read_note``).
 
-  The vault concept maps to Kora's memory system. Use recall to search
-  across memory layers for stored knowledge and facts.
+  If the user has configured KORA_VAULT__PATH to point at their Obsidian
+  folder, notes written via ``vault.write_note`` appear directly in Obsidian.
+
+  Use ``recall`` to search across Kora's memory layers for stored knowledge
+  and facts from past sessions.
