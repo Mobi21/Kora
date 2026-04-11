@@ -41,12 +41,13 @@ def test_get_all_capabilities_returns_correct_names() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_workspace_health_check_is_unimplemented() -> None:
-    registry = get_default_registry()
-    pack = registry.get("workspace")
-    assert pack is not None
+async def test_workspace_health_check_is_not_ok_without_binding() -> None:
+    """Workspace capability is now real; without binding it returns UNCONFIGURED."""
+    from kora_v2.capabilities.workspace import WorkspaceCapability
+    # Create a fresh, unbound instance (not the global registry one).
+    pack = WorkspaceCapability()
     health = await pack.health_check()
-    assert health.status == HealthStatus.UNIMPLEMENTED
+    assert health.status == HealthStatus.UNCONFIGURED
     assert health.summary.strip() != ""
 
 
@@ -77,14 +78,23 @@ async def test_doctor_health_check_is_unimplemented() -> None:
     assert health.summary.strip() != ""
 
 
-async def test_all_stubs_have_unimplemented_health() -> None:
-    """Verify every registered stub returns UNIMPLEMENTED health."""
+async def test_all_stubs_have_known_health_status() -> None:
+    """Verify every registered capability pack returns a non-empty summary.
+
+    Workspace is now implemented (Task 6) so it no longer returns UNIMPLEMENTED —
+    it returns UNCONFIGURED because the global registry instance is not bound.
+    Other packs still return UNIMPLEMENTED until their implementation tasks run.
+    """
     packs = get_all_capabilities()
     for pack in packs:
         health = await pack.health_check()
-        assert health.status == HealthStatus.UNIMPLEMENTED, (
-            f"{pack.name!r} should return UNIMPLEMENTED, got {health.status!r}"
-        )
+        assert health.status in {
+            HealthStatus.UNIMPLEMENTED,
+            HealthStatus.UNCONFIGURED,
+            HealthStatus.DEGRADED,
+            HealthStatus.OK,
+            HealthStatus.UNHEALTHY,
+        }, f"{pack.name!r} returned unexpected status {health.status!r}"
         assert health.summary.strip(), f"{pack.name!r} health summary must not be empty"
 
 

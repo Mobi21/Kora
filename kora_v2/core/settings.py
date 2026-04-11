@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
@@ -189,6 +189,15 @@ class VaultSettings(BaseModel):
     path: str = ""
 
 
+# ── Workspace config default factory ─────────────────────────────────────────
+# Imported lazily via a factory to keep settings.py free of capability imports
+# while still allowing WorkspaceConfig to be declared on Settings.
+
+def _workspace_config_default() -> Any:
+    from kora_v2.capabilities.workspace.config import WorkspaceConfig  # noqa: PLC0415
+    return WorkspaceConfig()
+
+
 # ── Root ─────────────────────────────────────────────────────────────────
 
 class Settings(BaseSettings):
@@ -211,6 +220,7 @@ class Settings(BaseSettings):
     security: SecuritySettings = SecuritySettings()
     vault: VaultSettings = VaultSettings()
     browser: BrowserSettings = BrowserSettings()
+    workspace: Any = Field(default_factory=_workspace_config_default)
 
     model_config = SettingsConfigDict(
         toml_file=Path("~/.kora/settings.toml").expanduser(),

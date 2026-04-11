@@ -261,6 +261,38 @@ class Container:
         self._verb_resolver = DomainVerbResolver()
         log.info("verb_resolver_initialized")
 
+        # Capability pack binding — late-bind settings + mcp_manager into any
+        # capability pack that exposes a .bind() method.  This keeps capability
+        # packs free of constructor DI while still receiving runtime deps.
+        self._bind_capabilities()
+
+    def _bind_capabilities(self) -> None:
+        """Late-bind settings and mcp_manager into capability packs that support it.
+
+        Iterates all registered capability packs and calls ``pack.bind(settings,
+        mcp_manager)`` for any pack that exposes that method.  Missing method or
+        any exception is logged at debug level and never crashes the daemon.
+        """
+        try:
+            from kora_v2.capabilities.registry import get_all_capabilities
+            for pack in get_all_capabilities():
+                bind_fn = getattr(pack, "bind", None)
+                if callable(bind_fn):
+                    try:
+                        bind_fn(self.settings, self._mcp_manager)
+                        log.debug(
+                            "capability_bound",
+                            pack=pack.name,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "capability_bind_failed",
+                            pack=pack.name,
+                            error=str(exc),
+                        )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("capability_binding_skipped", error=str(exc))
+
     async def initialize_mcp(self) -> None:
         """Start every configured MCP server (best-effort).
 
