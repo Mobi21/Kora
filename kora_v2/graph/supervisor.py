@@ -72,6 +72,28 @@ _CORE_SKILLS_FALLBACK = [
 # =====================================================================
 
 
+def _compute_session_duration(container: Any) -> int:
+    """Return the active session's duration in minutes, or 0."""
+    if container is None:
+        return 0
+    session_manager = getattr(container, "session_manager", None)
+    if session_manager is None:
+        return 0
+    session = getattr(session_manager, "active_session", None)
+    if session is None:
+        return 0
+    started_at = getattr(session, "started_at", None)
+    if started_at is None:
+        return 0
+    try:
+        from datetime import UTC, datetime
+
+        delta = datetime.now(UTC) - started_at
+        return max(0, int(delta.total_seconds() // 60))
+    except Exception:
+        return 0
+
+
 async def receive(state: SupervisorState) -> dict[str, Any]:
     """Parse incoming message, increment turn count, reset per-turn state.
 
@@ -127,12 +149,44 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
         if not skill_names:
             skill_names = list(_CORE_SKILLS_FALLBACK)
 
+        # Phase 5: pull ADHD output guidance + overwhelm triggers from
+        # the wired ADHDModule so they land in the frozen prefix.
+        adhd_module = getattr(container, "adhd_module", None) if container else None
+        adhd_guidance: list[str] | None = None
+        user_triggers: list[str] | None = None
+        if adhd_module is not None:
+            try:
+                adhd_guidance = adhd_module.output_guidance()
+                sup_ctx = adhd_module.supervisor_context()
+                if isinstance(sup_ctx, dict):
+                    user_triggers = sup_ctx.get("overwhelm_triggers") or None
+            except Exception:
+                log.debug("adhd_module_prefix_hook_failed", exc_info=True)
+
         frozen = build_frozen_prefix(
             user_model_snapshot=user_snapshot,
             skill_index=skill_names,
             skill_loader=skill_loader,
             active_skills=skill_names,
+            adhd_output_guidance=adhd_guidance,
+            user_triggers=user_triggers,
         )
+
+    # Phase 5: rebuild DayContext every turn from the ContextEngine.
+    # This is the single source of truth for the ## Today block.
+    day_context_dict: dict[str, Any] | None = state.get("day_context")
+    engine = getattr(container, "context_engine", None) if container else None
+    session_duration_min = _compute_session_duration(container)
+    if engine is not None:
+        try:
+            session_state = {
+                "turns_in_current_topic": state.get("turns_in_current_topic", 0),
+                "session_duration_min": session_duration_min,
+            }
+            dc = await engine.build_day_context(session_state=session_state)
+            day_context_dict = dc.model_dump(mode="json")
+        except Exception:
+            log.debug("build_day_context_failed", exc_info=True)
 
     # Check for unread autonomous updates from the background loop
     unread: list[dict[str, Any]] = []
@@ -145,6 +199,8 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
     suffix_state = dict(state)
     if unread:
         suffix_state["_unread_autonomous_updates"] = unread
+    if day_context_dict is not None:
+        suffix_state["day_context"] = day_context_dict
 
     suffix = build_dynamic_suffix(suffix_state)
 
@@ -158,6 +214,8 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
         "frozen_prefix": frozen,
         "_dynamic_suffix": suffix,
     }
+    if day_context_dict is not None:
+        update["day_context"] = day_context_dict
     if unread:
         update["_unread_autonomous_updates"] = unread
 
@@ -463,10 +521,156 @@ async def tool_loop(
     existing_records = list(state.get("tool_call_records", []))
     existing_records.extend(tool_records)
 
+    # Phase 5: topic-tracking for hyperfocus detection.
+    # Tool-footprint heuristic — see §4.4 of the life engine spec.
+    topic_update = _update_topic_tracker(state, tool_records)
+
     return {
         "messages": tool_results,
         "tool_call_records": existing_records,
         "_pending_tool_calls": [],  # Clear pending
+        **topic_update,
+    }
+
+
+_PRONOUN_RE = None  # lazy-compiled, see _update_topic_tracker
+
+# Tool arg keys that commonly carry an entity ID we should pick up for
+# topic-continuity tracking. Values that match (incl. regex-looking UUID
+# hex strings) are added to the recent-entity set.
+_ENTITY_ARG_KEYS = (
+    "item_id",
+    "entry_id",
+    "calendar_entry_id",
+    "parent_id",
+    "affected_entry_ids",
+    "routine_id",
+    "focus_block_id",
+    "medication_id",
+)
+
+
+def _extract_entity_ids(record: dict[str, Any]) -> set[str]:
+    """Pick primary entity IDs out of a tool call's args + result."""
+    ids: set[str] = set()
+    args = record.get("args") or {}
+    if isinstance(args, dict):
+        for key, value in args.items():
+            if key not in _ENTITY_ARG_KEYS:
+                continue
+            if isinstance(value, str) and value:
+                ids.add(value)
+            elif isinstance(value, list):
+                for v in value:
+                    if isinstance(v, str) and v:
+                        ids.add(v)
+    # Also try to parse {"id": "..."} out of the result string for
+    # create-style tools that return a fresh entity id.
+    result = record.get("result_summary") or ""
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict):
+                for key in ("id", "item_id", "entry_id"):
+                    val = parsed.get(key)
+                    if isinstance(val, str) and val:
+                        ids.add(val)
+        except json.JSONDecodeError:
+            pass
+    return ids
+
+
+def _update_topic_tracker(
+    state: SupervisorState, tool_records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Run the tool-footprint heuristic and return state updates.
+
+    Continuity rules (§4.4):
+    * Same topic if current tools overlap with any recent turn's tool
+      set, OR current entities overlap with any recent turn's entity
+      set, OR current tools is empty (pure conversation continues).
+    * Otherwise, check pronoun continuity ("it", "that", etc.) in the
+      last user message — pronouns also mean "still on topic".
+    * If changed → reset ``turns_in_current_topic`` to 1.
+      Else → increment by 1.
+    """
+    global _PRONOUN_RE
+    if _PRONOUN_RE is None:
+        import re as _re
+
+        _PRONOUN_RE = _re.compile(
+            r"\b(it|that|this|them|those|these)\b", _re.IGNORECASE
+        )
+
+    tracker = dict(state.get("topic_tracker") or {})
+    recent_tool_sets: list[list[str]] = list(tracker.get("recent_tool_sets", []))
+    recent_entity_sets: list[list[str]] = list(
+        tracker.get("recent_entity_ids", [])
+    )
+
+    current_tools = {r.get("tool_name", "") for r in tool_records if r.get("tool_name")}
+    current_entities: set[str] = set()
+    for record in tool_records:
+        current_entities |= _extract_entity_ids(record)
+
+    prior_turns = int(state.get("turns_in_current_topic", 0))
+    same_topic = False
+
+    if not current_tools:
+        # Pure conversation — continue whatever was active.
+        same_topic = True
+    else:
+        for prior in recent_tool_sets:
+            if current_tools & set(prior):
+                same_topic = True
+                break
+        if not same_topic and current_entities:
+            for prior in recent_entity_sets:
+                if current_entities & set(prior):
+                    same_topic = True
+                    break
+        if not same_topic:
+            # Pronoun continuity in the last user message — still on topic.
+            for msg in reversed(state.get("messages", [])):
+                role = (
+                    msg.get("role", "")
+                    if isinstance(msg, dict)
+                    else getattr(msg, "type", "")
+                )
+                if role in ("user", "human"):
+                    content = (
+                        msg.get("content", "")
+                        if isinstance(msg, dict)
+                        else getattr(msg, "content", "")
+                    )
+                    if isinstance(content, str) and _PRONOUN_RE.search(content):
+                        same_topic = True
+                    break
+
+    turns_in_topic = prior_turns + 1 if same_topic else 1
+
+    # Append + cap the deques at 3 entries each.
+    if current_tools:
+        recent_tool_sets.append(sorted(current_tools))
+    if current_entities:
+        recent_entity_sets.append(sorted(current_entities))
+    recent_tool_sets = recent_tool_sets[-3:]
+    recent_entity_sets = recent_entity_sets[-3:]
+
+    # Hyperfocus gate reads the session duration from day_context if
+    # populated (Phase 5 path). Without a session duration, we can't
+    # decide yet — leave hyperfocus_mode whatever it currently is.
+    day_context = state.get("day_context") or {}
+    session_minutes = int(day_context.get("session_duration_min", 0))
+    hyperfocus = turns_in_topic >= 3 and session_minutes >= 45
+
+    return {
+        "topic_tracker": {
+            "recent_tool_sets": recent_tool_sets,
+            "recent_entity_ids": recent_entity_sets,
+        },
+        "turns_in_current_topic": turns_in_topic,
+        "hyperfocus_mode": hyperfocus,
     }
 
 

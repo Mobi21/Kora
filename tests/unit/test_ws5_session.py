@@ -304,17 +304,19 @@ class TestWorkingMemoryLoaderItemsDb:
         assert "2026-04-07" in task_items[0].content  # due date prefix
 
     @pytest.mark.asyncio
-    async def test_load_handles_db_exception_gracefully(self) -> None:
-        """If items_db raises, load() should still return without error."""
+    async def test_load_propagates_db_exception(self) -> None:
+        """Phase 5: the silent exception swallow was removed. Broken DB
+        queries now propagate so real bugs surface loudly."""
+        import pytest as _pytest
+
         from kora_v2.context.working_memory import WorkingMemoryLoader
 
         mock_db = MagicMock()
         mock_db.execute = MagicMock(side_effect=Exception("table does not exist"))
 
         loader = WorkingMemoryLoader(items_db=mock_db)
-        # Should not raise
-        items = await loader.load()
-        assert isinstance(items, list)
+        with _pytest.raises(Exception, match="table does not exist"):
+            await loader.load()
 
     @pytest.mark.asyncio
     async def test_load_skips_items_db_when_none(self) -> None:

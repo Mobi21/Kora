@@ -256,28 +256,16 @@ class KoraCLI:
     async def _check_first_run(self) -> None:
         """Run first-run onboarding if no previous session exists.
 
-        Steps:
-        1. Check for MINIMAX_API_KEY — prompt if missing.
-        2. Ask name + main use case.
-        3. Offer MCP web search setup (Brave API key).
-
-        Sends the answers to Kora as a brief introduction message so
-        it is stored in memory.
+        Phase 5: delegates most of the questions to the structured
+        ``run_wizard`` flow (identity / ADHD / planning / life tracking).
+        The MINIMAX_API_KEY check and Brave Search setup run first and
+        then feed into Section 1 of the wizard.
         """
         bridges_dir = Path("_KoraMemory/.kora/bridges")
         if bridges_dir.exists() and list(bridges_dir.glob("*.md")):
             return  # Not first run
 
-        self._console.print()
-        self._console.print(
-            Panel(
-                "Welcome! Let's get you set up.",
-                title="Getting Started",
-                border_style="cyan",
-            )
-        )
-
-        # ── Step 1: API key ──────────────────────────────────────────
+        # ── Step 1: API key (legacy — must run before wizard) ──────
         if not os.environ.get("MINIMAX_API_KEY"):
             self._console.print("[yellow]No API key found.[/yellow]")
             self._console.print("Kora needs a MiniMax API key to work.")
@@ -294,20 +282,15 @@ class KoraCLI:
                 os.environ["MINIMAX_API_KEY"] = key.strip()
                 self._console.print("[green]API key saved to .env[/green]")
 
-        # ── Step 2: Name + use case ──────────────────────────────────
-        self._console.print()
-        self._console.print("A couple of quick questions:")
-        try:
-            name = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: Prompt.ask("What should I call you?")
-            )
-            use_case = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: Prompt.ask("What do you mainly want help with?")
-            )
-        except (EOFError, KeyboardInterrupt):
-            return
+        # ── Step 2: Structured 4-section wizard ─────────────────────
+        from kora_v2.cli.first_run import run_wizard
 
-        # ── Step 3: MCP web search ───────────────────────────────────
+        memory_base = Path("_KoraMemory")
+        result = await run_wizard(
+            self._console, container=None, memory_base=memory_base
+        )
+
+        # ── Step 3: Optional Brave web search (folded in as Section 5)
         try:
             enable_search = await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -341,10 +324,10 @@ class KoraCLI:
                 self._console.print("[green]Web search configured![/green]")
 
         # ── Send introduction ────────────────────────────────────────
-        if name.strip() or use_case.strip():
+        if result.name or result.use_case:
             intro = (
-                f"Hi! I'm {name.strip() or 'the user'}. "
-                f"I mainly want help with: {use_case.strip() or 'general tasks'}."
+                f"Hi! I'm {result.name or 'the user'}. "
+                f"I mainly want help with: {result.use_case or 'general tasks'}."
             )
             self._console.print("\n[dim]Sending introduction...[/dim]")
             await self._send_message(intro)
