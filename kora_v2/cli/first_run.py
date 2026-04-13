@@ -1,27 +1,32 @@
 """First-run wizard for the Rich CLI (Phase 5).
 
 Replaces the 3-question stub in ``cli/app.py:_check_first_run`` with a
-4-section guided wizard. Stores results in:
+5-section guided wizard. Stores results in:
 
 * ``_KoraMemory/User Model/adhd_profile/profile.yaml`` via
   :class:`kora_v2.adhd.profile.ADHDProfileLoader`
+* ``_KoraMemory/User Model/adhd_profile/wizard_summary.md`` — prose
+  summary of identity/use-case answers with YAML frontmatter
 * ``kora_v2/core/settings.py`` fields (``user_tz``, notifications, DND,
   cadence)
-* Optional prose note under ``_KoraMemory/User Model/adhd_profile/``
+* ``.env`` — MiniMax / Brave API keys (Section 5)
 
 The wizard is intentionally small — it only asks what it needs to
 populate ``ADHDProfile`` deterministically, and folds the legacy
-name/use_case/Brave-key prompts into Section 1.
+name/use_case/MiniMax/Brave prompts into Sections 1 and 5.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from dataclasses import dataclass, field
 from datetime import time
 from pathlib import Path
 from typing import Any
 
+import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -304,6 +309,52 @@ async def _section_life_mgmt(console: Console, result: WizardResult) -> None:
     result.life_tracking_domains = sorted(selected - {"none"})
 
 
+async def _section_api_keys(console: Console, result: WizardResult) -> None:
+    """Section 5: API keys and optional integrations.
+
+    Folds in the legacy ``cli/app.py`` MiniMax / Brave prompts so the
+    wizard owns the whole onboarding surface. Keys are written to
+    ``.env`` in :func:`_persist` (not here) so the persistence step
+    remains a single code path.
+    """
+    console.print()
+    console.print(
+        Panel(
+            "API keys for LLM and optional integrations.",
+            title="5. API Keys",
+            border_style="blue",
+        )
+    )
+
+    if not os.environ.get("MINIMAX_API_KEY"):
+        console.print("Kora needs a MiniMax API key to talk to the model.")
+        try:
+            key = await _aprompt(console, "Enter your MINIMAX_API_KEY", default="")
+        except (EOFError, KeyboardInterrupt):
+            key = ""
+        result.minimax_api_key = key.strip()
+    else:
+        console.print("[dim]MINIMAX_API_KEY already set — skipping.[/dim]")
+
+    try:
+        enable_search = await _aconfirm(
+            console,
+            "Enable web search? (requires a Brave API key)",
+            default=False,
+        )
+    except (EOFError, KeyboardInterrupt):
+        enable_search = False
+
+    if enable_search:
+        try:
+            brave_key = await _aprompt(
+                console, "Enter your BRAVE_API_KEY", default=""
+            )
+        except (EOFError, KeyboardInterrupt):
+            brave_key = ""
+        result.brave_api_key = brave_key.strip()
+
+
 # ── Persistence ─────────────────────────────────────────────────────────────
 
 
@@ -333,35 +384,106 @@ def _result_to_profile(result: WizardResult) -> ADHDProfile:
     )
 
 
+def _write_wizard_summary(result: WizardResult, memory_base: Path) -> Path:
+    """Persist the prose-facing fields (name/pronouns/use_case/domains).
+
+    Written to ``<memory_base>/User Model/adhd_profile/wizard_summary.md``
+    as a single file so re-running the wizard overwrites the summary
+    instead of piling up notes. YAML frontmatter for the structured
+    fields, prose body for ``use_case``.
+    """
+    target = memory_base / "User Model" / "adhd_profile" / "wizard_summary.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frontmatter = {
+        "name": result.name,
+        "pronouns": result.pronouns,
+        "life_tracking_domains": result.life_tracking_domains,
+    }
+    frontmatter_yaml = yaml.safe_dump(
+        frontmatter, sort_keys=False, default_flow_style=False
+    ).strip()
+    body_lines = [
+        "---",
+        frontmatter_yaml,
+        "---",
+        "",
+        "# Wizard summary",
+        "",
+        "## What I want help with",
+        "",
+        result.use_case or "(not provided)",
+        "",
+    ]
+    target.write_text("\n".join(body_lines), encoding="utf-8")
+    return target
+
+
+def _append_env_keys(result: WizardResult, env_path: Path) -> None:
+    """Append MiniMax/Brave API keys to ``.env`` and os.environ.
+
+    Only appends keys that were provided by the user *and* are not
+    already set in the process environment. Creates the file if it does
+    not exist; never rewrites existing keys.
+    """
+    to_write: list[str] = []
+    if result.minimax_api_key and not os.environ.get("MINIMAX_API_KEY"):
+        to_write.append(f"MINIMAX_API_KEY={result.minimax_api_key}")
+        os.environ["MINIMAX_API_KEY"] = result.minimax_api_key
+    if result.brave_api_key and not os.environ.get("BRAVE_API_KEY"):
+        to_write.append(f"BRAVE_API_KEY={result.brave_api_key}")
+        os.environ["BRAVE_API_KEY"] = result.brave_api_key
+    if not to_write:
+        return
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    with env_path.open("a", encoding="utf-8") as f:
+        f.write("\n" + "\n".join(to_write) + "\n")
+
+
+def _write_brave_mcp_config(result: WizardResult, config_path: Path) -> None:
+    """If a Brave key was provided, enable the brave_search MCP server."""
+    if not result.brave_api_key:
+        return
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config = {
+        "brave_search": {
+            "command": "npx",
+            "args": ["-y", "@anthropic/brave-search-mcp"],
+            "env": {"BRAVE_API_KEY": result.brave_api_key},
+            "enabled": True,
+        }
+    }
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
 def _persist(result: WizardResult, memory_base: Path, container: Any) -> None:
-    """Write wizard output to profile.yaml + settings."""
+    """Write wizard output to profile.yaml, summary, settings, and .env."""
     profile = _result_to_profile(result)
     loader = ADHDProfileLoader(memory_base)
     loader.save(profile)
+    _write_wizard_summary(result, memory_base)
+    _append_env_keys(result, Path(".env"))
+    _write_brave_mcp_config(result, Path("data/mcp_servers.json"))
 
     # Best-effort settings update — the container's settings object is
     # a pydantic BaseSettings instance, which allows live mutation of
     # fields even without a re-construction.
     settings = getattr(container, "settings", None)
     if settings is not None:
-        try:
-            if result.timezone:
-                settings.user_tz = result.timezone
-            notifications = getattr(settings, "notifications", None)
-            if notifications is not None:
-                notifications.max_per_hour = result.notifications_per_hour
-                if result.dnd_start is not None:
-                    notifications.dnd_start = result.dnd_start
-                if result.dnd_end is not None:
-                    notifications.dnd_end = result.dnd_end
-            planning = getattr(settings, "planning", None)
-            if planning is not None and getattr(planning, "cadence", None):
-                planning.cadence.weekly_planning_day = result.weekly_planning_day
-                planning.cadence.weekly_planning_time = (
-                    result.weekly_planning_time
-                )
-        except Exception:
-            pass
+        if result.timezone:
+            settings.user_tz = result.timezone
+        notifications = getattr(settings, "notifications", None)
+        if notifications is not None:
+            notifications.max_per_hour = result.notifications_per_hour
+            if result.dnd_start is not None:
+                notifications.dnd_start = result.dnd_start
+            if result.dnd_end is not None:
+                notifications.dnd_end = result.dnd_end
+        planning = getattr(settings, "planning", None)
+        if planning is not None and getattr(planning, "cadence", None):
+            planning.cadence.weekly_planning_day = result.weekly_planning_day
+            planning.cadence.weekly_planning_time = (
+                result.weekly_planning_time
+            )
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
@@ -395,6 +517,7 @@ async def run_wizard(
         await _section_adhd(console, result)
         await _section_planning(console, result)
         await _section_life_mgmt(console, result)
+        await _section_api_keys(console, result)
     except (EOFError, KeyboardInterrupt):
         console.print("[yellow]Wizard cancelled.[/yellow]")
         return result

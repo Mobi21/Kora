@@ -13,14 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 import structlog
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 
 log = structlog.get_logger(__name__)
 
@@ -256,72 +255,20 @@ class KoraCLI:
     async def _check_first_run(self) -> None:
         """Run first-run onboarding if no previous session exists.
 
-        Phase 5: delegates most of the questions to the structured
-        ``run_wizard`` flow (identity / ADHD / planning / life tracking).
-        The MINIMAX_API_KEY check and Brave Search setup run first and
-        then feed into Section 1 of the wizard.
+        Phase 5: delegates all questions to the structured 5-section
+        ``run_wizard`` flow. Section 5 owns API key prompts (MiniMax +
+        optional Brave), so this method is just a gate + introduction.
         """
         bridges_dir = Path("_KoraMemory/.kora/bridges")
         if bridges_dir.exists() and list(bridges_dir.glob("*.md")):
             return  # Not first run
 
-        # ── Step 1: API key (legacy — must run before wizard) ──────
-        if not os.environ.get("MINIMAX_API_KEY"):
-            self._console.print("[yellow]No API key found.[/yellow]")
-            self._console.print("Kora needs a MiniMax API key to work.")
-            try:
-                key = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: Prompt.ask("Enter your MINIMAX_API_KEY")
-                )
-            except (EOFError, KeyboardInterrupt):
-                return
-            if key.strip():
-                env_path = Path(".env")
-                with env_path.open("a") as f:
-                    f.write(f"\nMINIMAX_API_KEY={key.strip()}\n")
-                os.environ["MINIMAX_API_KEY"] = key.strip()
-                self._console.print("[green]API key saved to .env[/green]")
-
-        # ── Step 2: Structured 4-section wizard ─────────────────────
         from kora_v2.cli.first_run import run_wizard
 
         memory_base = Path("_KoraMemory")
         result = await run_wizard(
             self._console, container=None, memory_base=memory_base
         )
-
-        # ── Step 3: Optional Brave web search (folded in as Section 5)
-        try:
-            enable_search = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: Confirm.ask(
-                    "Would you like to enable web search? (requires a Brave API key)",
-                    default=False,
-                ),
-            )
-        except (EOFError, KeyboardInterrupt):
-            enable_search = False
-
-        if enable_search:
-            try:
-                brave_key = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: Prompt.ask("Enter your BRAVE_API_KEY")
-                )
-            except (EOFError, KeyboardInterrupt):
-                brave_key = ""
-            if brave_key.strip():
-                settings_path = Path("data/mcp_servers.json")
-                settings_path.parent.mkdir(parents=True, exist_ok=True)
-                config = {
-                    "brave_search": {
-                        "command": "npx",
-                        "args": ["-y", "@anthropic/brave-search-mcp"],
-                        "env": {"BRAVE_API_KEY": brave_key.strip()},
-                        "enabled": True,
-                    }
-                }
-                settings_path.write_text(json.dumps(config, indent=2))
-                self._console.print("[green]Web search configured![/green]")
 
         # ── Send introduction ────────────────────────────────────────
         if result.name or result.use_case:
