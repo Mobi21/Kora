@@ -88,6 +88,12 @@ class Container:
         # Phase 6B: Routine manager for guided routines.
         self._routine_manager: Any | None = None
 
+        # Phase 5: ADHD life engine components (lazy-built via properties).
+        self._adhd_profile: Any | None = None
+        self._adhd_module: Any | None = None
+        self._context_engine: Any | None = None
+        self._calendar_sync: Any | None = None
+
         # Auth relay (set by RuntimeKernel)
         self._auth_relay: Any | None = None
 
@@ -213,8 +219,10 @@ class Container:
         is constructed (can be called before or after initialize_memory).
         """
         # Ensure tool modules are imported so @tool decorators register them
+        import kora_v2.tools.calendar  # noqa: F401
         import kora_v2.tools.filesystem  # noqa: F401
         import kora_v2.tools.life_management  # noqa: F401
+        import kora_v2.tools.planning  # noqa: F401
         import kora_v2.tools.routines  # noqa: F401
         from kora_v2.agents.workers.executor import ExecutorWorkerHarness
         from kora_v2.agents.workers.planner import PlannerWorkerHarness
@@ -420,6 +428,64 @@ class Container:
     def routine_manager(self) -> Any:
         """RoutineManager for guided routine sessions."""
         return self._routine_manager
+
+    # ── Phase 5: ADHD life engine ─────────────────────────────────
+
+    @property
+    def adhd_profile(self) -> Any:
+        """Lazy-loaded ``ADHDProfile`` from ``_KoraMemory/User Model/``.
+
+        Reads ``profile.yaml`` on first access. Returns a default
+        profile (empty schedule, default time_correction_factor=1.5)
+        when the file does not yet exist — the user can populate it
+        through the first-run wizard or by hand-editing the YAML.
+        """
+        if self._adhd_profile is None:
+            from kora_v2.adhd.profile import ADHDProfileLoader
+
+            base = Path(self.settings.memory.kora_memory_path)
+            loader = ADHDProfileLoader(base)
+            try:
+                self._adhd_profile = loader.load()
+            except Exception:
+                log.debug("adhd_profile_load_failed", exc_info=True)
+                from kora_v2.adhd.profile import ADHDProfile
+
+                self._adhd_profile = ADHDProfile()
+        return self._adhd_profile
+
+    @property
+    def adhd_module(self) -> Any:
+        """Lazy-built ``ADHDModule`` wired with the live ``ADHDProfile``."""
+        if self._adhd_module is None:
+            from kora_v2.adhd.module import ADHDModule
+
+            self._adhd_module = ADHDModule(self.adhd_profile)
+        return self._adhd_module
+
+    @property
+    def context_engine(self) -> Any:
+        """Lazy-built ``ContextEngine`` reading from operational.db."""
+        if self._context_engine is None:
+            from kora_v2.context.engine import ContextEngine
+
+            db_path = self.settings.data_dir / "operational.db"
+            self._context_engine = ContextEngine(
+                db_path,
+                self.adhd_module,
+                user_tz_name=self.settings.user_tz,
+            )
+        return self._context_engine
+
+    @property
+    def calendar_sync(self) -> Any:
+        """Lazy-built ``CalendarSync`` — thin wrapper over the Google
+        Calendar MCP server (best-effort; None return paths are fine)."""
+        if self._calendar_sync is None:
+            from kora_v2.tools.calendar import CalendarSync
+
+            self._calendar_sync = CalendarSync(self)
+        return self._calendar_sync
 
     # ── Cleanup ───────────────────────────────────────────────────
 

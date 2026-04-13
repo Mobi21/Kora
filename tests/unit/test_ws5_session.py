@@ -304,17 +304,19 @@ class TestWorkingMemoryLoaderItemsDb:
         assert "2026-04-07" in task_items[0].content  # due date prefix
 
     @pytest.mark.asyncio
-    async def test_load_handles_db_exception_gracefully(self) -> None:
-        """If items_db raises, load() should still return without error."""
+    async def test_load_propagates_db_exception(self) -> None:
+        """Phase 5: the silent exception swallow was removed. Broken DB
+        queries now propagate so real bugs surface loudly."""
+        import pytest as _pytest
+
         from kora_v2.context.working_memory import WorkingMemoryLoader
 
         mock_db = MagicMock()
         mock_db.execute = MagicMock(side_effect=Exception("table does not exist"))
 
         loader = WorkingMemoryLoader(items_db=mock_db)
-        # Should not raise
-        items = await loader.load()
-        assert isinstance(items, list)
+        with _pytest.raises(Exception, match="table does not exist"):
+            await loader.load()
 
     @pytest.mark.asyncio
     async def test_load_skips_items_db_when_none(self) -> None:
@@ -388,7 +390,10 @@ class TestCheckFirstRun:
 
     @pytest.mark.asyncio
     async def test_skips_when_dir_does_not_exist(self) -> None:
-        """If bridges dir doesn't exist, falls through but EOFError aborts gracefully."""
+        """If bridges dir doesn't exist, the wizard is invoked. When the
+        wizard returns an empty ``WizardResult`` (EOFError / cancellation),
+        no intro message is sent."""
+        from kora_v2.cli import first_run as first_run_module
         from kora_v2.cli.app import KoraCLI
 
         cli = KoraCLI()
@@ -399,22 +404,19 @@ class TestCheckFirstRun:
             mock_bridges.exists.return_value = False
             mock_path_cls.return_value = mock_bridges
 
-            with patch("kora_v2.cli.app.asyncio") as mock_asyncio:
-                loop_mock = MagicMock()
-                mock_asyncio.get_event_loop.return_value = loop_mock
-                # run_in_executor raises EOFError to simulate non-interactive
-                loop_mock.run_in_executor = AsyncMock(side_effect=EOFError)
-
+            with patch.object(
+                first_run_module,
+                "run_wizard",
+                AsyncMock(return_value=first_run_module.WizardResult()),
+            ):
                 cli._send_message = AsyncMock()
-                # Should not raise; EOFError is caught internally
                 await cli._check_first_run()
-
-                # Since EOFError was raised, _send_message should not be called
                 cli._send_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_skips_when_bridges_dir_exists_but_empty(self) -> None:
         """If bridges dir exists but has no .md files, treat as first run."""
+        from kora_v2.cli import first_run as first_run_module
         from kora_v2.cli.app import KoraCLI
 
         cli = KoraCLI()
@@ -426,11 +428,11 @@ class TestCheckFirstRun:
             mock_bridges.glob.return_value = []  # no .md files
             mock_path_cls.return_value = mock_bridges
 
-            with patch("kora_v2.cli.app.asyncio") as mock_asyncio:
-                loop_mock = MagicMock()
-                mock_asyncio.get_event_loop.return_value = loop_mock
-                loop_mock.run_in_executor = AsyncMock(side_effect=KeyboardInterrupt)
-
+            with patch.object(
+                first_run_module,
+                "run_wizard",
+                AsyncMock(return_value=first_run_module.WizardResult()),
+            ):
                 cli._send_message = AsyncMock()
                 await cli._check_first_run()
                 cli._send_message.assert_not_called()

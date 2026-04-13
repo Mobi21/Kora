@@ -1,7 +1,10 @@
 """Working memory loader and energy inference for Kora V2.
 
 Provides:
-- estimate_energy(): lightweight (<1ms) time-of-day energy/focus inference
+- estimate_energy(): DEPRECATED in Phase 5 — kept as a thin time-of-day
+  fallback. New code should use ``ContextEngine._estimate_energy`` in
+  ``kora_v2/context/engine.py`` which combines medication, calendar,
+  time-of-day, and self-report signals.
 - WorkingMemoryLoader: loads max 5 prioritized items for the dynamic suffix
 """
 
@@ -121,31 +124,35 @@ class WorkingMemoryLoader:
                     )
                 )
 
-        # Source 2: items due soon from items_db
+        # Source 2: items due soon from items_db. Phase 5 fix: the
+        # canonical column is ``type`` (a SQL keyword in some dialects
+        # but a valid identifier in SQLite). The previous implementation
+        # selected ``item_type`` which silently never existed, and
+        # swallowed the error so broken queries looked like "no items".
         if self.items_db is not None:
-            try:
-                from datetime import UTC, datetime, timedelta
-                cutoff = (datetime.now(UTC) + timedelta(hours=48)).isoformat()
-                async with self.items_db.execute(
-                    """SELECT title, item_type, priority, due_date FROM items
-                       WHERE status NOT IN ('done', 'cancelled')
-                       AND (due_date IS NULL OR due_date <= ?)
-                       ORDER BY priority ASC, due_date ASC LIMIT 5""",
-                    (cutoff,),
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    for row in rows:
-                        title, item_type, priority, due_date = row
-                        label = f"[{item_type}] {title}"
-                        if due_date:
-                            label += f" (due {due_date[:10]})"
-                        items.append(WorkingMemoryItem(
+            from datetime import UTC, datetime, timedelta
+
+            cutoff = (datetime.now(UTC) + timedelta(hours=48)).isoformat()
+            async with self.items_db.execute(
+                """SELECT title, type, priority, due_date FROM items
+                   WHERE status NOT IN ('done', 'cancelled')
+                   AND (due_date IS NULL OR due_date <= ?)
+                   ORDER BY priority ASC, due_date ASC LIMIT 5""",
+                (cutoff,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    title, item_kind, priority, due_date = row
+                    label = f"[{item_kind}] {title}"
+                    if due_date:
+                        label += f" (due {due_date[:10]})"
+                    items.append(
+                        WorkingMemoryItem(
                             source="items_db",
                             content=label,
                             priority=priority or 2,
-                        ))
-            except Exception:
-                pass  # items table may not exist yet
+                        )
+                    )
 
         # Source 3: commitments from projection_db (placeholder — not yet implemented)
 

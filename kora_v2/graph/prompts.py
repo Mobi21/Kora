@@ -215,6 +215,29 @@ You understand executive function challenges deeply:
 """
 
 
+_LIFE_EVENT_DETECTION = """\
+## Life Event Detection
+
+When the user mentions life events in conversation, log them using the
+appropriate tool. Do this naturally -- don't ask "should I log that?"
+Just log it and acknowledge it casually in your reply.
+
+- Food/meals ("grabbed lunch", "had a sandwich", "skipped breakfast"):
+  call log_meal immediately.
+- Medication ("took my meds", "forgot afternoon dose", "Adderall kicked
+  in"): call log_medication immediately.
+- Spending ("bought a keyboard", "spent $50 on lunch", "impulse buy"):
+  call log_expense. If the tool returns a ``note`` field about spending
+  being above average, surface it gently ("no judgment -- just flagging").
+- Focus ("I've been coding for 2 hours", "in the zone"): consider
+  start_focus_block or noting the user's self-reported state.
+
+If the user says "don't track that" for any domain, stop logging in
+that domain for the rest of the session. If uncertain whether to log,
+err on the side of logging -- the user can always correct.
+"""
+
+
 _GROUNDING_RULE = """\
 # Tool Action Grounding Rule
 
@@ -268,17 +291,43 @@ def _format_skill_index(skills: list[str] | None) -> str:
     return "\n".join(lines)
 
 
+def _format_adhd_output_guidance(guidance: list[str] | None) -> str:
+    """Render ADHD output guidance lines as a prose block."""
+    if not guidance:
+        return ""
+    lines = ["## ADHD Output Guidance"]
+    for g in guidance:
+        lines.append(f"- {g}")
+    return "\n".join(lines)
+
+
+def _format_user_triggers(triggers: list[str] | None) -> str:
+    """Render overwhelm triggers as a short block."""
+    if not triggers:
+        return ""
+    lines = ["## User Triggers"]
+    lines.append(
+        "Be extra gentle when these come up; offer one-step actions:"
+    )
+    for t in triggers:
+        lines.append(f"- {t}")
+    return "\n".join(lines)
+
+
 def build_frozen_prefix(
     user_model_snapshot: dict | None = None,
     skill_index: list[str] | None = None,
     skill_loader: Any | None = None,
     active_skills: list[str] | None = None,
+    adhd_output_guidance: list[str] | None = None,
+    user_triggers: list[str] | None = None,
 ) -> str:
     """Build the supervisor's frozen system prompt.
 
     Contains: Identity, Personality (8 Core Principles),
     Delegation Prompt (~700 tokens), Failure Protocol (~200 tokens),
     ADHD Awareness (~200 tokens), Grounding Rule (~100 tokens),
+    Life Event Detection (passive inference, Phase 5),
     User Knowledge (variable), Skill Index, and Skill Guidance.
 
     Cached per session -- does not change between turns.
@@ -288,6 +337,10 @@ def build_frozen_prefix(
         skill_index: Optional list of available skill names.
         skill_loader: Optional SkillLoader instance for guidance text.
         active_skills: Optional list of active skill names for guidance.
+        adhd_output_guidance: Optional prose lines from
+            ``ADHDModule.output_guidance()``.
+        user_triggers: Optional overwhelm triggers from
+            ``ADHDModule.supervisor_context()``.
 
     Returns:
         Complete frozen prefix string.
@@ -305,8 +358,19 @@ def build_frozen_prefix(
         "",
         _GROUNDING_RULE.strip(),
         "",
-        _format_user_knowledge(user_model_snapshot),
+        _LIFE_EVENT_DETECTION.strip(),
     ]
+
+    adhd_block = _format_adhd_output_guidance(adhd_output_guidance)
+    if adhd_block:
+        sections.extend(["", adhd_block])
+
+    trigger_block = _format_user_triggers(user_triggers)
+    if trigger_block:
+        sections.extend(["", trigger_block])
+
+    sections.extend(["", _format_user_knowledge(user_model_snapshot)])
+
     skill_section = _format_skill_index(skill_index)
     if skill_section:
         sections.extend(["", skill_section])
@@ -323,6 +387,133 @@ def build_frozen_prefix(
 # =====================================================================
 # Dynamic Suffix  (rebuilt per turn)
 # =====================================================================
+
+
+def _render_today_block(day_context: dict[str, Any], state: dict[str, Any]) -> str:
+    """Render the unified ``## Today`` block from a ``DayContext`` dict.
+
+    ``day_context`` is stored as a dict in the supervisor state (see
+    ``graph/state.py`` — Pydantic models with datetimes don't round-
+    trip cleanly through LangGraph's MemorySaver). We read fields
+    defensively so partially-populated contexts still render.
+    """
+    date_str = day_context.get("date", "")
+    day_of_week = day_context.get("day_of_week", "")
+    header_bits: list[str] = []
+    if day_of_week and date_str:
+        try:
+            from datetime import date as _date
+            if isinstance(date_str, str):
+                d = _date.fromisoformat(date_str)
+            else:
+                d = date_str
+            header_bits.append(f"{day_of_week}, {d.strftime('%B')} {d.day}")
+        except (ValueError, TypeError):
+            header_bits.append(f"{day_of_week} {date_str}")
+    elif day_of_week:
+        header_bits.append(day_of_week)
+    elif date_str:
+        header_bits.append(str(date_str))
+
+    heading = "## Today"
+    if header_bits:
+        heading = f"## Today ({header_bits[0]})"
+
+    lines: list[str] = [heading]
+
+    # Energy
+    energy = day_context.get("energy") or {}
+    if energy:
+        level = energy.get("level", "unknown")
+        focus = energy.get("focus", "unknown")
+        is_guess = energy.get("is_guess", False)
+        tag = " (guess — no check-in yet today)" if is_guess else ""
+        lines.append(f"Energy: {level}/{focus}{tag}")
+
+    # Next event + countdown
+    next_event = day_context.get("next_event")
+    minutes_until = day_context.get("minutes_until_next")
+    if next_event and minutes_until is not None:
+        title = (
+            next_event.get("title")
+            if isinstance(next_event, dict)
+            else getattr(next_event, "title", "")
+        )
+        if title:
+            lines.append(f"Next: {title} in {minutes_until} min")
+
+    # Medication status
+    med = day_context.get("medication_status") or {}
+    if med:
+        taken = med.get("taken") or []
+        pending_meds = med.get("pending") or []
+        missed = med.get("missed") or []
+        fragments: list[str] = []
+        for t in taken[:2]:
+            fragments.append(
+                f"{t.get('name', 'meds')} taken at {t.get('taken_at', '?')}"
+            )
+        for p in pending_meds[:2]:
+            fragments.append(
+                f"{p.get('name', 'meds')} pending ({p.get('window', '?')})"
+            )
+        for m in missed[:2]:
+            fragments.append(
+                f"{m.get('name', 'meds')} missed ({m.get('window', '?')})"
+            )
+        if fragments:
+            lines.append("Meds: " + " | ".join(fragments))
+
+    # Focus blocks
+    focus_blocks = day_context.get("focus_blocks") or {}
+    if focus_blocks:
+        completed = focus_blocks.get("completed") or []
+        active = focus_blocks.get("active")
+        planned = focus_blocks.get("planned") or []
+        parts_focus: list[str] = []
+        total_min = sum(int(c.get("duration_min", 0)) for c in completed)
+        if total_min > 0:
+            hrs, mins = divmod(total_min, 60)
+            total_str = f"{hrs}h {mins}min" if hrs else f"{mins}min"
+            parts_focus.append(f"{total_str} completed")
+        if active:
+            label = active.get("label", "focus")
+            elapsed = active.get("elapsed_min", 0)
+            parts_focus.append(f"{label} active ({elapsed}min in)")
+        if planned:
+            first_planned = planned[0]
+            label = first_planned.get("label", "focus")
+            starts_at = first_planned.get("starts_at", "")
+            parts_focus.append(f"{label} block at {starts_at}")
+        if parts_focus:
+            lines.append("Focus: " + " | ".join(parts_focus))
+
+    # Routines
+    routine_status = day_context.get("routine_status") or {}
+    by_routine = routine_status.get("by_routine", {}) if routine_status else {}
+    if by_routine:
+        marks: list[str] = []
+        for name, status in by_routine.items():
+            glyph = "✓" if status == "completed" else "..." if status == "in_progress" else "not started"
+            marks.append(f"{name} {glyph}")
+        lines.append("Routines: " + " | ".join(marks))
+
+    # Items / plan
+    plan_status = day_context.get("plan_status") or {}
+    items_due = day_context.get("items_due") or []
+    if items_due or plan_status:
+        due_count = len(items_due)
+        done = int(plan_status.get("completed", 0))
+        lines.append("")
+        lines.append(f"{due_count} items due today, {done} completed")
+
+    # Check-in suggestion
+    check_in = day_context.get("check_in_suggestion")
+    if check_in:
+        lines.append("")
+        lines.append(f"[Check-in idea: {check_in}]")
+
+    return "\n".join(lines)
 
 
 def build_dynamic_suffix(state: dict[str, Any]) -> str:
@@ -357,30 +548,47 @@ def build_dynamic_suffix(state: dict[str, Any]) -> str:
             confidence = getattr(emotional, "confidence", 0.5)
         parts.append(f"Mood: {mood} (confidence: {confidence:.1f})")
 
-    # Energy estimate (full rendering)
-    energy = state.get("energy_estimate")
-    if energy is not None:
-        if isinstance(energy, dict):
-            level = energy.get("level", "unknown")
-            focus = energy.get("focus", "unknown")
-        else:
-            level = getattr(energy, "level", "unknown")
-            focus = getattr(energy, "focus", "unknown")
-        parts.append(f"Energy: {level} | Focus: {focus}")
-
-    # Pending items (from WorkingMemoryLoader)
     pending = state.get("pending_items") or []
-    if pending:
-        parts.append("")
-        parts.append("## Pending Items")
-        for item in pending[:5]:
-            if isinstance(item, dict):
-                content = item.get("content", "")
-                source = item.get("source", "")
+
+    # Phase 5: unified ## Today block (replaces separate Energy: line
+    # and ## Pending Items). Falls back to legacy rendering when
+    # day_context is not populated yet (e.g. during early session init
+    # before ContextEngine has run).
+    day_context = state.get("day_context")
+    if day_context:
+        today_block = _render_today_block(day_context, state)
+        if today_block:
+            parts.append("")
+            parts.append(today_block)
+    else:
+        # Legacy Phase 4 rendering — only used when day_context is None.
+        energy = state.get("energy_estimate")
+        if energy is not None:
+            if isinstance(energy, dict):
+                level = energy.get("level", "unknown")
+                focus = energy.get("focus", "unknown")
             else:
-                content = getattr(item, "content", "")
-                source = getattr(item, "source", "")
-            parts.append(f"- {content} ({source})")
+                level = getattr(energy, "level", "unknown")
+                focus = getattr(energy, "focus", "unknown")
+            parts.append(f"Energy: {level} | Focus: {focus}")
+
+        if pending:
+            parts.append("")
+            parts.append("## Pending Items")
+            for item in pending[:5]:
+                if isinstance(item, dict):
+                    content = item.get("content", "")
+                    source = item.get("source", "")
+                else:
+                    content = getattr(item, "content", "")
+                    source = getattr(item, "source", "")
+                parts.append(f"- {content} ({source})")
+
+    # Hyperfocus banner (Phase 5) — surfaced whenever the supervisor
+    # flagged locked_in + long session. Stays out of the way otherwise.
+    if state.get("hyperfocus_mode"):
+        parts.append("")
+        parts.append("[Hyperfocus mode — Kora stays out of the way]")
 
     # Session bridge (from last session)
     bridge = state.get("session_bridge")

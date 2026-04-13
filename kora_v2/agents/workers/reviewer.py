@@ -26,6 +26,7 @@ from kora_v2.core.models import (
     ReviewInput,
     ReviewOutput,
 )
+from kora_v2.core.rsd_filter import check_output
 from kora_v2.tools.registry import get_schema_tool
 
 log = structlog.get_logger(__name__)
@@ -95,6 +96,50 @@ class ReviewerWorkerHarness(AgentHarness[ReviewInput, ReviewOutput]):
             agent_name="reviewer",
         )
         self._container = container
+
+    async def _apply_rsd_filter(self, review_output: ReviewOutput) -> None:
+        """Scan the review's text fields for RSD-triggering language and
+        append ``adhd_friendliness`` findings when any rule fires.
+
+        Non-blocking: the reviewer does not downgrade its recommendation
+        — it just surfaces the violations so callers (and the user) see
+        what flagged.
+        """
+        adhd_module = getattr(self._container, "adhd_module", None)
+        if adhd_module is None:
+            return
+        try:
+            rules = adhd_module.output_rules()
+        except Exception:
+            return
+        if not rules:
+            return
+
+        texts_to_check: list[str] = []
+        for finding in review_output.findings:
+            if finding.description:
+                texts_to_check.append(finding.description)
+            if finding.suggested_fix:
+                texts_to_check.append(finding.suggested_fix)
+        if review_output.revision_guidance:
+            texts_to_check.append(review_output.revision_guidance)
+
+        for text in texts_to_check:
+            result = await check_output(text, rules)
+            if result.passed:
+                continue
+            for v in result.violations:
+                review_output.findings.append(
+                    ReviewFinding(
+                        severity="info",
+                        category="adhd_friendliness",
+                        description=(
+                            f"RSD-sensitive phrasing flagged "
+                            f"('{v.get('match', '')}', rule={v.get('rule', '')})"
+                        ),
+                        suggested_fix=v.get("suggestion"),
+                    )
+                )
 
     # ── Main execute method ────────────────────────────────────────────────
 
@@ -200,6 +245,13 @@ class ReviewerWorkerHarness(AgentHarness[ReviewInput, ReviewOutput]):
                         "Address the warnings listed in the findings above "
                         "and resubmit for review."
                     )
+
+                # Phase 5: RSD filter — append adhd_friendliness findings
+                # for any banned phrases that slipped into the review's
+                # descriptions or revision_guidance. Non-blocking — the
+                # reviewer flags them but still returns the original
+                # recommendation.
+                await self._apply_rsd_filter(review_output)
 
                 # Track best result
                 if best_result is None or review_output.confidence > best_result.confidence:

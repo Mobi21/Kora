@@ -362,6 +362,65 @@ CREATE TABLE IF NOT EXISTS quick_notes (
     created_at TEXT NOT NULL
 );
 
+-- Phase 5: Calendar entries (unified timeline for events, meds, focus blocks) -
+CREATE TABLE IF NOT EXISTS calendar_entries (
+    id              TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL DEFAULT 'event',
+    title           TEXT NOT NULL,
+    description     TEXT,
+    starts_at       TEXT NOT NULL,
+    ends_at         TEXT,
+    all_day         INTEGER DEFAULT 0,
+    source          TEXT NOT NULL DEFAULT 'kora',
+    google_event_id TEXT,
+    recurring_rule  TEXT,
+    energy_match    TEXT,
+    location        TEXT,
+    metadata        TEXT,
+    synced_at       TEXT,
+    status          TEXT NOT NULL DEFAULT 'active',
+    override_parent_id       TEXT,
+    override_occurrence_date TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_calendar_entries_date
+    ON calendar_entries(starts_at, ends_at);
+CREATE INDEX IF NOT EXISTS idx_calendar_entries_kind
+    ON calendar_entries(kind, starts_at);
+CREATE INDEX IF NOT EXISTS idx_calendar_entries_google
+    ON calendar_entries(google_event_id) WHERE google_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_calendar_entries_override
+    ON calendar_entries(override_parent_id, override_occurrence_date)
+    WHERE override_parent_id IS NOT NULL;
+
+-- Phase 5: Finance log ---------------------------------------------------------
+CREATE TABLE IF NOT EXISTS finance_log (
+    id          TEXT PRIMARY KEY,
+    amount      REAL NOT NULL,
+    category    TEXT NOT NULL,
+    description TEXT,
+    is_impulse  INTEGER DEFAULT 0,
+    logged_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_finance_log_logged
+    ON finance_log(logged_at);
+CREATE INDEX IF NOT EXISTS idx_finance_log_category
+    ON finance_log(category, logged_at);
+
+-- Phase 5: Energy log ----------------------------------------------------------
+CREATE TABLE IF NOT EXISTS energy_log (
+    id          TEXT PRIMARY KEY,
+    level       TEXT NOT NULL,
+    focus       TEXT,
+    source      TEXT NOT NULL,
+    notes       TEXT,
+    logged_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_energy_log_logged
+    ON energy_log(logged_at);
+
 -- Autonomous plan budget columns: request_count, token_estimate, cost_estimate
 -- Added as ALTER TABLE below since autonomous_plans was created without them.
 """
@@ -416,6 +475,24 @@ _AUTONOMOUS_PLAN_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ),
 )
 
+# Phase 5: items table extensions for planning (due_date/priority/goal_scope).
+_ITEMS_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("due_date", "ALTER TABLE items ADD COLUMN due_date TEXT"),
+    ("priority", "ALTER TABLE items ADD COLUMN priority INTEGER DEFAULT 3"),
+    (
+        "goal_scope",
+        "ALTER TABLE items ADD COLUMN goal_scope TEXT NOT NULL DEFAULT 'task'",
+    ),
+)
+
+# Phase 5: link focus_blocks rows to their pre-planned calendar_entry.
+_FOCUS_BLOCK_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    (
+        "calendar_entry_id",
+        "ALTER TABLE focus_blocks ADD COLUMN calendar_entry_id TEXT",
+    ),
+)
+
 
 async def _ensure_columns(
     db: aiosqlite.Connection,
@@ -449,6 +526,8 @@ async def init_operational_db(db_path: Path) -> None:
         await _ensure_columns(db, "turn_traces", _TURN_TRACE_MIGRATIONS)
         await _ensure_columns(db, "permission_grants", _PERMISSION_GRANT_MIGRATIONS)
         await _ensure_columns(db, "autonomous_plans", _AUTONOMOUS_PLAN_MIGRATIONS)
+        await _ensure_columns(db, "items", _ITEMS_MIGRATIONS)
+        await _ensure_columns(db, "focus_blocks", _FOCUS_BLOCK_MIGRATIONS)
         # Phase 9 Task 4: index on capability-scoped columns (idempotent via IF NOT EXISTS)
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_permission_grants_capability "

@@ -2,20 +2,30 @@
 
 Manages: init pipeline (8 steps), end pipeline (5 steps),
 HARD_STOP continuation, bridge notes, emotion decay.
+
+Phase 5 additions: deterministic ``working_on`` extraction, a sidecar
+``{session_id}-snapshot.json`` for the ``day_plan_snapshot`` field, and
+full-fidelity frontmatter roundtrip so scalar fields like
+``active_plan_id``/``emotional_trajectory`` stop getting dropped on save.
 """
+import json
+import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
+import yaml
 
 from kora_v2.context.working_memory import WorkingMemoryLoader, estimate_energy
 from kora_v2.core.events import EventType
 from kora_v2.core.models import (
+    DayPlanSnapshot,
     EmotionalState,
     SessionBridge,
     SessionState,
+    WorkingOnSnapshot,
 )
 
 log = structlog.get_logger(__name__)
@@ -302,11 +312,23 @@ class SessionManager:
         summary = self._summarize_messages(messages)
         open_threads = self._extract_open_threads(messages)
 
+        # Phase 5: deterministic working_on extraction from last N turns
+        working_on = await self._build_working_on(session_id, messages)
+
+        # Phase 5: map self-reported energy from session → bridge scalar
+        energy_at_end: Any = None
+        if self.active_session and self.active_session.energy_estimate:
+            level = getattr(self.active_session.energy_estimate, "level", None)
+            if level in ("low", "medium", "high"):
+                energy_at_end = level
+
         bridge = SessionBridge(
             session_id=session_id,
             summary=summary,
             open_threads=open_threads,
             emotional_trajectory=f"Session ended with mood: {emotional_state.mood_label}",
+            working_on=working_on,
+            energy_at_end=energy_at_end,
         )
 
         # Step 4: Emit SESSION_END event
@@ -341,30 +363,82 @@ class SessionManager:
         return bridge
 
     async def load_last_bridge(self) -> SessionBridge | None:
-        """Load the most recent bridge note from filesystem."""
+        """Load the most recent bridge note from filesystem.
+
+        Phase 5: parses YAML frontmatter with all scalar fields, then
+        reads the optional ``{stamp}_{session_id}-snapshot.json`` sidecar
+        to restore ``day_plan_snapshot`` when present. Falls back to the
+        legacy plain-markdown format if no frontmatter is detected.
+        """
         bridges_dir = self._bridges_dir()
         if not bridges_dir.exists():
             return None
 
-        # Find most recent bridge file
         bridge_files = sorted(bridges_dir.glob("*.md"), reverse=True)
         if not bridge_files:
             return None
 
+        bridge_path = bridge_files[0]
         try:
-            content = bridge_files[0].read_text()
-            # Parse simple format: first line = session_id, rest = summary
-            lines = content.strip().split("\n")
-            session_id = lines[0].replace("# Session: ", "").strip() if lines else "unknown"
-            summary = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
-
-            return SessionBridge(
-                session_id=session_id,
-                summary=summary,
-            )
-        except Exception:
-            log.warning("failed_to_load_bridge", path=str(bridge_files[0]))
+            content = bridge_path.read_text()
+        except OSError:
+            log.warning("failed_to_load_bridge", path=str(bridge_path))
             return None
+
+        data: dict[str, Any] = {}
+        body = content
+        if content.startswith("---"):
+            # Split frontmatter from body.
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                try:
+                    loaded = yaml.safe_load(parts[1]) or {}
+                    if isinstance(loaded, dict):
+                        data = loaded
+                    body = parts[2].lstrip("\n")
+                except yaml.YAMLError:
+                    log.warning("bridge_frontmatter_parse_failed", path=str(bridge_path))
+
+        if not data:
+            # Legacy format — first line "# Session: {id}", rest is summary.
+            lines = content.strip().split("\n")
+            session_id = (
+                lines[0].replace("# Session: ", "").strip() if lines else "unknown"
+            )
+            summary = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+            return SessionBridge(session_id=session_id, summary=summary)
+
+        # Optional sidecar for day_plan_snapshot.
+        day_plan_snapshot = None
+        sidecar = bridges_dir / (bridge_path.stem + "-snapshot.json")
+        if sidecar.exists():
+            try:
+                snap_data = json.loads(sidecar.read_text())
+                day_plan_snapshot = DayPlanSnapshot.model_validate(snap_data)
+            except (OSError, json.JSONDecodeError, ValueError):
+                log.debug(
+                    "bridge_sidecar_parse_failed", path=str(sidecar)
+                )
+
+        working_on_raw = data.get("working_on")
+        working_on = None
+        if isinstance(working_on_raw, dict):
+            try:
+                working_on = WorkingOnSnapshot.model_validate(working_on_raw)
+            except (ValueError, TypeError):
+                working_on = None
+
+        return SessionBridge(
+            session_id=data.get("session_id", "unknown"),
+            summary=data.get("summary") or body.strip(),
+            open_threads=list(data.get("open_threads") or []),
+            emotional_trajectory=data.get("emotional_trajectory", ""),
+            active_plan_id=data.get("active_plan_id"),
+            continuation_checkpoint_id=data.get("continuation_checkpoint_id"),
+            working_on=working_on,
+            energy_at_end=data.get("energy_at_end"),
+            day_plan_snapshot=day_plan_snapshot,
+        )
 
     async def generate_greeting(self, graph: Any, config: dict) -> str:
         """Generate a context-dependent greeting via the supervisor graph.
@@ -453,21 +527,150 @@ class SessionManager:
         return base / ".kora" / "bridges"
 
     async def _save_bridge(self, bridge: SessionBridge) -> None:
-        """Save bridge note to filesystem."""
+        """Save bridge note with YAML frontmatter + optional sidecar.
+
+        Writes two files per bridge:
+          * ``{stamp}_{session_id}.md`` — markdown with YAML frontmatter
+            containing every scalar field (session_id, summary,
+            open_threads, emotional_trajectory, active_plan_id,
+            continuation_checkpoint_id, working_on, energy_at_end).
+            Body is the prose summary + open threads list.
+          * ``{stamp}_{session_id}-snapshot.json`` — sidecar with the
+            ``day_plan_snapshot`` when present. Pydantic's JSON dump
+            handles datetime cleanly.
+        """
         bridges_dir = self._bridges_dir()
         try:
             bridges_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"{bridge.created_at.strftime('%Y%m%d_%H%M%S')}_{bridge.session_id}.md"
+            stamp = bridge.created_at.strftime("%Y%m%d_%H%M%S")
+            filename = f"{stamp}_{bridge.session_id}.md"
             filepath = bridges_dir / filename
-            content = f"# Session: {bridge.session_id}\n{bridge.summary}\n"
+
+            frontmatter_data: dict[str, Any] = {
+                "session_id": bridge.session_id,
+                "summary": bridge.summary,
+                "open_threads": list(bridge.open_threads),
+                "emotional_trajectory": bridge.emotional_trajectory,
+                "active_plan_id": bridge.active_plan_id,
+                "continuation_checkpoint_id": bridge.continuation_checkpoint_id,
+                "energy_at_end": bridge.energy_at_end,
+                "created_at": bridge.created_at.isoformat(),
+            }
+            if bridge.working_on is not None:
+                frontmatter_data["working_on"] = bridge.working_on.model_dump(
+                    mode="json"
+                )
+
+            fm_yaml = yaml.safe_dump(
+                frontmatter_data, sort_keys=False, default_flow_style=False
+            )
+            body_parts = [f"# Session: {bridge.session_id}", "", bridge.summary or ""]
             if bridge.open_threads:
-                content += "\n## Open Threads\n"
+                body_parts.append("\n## Open Threads")
                 for thread in bridge.open_threads:
-                    content += f"- {thread}\n"
+                    body_parts.append(f"- {thread}")
+            body = "\n".join(body_parts).rstrip() + "\n"
+            content = f"---\n{fm_yaml}---\n\n{body}"
             filepath.write_text(content)
+
+            if bridge.day_plan_snapshot is not None:
+                sidecar = bridges_dir / f"{stamp}_{bridge.session_id}-snapshot.json"
+                sidecar.write_text(
+                    bridge.day_plan_snapshot.model_dump_json(indent=2)
+                )
+
             log.debug("bridge_saved", path=str(filepath))
         except Exception:
-            log.warning("failed_to_save_bridge", session_id=bridge.session_id)
+            log.warning(
+                "failed_to_save_bridge",
+                session_id=bridge.session_id,
+                exc_info=True,
+            )
+
+    async def _build_working_on(
+        self, session_id: str, messages: list[dict]
+    ) -> WorkingOnSnapshot:
+        """Extract the ``WorkingOnSnapshot`` from the last 10 turns.
+
+        Fully deterministic — no LLM call. Scans messages for tool names
+        and the session's ``item_state_history`` rows for touched items.
+        """
+        recent = messages[-20:] if len(messages) > 20 else messages
+        last_tools: list[str] = []
+        last_user_message = ""
+        last_assistant_summary = ""
+        for msg in recent:
+            role = (
+                msg.get("role", "")
+                if isinstance(msg, dict)
+                else getattr(msg, "type", "")
+            )
+            content = (
+                msg.get("content", "")
+                if isinstance(msg, dict)
+                else getattr(msg, "content", "")
+            )
+            if role in ("user", "human") and isinstance(content, str):
+                last_user_message = content
+            if role in ("assistant", "ai") and isinstance(content, str):
+                last_assistant_summary = content
+            tool_calls = (
+                msg.get("tool_calls")
+                if isinstance(msg, dict)
+                else getattr(msg, "tool_calls", None)
+            )
+            if tool_calls:
+                for tc in tool_calls:
+                    name = (
+                        tc.get("name")
+                        if isinstance(tc, dict)
+                        else getattr(tc, "name", None)
+                    )
+                    if isinstance(name, str) and name and name not in last_tools:
+                        last_tools.append(name)
+
+        # Strip common filler words from the user's last message.
+        cleaned_user = re.sub(
+            r"^\s*(um|uh|okay|so|well|and|but)\s+",
+            "",
+            last_user_message,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        snippet = (
+            last_assistant_summary[-200:] if last_assistant_summary else ""
+        ).strip()
+
+        # Items touched this session.
+        items_touched: list[str] = []
+        settings = getattr(self.container, "settings", None)
+        if settings and hasattr(settings, "data_dir") and self.active_session:
+            try:
+                import aiosqlite
+
+                db_path = Path(settings.data_dir) / "operational.db"
+                async with aiosqlite.connect(str(db_path)) as db:
+                    db.row_factory = aiosqlite.Row
+                    async with db.execute(
+                        "SELECT DISTINCT item_id FROM item_state_history "
+                        "WHERE recorded_at >= ? ORDER BY recorded_at DESC",
+                        (self.active_session.started_at.isoformat(),),
+                    ) as cur:
+                        rows = await cur.fetchall()
+                items_touched = [r["item_id"] for r in rows if r["item_id"]]
+            except Exception:
+                log.debug(
+                    "working_on_items_lookup_failed",
+                    session_id=session_id,
+                    exc_info=True,
+                )
+
+        return WorkingOnSnapshot(
+            last_tools=last_tools[-5:],
+            items_touched=items_touched[:10],
+            last_user_message=cleaned_user[:300],
+            last_assistant_summary_snippet=snippet,
+        )
 
     def _summarize_messages(self, messages: list[dict]) -> str:
         """Build a structured bridge summary from messages.

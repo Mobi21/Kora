@@ -10,8 +10,11 @@ tools:
   - query_meals
   - query_focus_blocks
   - quick_note
+  - query_quick_notes
   - start_focus_block
   - end_focus_block
+  - log_expense
+  - query_expenses
 
 discovery_tools: []
 
@@ -25,8 +28,12 @@ guidance: |
     query_meals — answer "did I eat today?" or "what have I eaten?"
   - **Focus**: start_focus_block, end_focus_block — track focus sessions;
     query_focus_blocks — check if a block is running or review recent work
-  - **Quick capture**: quick_note — use immediately when the user says "note: X" or similar
+  - **Quick capture**: quick_note — use immediately when the user says "note: X" or similar;
+    query_quick_notes — search recent captured notes
   - **Reminders**: create_reminder, query_reminders for specific scheduled nudges and check-ins
+  - **Finance**: log_expense — log spending (the tool may flag is_impulse
+    vs. category average, pass that note along gently per RSD rules);
+    query_expenses — review recent spending by category
 
   When the user asks about past meds/meals/focus work, always use the matching
   query_* tool rather than guessing from conversation memory. The write tools

@@ -8,12 +8,50 @@ at validation time.
 from __future__ import annotations
 
 import os
+from datetime import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Self
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
+
+
+def _detect_user_tz() -> str:
+    """Auto-detect the system's IANA timezone name.
+
+    Prefers ``tzlocal`` when available (canonical IANA names).
+    Falls back to reading ``/etc/localtime`` (macOS/Linux), then to the
+    ``datetime.now().astimezone()`` tzinfo, then to ``UTC``.
+    """
+    try:
+        import tzlocal  # type: ignore
+
+        return str(tzlocal.get_localzone())
+    except Exception:
+        pass
+    # /etc/localtime is typically a symlink to something like
+    # /usr/share/zoneinfo/America/Los_Angeles on macOS and most Linux distros.
+    try:
+        link = Path("/etc/localtime").resolve()
+        zi = link.as_posix()
+        marker = "/zoneinfo/"
+        if marker in zi:
+            name = zi.split(marker, 1)[1]
+            if name:
+                return name
+    except Exception:
+        pass
+    try:
+        from datetime import datetime as _dt
+        tz = _dt.now().astimezone().tzinfo
+        if tz is not None:
+            name = getattr(tz, "key", None) or str(tz)
+            if name and name != "None":
+                return str(name)
+    except Exception:
+        pass
+    return "UTC"
 
 # ── LLM ──────────────────────────────────────────────────────────────────
 
@@ -107,13 +145,44 @@ class DaemonSettings(BaseModel):
 # ── Notifications ────────────────────────────────────────────────────────
 
 class NotificationSettings(BaseModel):
-    """Proactive engagement and ADHD-aware pacing."""
+    """Proactive engagement and ADHD-aware pacing.
+
+    Phase 5 adds cadence + DND fields that the Phase 8 ProactiveAgent will
+    consume. Phase 5 builds the hooks but does not act on them.
+    """
 
     enabled: bool = True
     cooldown_minutes: int = 15
     respect_dnd: bool = True
     re_engagement_hours: int = 4
     hyperfocus_threshold_turns: int = 3
+    # Phase 5: hourly cap + DND window (consumed by Phase 8 ProactiveAgent).
+    max_per_hour: int = 4
+    dnd_start: time | None = None  # local user_tz; None disables window
+    dnd_end: time | None = None
+
+
+# ── Planning ─────────────────────────────────────────────────────────────
+
+class PlanningCadence(BaseModel):
+    """Kora-led planning cadence — daily/weekly/monthly triggers.
+
+    Phase 5 stores the configuration; Phase 8 ProactiveAgent acts on it.
+    """
+
+    daily_planning_enabled: bool = True
+    daily_planning_time: time | None = None  # None = first session of the day
+    weekly_planning_enabled: bool = True
+    weekly_planning_day: str = "Sunday"
+    weekly_planning_time: time = time(18, 0)
+    monthly_reflection_enabled: bool = True
+    monthly_reflection_day: int = 1
+
+
+class PlanningSettings(BaseModel):
+    """Top-level planning configuration (cadence + helpers)."""
+
+    cadence: PlanningCadence = PlanningCadence()
 
 
 # ── Autonomous ───────────────────────────────────────────────────────────
@@ -223,7 +292,11 @@ class Settings(BaseSettings):
     security: SecuritySettings = SecuritySettings()
     vault: VaultSettings = VaultSettings()
     browser: BrowserSettings = BrowserSettings()
+    planning: PlanningSettings = PlanningSettings()
     workspace: Any = Field(default_factory=_workspace_config_default)
+    # Phase 5: display timezone (storage is always UTC). Auto-detected on
+    # first run; user can override in the first-run wizard.
+    user_tz: str = Field(default_factory=_detect_user_tz)
 
     model_config = SettingsConfigDict(
         toml_file=Path("~/.kora/settings.toml").expanduser(),

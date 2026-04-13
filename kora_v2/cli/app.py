@@ -13,14 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 import structlog
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 
 log = structlog.get_logger(__name__)
 
@@ -256,95 +255,26 @@ class KoraCLI:
     async def _check_first_run(self) -> None:
         """Run first-run onboarding if no previous session exists.
 
-        Steps:
-        1. Check for MINIMAX_API_KEY — prompt if missing.
-        2. Ask name + main use case.
-        3. Offer MCP web search setup (Brave API key).
-
-        Sends the answers to Kora as a brief introduction message so
-        it is stored in memory.
+        Phase 5: delegates all questions to the structured 5-section
+        ``run_wizard`` flow. Section 5 owns API key prompts (MiniMax +
+        optional Brave), so this method is just a gate + introduction.
         """
         bridges_dir = Path("_KoraMemory/.kora/bridges")
         if bridges_dir.exists() and list(bridges_dir.glob("*.md")):
             return  # Not first run
 
-        self._console.print()
-        self._console.print(
-            Panel(
-                "Welcome! Let's get you set up.",
-                title="Getting Started",
-                border_style="cyan",
-            )
+        from kora_v2.cli.first_run import run_wizard
+
+        memory_base = Path("_KoraMemory")
+        result = await run_wizard(
+            self._console, container=None, memory_base=memory_base
         )
 
-        # ── Step 1: API key ──────────────────────────────────────────
-        if not os.environ.get("MINIMAX_API_KEY"):
-            self._console.print("[yellow]No API key found.[/yellow]")
-            self._console.print("Kora needs a MiniMax API key to work.")
-            try:
-                key = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: Prompt.ask("Enter your MINIMAX_API_KEY")
-                )
-            except (EOFError, KeyboardInterrupt):
-                return
-            if key.strip():
-                env_path = Path(".env")
-                with env_path.open("a") as f:
-                    f.write(f"\nMINIMAX_API_KEY={key.strip()}\n")
-                os.environ["MINIMAX_API_KEY"] = key.strip()
-                self._console.print("[green]API key saved to .env[/green]")
-
-        # ── Step 2: Name + use case ──────────────────────────────────
-        self._console.print()
-        self._console.print("A couple of quick questions:")
-        try:
-            name = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: Prompt.ask("What should I call you?")
-            )
-            use_case = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: Prompt.ask("What do you mainly want help with?")
-            )
-        except (EOFError, KeyboardInterrupt):
-            return
-
-        # ── Step 3: MCP web search ───────────────────────────────────
-        try:
-            enable_search = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: Confirm.ask(
-                    "Would you like to enable web search? (requires a Brave API key)",
-                    default=False,
-                ),
-            )
-        except (EOFError, KeyboardInterrupt):
-            enable_search = False
-
-        if enable_search:
-            try:
-                brave_key = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: Prompt.ask("Enter your BRAVE_API_KEY")
-                )
-            except (EOFError, KeyboardInterrupt):
-                brave_key = ""
-            if brave_key.strip():
-                settings_path = Path("data/mcp_servers.json")
-                settings_path.parent.mkdir(parents=True, exist_ok=True)
-                config = {
-                    "brave_search": {
-                        "command": "npx",
-                        "args": ["-y", "@anthropic/brave-search-mcp"],
-                        "env": {"BRAVE_API_KEY": brave_key.strip()},
-                        "enabled": True,
-                    }
-                }
-                settings_path.write_text(json.dumps(config, indent=2))
-                self._console.print("[green]Web search configured![/green]")
-
         # ── Send introduction ────────────────────────────────────────
-        if name.strip() or use_case.strip():
+        if result.name or result.use_case:
             intro = (
-                f"Hi! I'm {name.strip() or 'the user'}. "
-                f"I mainly want help with: {use_case.strip() or 'general tasks'}."
+                f"Hi! I'm {result.name or 'the user'}. "
+                f"I mainly want help with: {result.use_case or 'general tasks'}."
             )
             self._console.print("\n[dim]Sending introduction...[/dim]")
             await self._send_message(intro)

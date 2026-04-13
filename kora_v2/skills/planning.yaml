@@ -1,0 +1,64 @@
+name: planning
+display_name: "Kora-Led Life Planning"
+
+tools:
+  - draft_plan
+  - update_plan
+  - day_briefing
+  - create_item
+  - complete_item
+  - defer_item
+  - query_items
+  - life_summary
+  - create_reminder
+  - query_reminders
+
+discovery_tools: []
+
+guidance: |
+  ## Life Planning Tools
+
+  Kora leads planning. You draft plans from live data, surface
+  conflicts, and walk the user through adjustments — they should not
+  have to build a plan from scratch.
+
+  **When to use:**
+  - User asks "what's on my day?" → day_briefing (full DayContext)
+  - User asks "plan my week" / "help me plan" → draft_plan with the
+    relevant scope ("today", "this week", "next week", "until Friday")
+  - User says "my plans changed" / "I missed my 10am" → identify the
+    affected calendar entry IDs from DayContext.schedule FIRST, then
+    call update_plan with action=delete|reschedule|shrink
+  - User creates a task or goal → create_item (goal_scope sets the
+    planning horizon)
+  - User asks "what's due?" → query_items
+  - User asks for a weekly/monthly retrospective → life_summary
+
+  **Time estimates:** create_item automatically applies the 1.5x ADHD
+  time-correction multiplier to ``estimated_minutes``. Pass the raw
+  estimate; the corrected value is what gets stored.
+
+  **goal_scope is a planning horizon, not a hierarchy.** Valid values:
+  ``task``, ``daily_goal``, ``weekly_goal``, ``monthly_goal``,
+  ``someday``. This is orthogonal to the ``type`` column (task vs.
+  step, used by the autonomous planner).
+
+  **update_plan is deterministic.** You (the supervisor LLM) must:
+    1. Look at DayContext.schedule to identify which entry IDs the
+       user is talking about. If you can't identify them, ASK the
+       user — do not pass vague free text to update_plan.
+    2. Call update_plan with the identified IDs and a structured
+       action. The tool returns a ripple analysis with ``moved``,
+       ``new_conflicts``, and ``warnings``.
+    3. Present the analysis conversationally to the user:
+       "That pushes coding to 3pm, which is your usual crash window.
+       Want to swap it with the lighter email task?"
+    4. On confirmation, call update_plan again or accept the change.
+
+  **Drafting plans:** present drafts naturally. "Here's what I'm
+  thinking for the week — tell me what to adjust." Let the user
+  reshape it; don't insist on the first draft.
+
+  **draft_plan is a thinking tool.** The JSON payload it returns is
+  for you, not the user. Read it, then speak to the user in plain
+  language about what you see.

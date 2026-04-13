@@ -51,7 +51,8 @@ class TestInitOperationalDb:
                 "AND name NOT LIKE 'sqlite_%'"
             )
             count = (await cursor.fetchone())[0]
-        assert count == 24
+        # Phase 5 added calendar_entries, finance_log, energy_log → 27.
+        assert count == 27
 
     async def test_sessions_table_schema(self, tmp_path):
         """Verify column names for sessions table."""

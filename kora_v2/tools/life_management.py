@@ -1,8 +1,9 @@
 """Life management tools for Kora V2.
 
-Provides 7 ADHD-oriented tools that write to and read from SQLite:
+Provides ADHD-oriented tools that write to and read from SQLite:
   log_medication, log_meal, create_reminder, query_reminders,
-  quick_note, start_focus_block, end_focus_block.
+  quick_note, start_focus_block, end_focus_block, query_quick_notes,
+  log_expense, query_expenses (Phase 5).
 
 Note: from __future__ import annotations is intentionally omitted.
 The @tool decorator inspects runtime type annotations via inspect.signature(),
@@ -752,3 +753,267 @@ async def query_focus_blocks(input: QueryFocusBlocksInput, container: Any) -> st
     except (OSError, aiosqlite.Error) as exc:
         log.warning("query_focus_blocks.error", error=str(exc))
         return _err(f"database error: {exc}")
+
+
+# ── Phase 5: Finance + quick-note query ─────────────────────────────────────
+
+
+# Minimum prior entries in a category within the 30-day window before
+# is_impulse will fire. Below this threshold, averages are too noisy and
+# the flag stays False — spec §6.2.
+IMPULSE_MIN_SAMPLES = 5
+
+
+class LogExpenseInput(BaseModel):
+    amount: float = Field(..., description="Expense amount (positive)")
+    category: str = Field(
+        ...,
+        description=(
+            "'food' | 'transport' | 'tech' | 'entertainment' | 'health' | "
+            "'other'"
+        ),
+    )
+    description: str = Field("", description="Optional description")
+
+
+class QueryExpensesInput(BaseModel):
+    days_back: int = Field(7, description="Look back N days (default 7)")
+    category: str = Field("", description="Optional category filter")
+    limit: int = Field(50, description="Max entries to return")
+
+
+class QueryQuickNotesInput(BaseModel):
+    days_back: int = Field(7, description="Look back N days (default 7)")
+    tag: str = Field("", description="Optional tag filter (substring)")
+    limit: int = Field(30, description="Max entries to return")
+
+
+@tool(
+    name="log_expense",
+    description=(
+        "Log a spending entry in the finance log. Detects impulse-spend "
+        "vs. historical category average (requires at least 5 prior "
+        "entries in the category within 30 days to flag). When flagged, "
+        "the tool returns a note so Kora can surface it gently per RSD "
+        "rules -- do NOT shame or lecture."
+    ),
+    category=ToolCategory.LIFE_MANAGEMENT,
+    auth_level=AuthLevel.ASK_FIRST,
+    is_read_only=False,
+)
+async def log_expense(input: LogExpenseInput, container: Any) -> str:
+    """Insert a finance_log entry; flag is_impulse when above category avg."""
+    db_path = _get_db_path(container)
+    if db_path is None:
+        return _err("no database available")
+    if input.amount <= 0:
+        return _err("amount must be positive")
+
+    row_id = _new_id()
+    now = _now_iso()
+    cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+
+    is_impulse = False
+    category_avg: float | None = None
+    try:
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT amount FROM finance_log WHERE category = ? "
+                "AND logged_at >= ?",
+                (input.category, cutoff),
+            ) as cur:
+                rows = await cur.fetchall()
+            if len(rows) >= IMPULSE_MIN_SAMPLES:
+                avg = sum(float(r["amount"]) for r in rows) / len(rows)
+                category_avg = round(avg, 2)
+                if input.amount > avg * 1.5:
+                    is_impulse = True
+
+            await db.execute(
+                """
+                INSERT INTO finance_log
+                    (id, amount, category, description, is_impulse,
+                     logged_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row_id,
+                    input.amount,
+                    input.category,
+                    input.description or None,
+                    1 if is_impulse else 0,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+    except (OSError, aiosqlite.Error) as exc:
+        log.warning("log_expense.error", error=str(exc))
+        return _err(f"database error: {exc}")
+
+    note: str | None = None
+    if is_impulse and category_avg is not None:
+        note = (
+            f"This is higher than usual for {input.category} "
+            f"(${input.amount:.2f} vs ~${category_avg:.2f} average)."
+        )
+
+    log.info(
+        "log_expense.ok",
+        id=row_id,
+        amount=input.amount,
+        category=input.category,
+        is_impulse=is_impulse,
+    )
+    return _ok(
+        {
+            "id": row_id,
+            "amount": input.amount,
+            "category": input.category,
+            "is_impulse": is_impulse,
+            "category_avg": category_avg,
+            "note": note,
+            "message": f"Logged ${input.amount:.2f} for {input.category}",
+        }
+    )
+
+
+@tool(
+    name="query_expenses",
+    description=(
+        "Query the finance log. Returns expenses ordered by most-recent "
+        "first, optionally filtered by days and category."
+    ),
+    category=ToolCategory.LIFE_MANAGEMENT,
+    auth_level=AuthLevel.ALWAYS_ALLOWED,
+    is_read_only=True,
+)
+async def query_expenses(input: QueryExpensesInput, container: Any) -> str:
+    """SELECT recent finance_log rows, optionally filtered."""
+    db_path = _get_db_path(container)
+    if db_path is None:
+        return _err("no database available")
+
+    where_clauses: list[str] = []
+    params: list[Any] = []
+    cutoff = _cutoff_iso(input.days_back)
+    if cutoff is not None:
+        where_clauses.append("logged_at >= ?")
+        params.append(cutoff)
+    if input.category:
+        where_clauses.append("category = ?")
+        params.append(input.category)
+    where_sql = (
+        ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    )
+    limit = max(1, min(input.limit, 200))
+    params.append(limit)
+
+    sql = f"""
+        SELECT id, amount, category, description, is_impulse, logged_at
+        FROM finance_log
+        {where_sql}
+        ORDER BY logged_at DESC
+        LIMIT ?
+    """
+
+    try:
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+    except (OSError, aiosqlite.Error) as exc:
+        log.warning("query_expenses.error", error=str(exc))
+        return _err(f"database error: {exc}")
+
+    entries = [
+        {
+            "id": row["id"],
+            "amount": float(row["amount"]),
+            "category": row["category"],
+            "description": row["description"],
+            "is_impulse": bool(row["is_impulse"]),
+            "logged_at": row["logged_at"],
+        }
+        for row in rows
+    ]
+    by_category: dict[str, float] = {}
+    total = 0.0
+    for e in entries:
+        total += e["amount"]
+        by_category[e["category"]] = round(
+            by_category.get(e["category"], 0) + e["amount"], 2
+        )
+    return json.dumps(
+        {
+            "success": True,
+            "expenses": entries,
+            "count": len(entries),
+            "total": round(total, 2),
+            "by_category": by_category,
+        }
+    )
+
+
+@tool(
+    name="query_quick_notes",
+    description=(
+        "Query recent quick notes. Returns most-recent first; supports "
+        "substring filter on tags."
+    ),
+    category=ToolCategory.LIFE_MANAGEMENT,
+    auth_level=AuthLevel.ALWAYS_ALLOWED,
+    is_read_only=True,
+)
+async def query_quick_notes(
+    input: QueryQuickNotesInput, container: Any
+) -> str:
+    db_path = _get_db_path(container)
+    if db_path is None:
+        return _err("no database available")
+
+    where_clauses: list[str] = []
+    params: list[Any] = []
+    cutoff = _cutoff_iso(input.days_back)
+    if cutoff is not None:
+        where_clauses.append("created_at >= ?")
+        params.append(cutoff)
+    if input.tag:
+        where_clauses.append("LOWER(COALESCE(tags, '')) LIKE ?")
+        params.append(f"%{input.tag.lower()}%")
+    where_sql = (
+        ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    )
+    limit = max(1, min(input.limit, 200))
+    params.append(limit)
+
+    sql = f"""
+        SELECT id, content, tags, created_at
+        FROM quick_notes
+        {where_sql}
+        ORDER BY created_at DESC
+        LIMIT ?
+    """
+
+    try:
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+    except (OSError, aiosqlite.Error) as exc:
+        log.warning("query_quick_notes.error", error=str(exc))
+        return _err(f"database error: {exc}")
+
+    notes = [
+        {
+            "id": r["id"],
+            "content": r["content"],
+            "tags": r["tags"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+    return json.dumps(
+        {"success": True, "notes": notes, "count": len(notes)}
+    )

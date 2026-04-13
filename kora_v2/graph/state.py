@@ -66,6 +66,18 @@ class SupervisorState(TypedDict, total=False):
     session_bridge: dict[str, Any] | None  # Last session's bridge note, loaded at init
     greeting_sent: bool  # Whether session greeting has been sent this session
 
+    # ── Phase 5: ADHD life engine ─────────────────────────────────
+    # Populated by build_suffix from ContextEngine.build_day_context()
+    # and consumed by the "## Today" block renderer. Stored as dict so
+    # it survives LangGraph checkpointing (raw Pydantic models with
+    # datetimes don't round-trip cleanly through MemorySaver).
+    day_context: dict[str, Any] | None
+    # Topic-tracking state used for hyperfocus detection. Reset when
+    # the tool-footprint heuristic says "new topic".
+    turns_in_current_topic: int
+    hyperfocus_mode: bool
+    topic_tracker: dict[str, Any] | None
+
     # ── Internal (graph-private, not part of public contract) ─────
     # Dynamic suffix assembled by build_suffix, consumed by think.
     _dynamic_suffix: str

@@ -1,0 +1,54 @@
+name: calendar
+display_name: "Calendar (Unified Timeline)"
+
+tools:
+  - create_calendar_entry
+  - query_calendar
+  - update_calendar_entry
+  - delete_calendar_entry
+  - sync_google_calendar
+
+discovery_tools: []
+
+guidance: |
+  ## Calendar Tools
+
+  Kora's calendar is a unified timeline covering events, medication
+  windows, focus blocks, routine windows, buffers, reminders, and
+  deadlines. Use ``kind`` to distinguish them; the same tools work for
+  every kind.
+
+  **When to use:**
+  - The user asks "what's on my day?" / "what's coming up?" → query_calendar
+  - The user commits to a meeting, focus block, or deadline → create_calendar_entry
+  - The user says "move my 10am" / "I missed X" → update_calendar_entry (or update_plan)
+  - The user asks "sync my Google Calendar" → sync_google_calendar
+
+  **ISO 8601 datetimes, UTC preferred.** If the user gives you a local
+  time, convert using the Settings.user_tz (ask Kora's engine, don't
+  guess). Always pass complete ``starts_at`` and (for bounded entries)
+  ``ends_at``.
+
+  **Recurring entries:**
+  - Use ``recurring_rule`` with an RFC 5545 RRULE string (e.g.
+    ``FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR``). The store expands the
+    template at query time; you'll see synthetic IDs shaped
+    ``{parent_id}::{YYYY-MM-DD}`` when a recurring event is listed.
+  - To change one occurrence, call ``update_calendar_entry`` with that
+    synthetic ID and the fields you want to change — the tool creates
+    an exception row that overrides that date without touching the
+    parent rule. To cancel one occurrence, ``delete_calendar_entry``
+    with the synthetic ID creates a cancelled exception.
+  - "Apply to all future occurrences" is not supported yet; if the user
+    asks for that, delete the recurring entry and recreate it with the
+    new rule.
+
+  **Buffer auto-insertion:** when you create a focus_block or event
+  that starts within 5 minutes after another active entry, the tool
+  automatically inserts a 15-minute (configurable) transition buffer.
+  Mention it briefly if relevant ("added a 15min buffer before your
+  3pm meeting") — don't hide it.
+
+  **Kora's calendar is authoritative.** Google Calendar is a sync
+  partner, not the source of truth. If sync fails, Kora operates from
+  the internal store and surfaces the failure honestly.

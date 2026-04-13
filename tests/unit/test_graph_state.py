@@ -36,6 +36,11 @@ class TestSupervisorState:
             # WS4 overlap detection
             "_overlap_score",
             "_overlap_action",
+            # Phase 5 ADHD life engine
+            "day_context",
+            "turns_in_current_topic",
+            "hyperfocus_mode",
+            "topic_tracker",
         }
         assert expected == keys
 
