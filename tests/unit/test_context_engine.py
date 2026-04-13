@@ -18,6 +18,7 @@ from kora_v2.adhd import (
 from kora_v2.adhd.protocol import EnergySignal
 from kora_v2.context.engine import (
     ContextEngine,
+    _aggregate_focus_summary,
     _build_medication_status,
     _estimate_energy,
 )
@@ -192,6 +193,44 @@ class TestMedicationStatus:
         rows = [FakeRow(datetime(2026, 4, 12, 9, 31, tzinfo=UTC))]
         status = _build_medication_status(profile, rows, now, tz)
         assert status.missed and not status.taken
+
+
+class TestFocusSummaryTrend:
+    """``_aggregate_focus_summary.trend`` must reflect first-half vs
+    second-half averages, not a hardcoded 'stable'."""
+
+    @staticmethod
+    def _rows(hours_per_day: list[float]) -> list[dict]:
+        rows: list[dict] = []
+        base = datetime(2026, 4, 1, 9, 0, tzinfo=UTC)
+        for i, h in enumerate(hours_per_day):
+            start = base + timedelta(days=i)
+            end = start + timedelta(hours=h)
+            rows.append(
+                {
+                    "started_at": start.isoformat(),
+                    "ended_at": end.isoformat(),
+                }
+            )
+        return rows
+
+    def test_stable(self):
+        rows = self._rows([2, 2, 2, 2])
+        assert _aggregate_focus_summary(rows, ZoneInfo("UTC"))["trend"] == "stable"
+
+    def test_declining(self):
+        # First half: 4h/day, second half: 1h/day → below 0.7 * first avg.
+        rows = self._rows([4, 4, 1, 1])
+        assert (
+            _aggregate_focus_summary(rows, ZoneInfo("UTC"))["trend"] == "declining"
+        )
+
+    def test_improving(self):
+        # First half: 1h/day, second half: 4h/day → above 1.3 * first avg.
+        rows = self._rows([1, 1, 4, 4])
+        assert (
+            _aggregate_focus_summary(rows, ZoneInfo("UTC"))["trend"] == "improving"
+        )
 
 
 class TestLifeContextAggregation:

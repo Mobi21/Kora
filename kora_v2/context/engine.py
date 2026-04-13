@@ -585,12 +585,8 @@ class ContextEngine:
         sql: str,
         params: tuple[Any, ...],
     ) -> list[aiosqlite.Row]:
-        try:
-            async with db.execute(sql, params) as cur:
-                return await cur.fetchall()
-        except aiosqlite.Error as exc:
-            log.debug("context_engine_query_failed", sql=sql, error=str(exc))
-            return []
+        async with db.execute(sql, params) as cur:
+            return await cur.fetchall()
 
     async def _fetch_one(
         self,
@@ -598,12 +594,8 @@ class ContextEngine:
         sql: str,
         params: tuple[Any, ...],
     ) -> aiosqlite.Row | None:
-        try:
-            async with db.execute(sql, params) as cur:
-                return await cur.fetchone()
-        except aiosqlite.Error as exc:
-            log.debug("context_engine_query_failed", sql=sql, error=str(exc))
-            return None
+        async with db.execute(sql, params) as cur:
+            return await cur.fetchone()
 
 
 # ── Status builders ─────────────────────────────────────────────────────────
@@ -628,7 +620,7 @@ def _build_focus_status(
                 elapsed = int(
                     (datetime.now(UTC) - started_dt).total_seconds() / 60
                 )
-            except ValueError:
+            except (ValueError, TypeError):
                 elapsed = 0
             active = {
                 "label": label,
@@ -638,9 +630,13 @@ def _build_focus_status(
         else:
             try:
                 started_dt = datetime.fromisoformat(started_at)
+                if started_dt.tzinfo is None:
+                    started_dt = started_dt.replace(tzinfo=UTC)
                 ended_dt = datetime.fromisoformat(ended_at)
+                if ended_dt.tzinfo is None:
+                    ended_dt = ended_dt.replace(tzinfo=UTC)
                 duration = int((ended_dt - started_dt).total_seconds() / 60)
-            except ValueError:
+            except (ValueError, TypeError):
                 duration = 0
             completed.append({"label": label, "duration_min": duration})
 
@@ -759,10 +755,26 @@ def _aggregate_focus_summary(
     best_day: str | None = None
     if by_day:
         best_day = max(by_day.items(), key=lambda kv: kv[1])[0]
+
+    # Trend: compare first half vs second half of the date range
+    trend = "stable"
+    if len(by_day) >= 2:
+        ordered_days = sorted(by_day.items())
+        mid = len(ordered_days) // 2
+        first_half = ordered_days[:mid] or ordered_days[:1]
+        second_half = ordered_days[mid:] or ordered_days[-1:]
+        first_avg = sum(v for _, v in first_half) / len(first_half)
+        second_avg = sum(v for _, v in second_half) / len(second_half)
+        if first_avg > 0:
+            if second_avg < first_avg * 0.7:
+                trend = "declining"
+            elif second_avg > first_avg * 1.3:
+                trend = "improving"
+
     return {
         "total_hours": round(total_min / 60, 1),
         "daily_avg": round(daily_avg, 1),
-        "trend": "stable",
+        "trend": trend,
         "best_day": best_day,
         "by_weekday": {k: round(v, 1) for k, v in by_weekday.items()},
     }
