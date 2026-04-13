@@ -30,9 +30,12 @@ import structlog
 from dateutil.rrule import rrulestr
 from pydantic import BaseModel, Field
 
-from kora_v2.core.calendar_models import CalendarEntry
+from kora_v2.core.calendar_models import CalendarEntry, CalendarKind
 from kora_v2.tools.registry import tool
 from kora_v2.tools.types import AuthLevel, ToolCategory
+
+# Valid kind literals for runtime validation of Google marker tags.
+_VALID_KINDS: frozenset[str] = frozenset(CalendarKind.__args__)  # type: ignore[attr-defined]
 
 log = structlog.get_logger(__name__)
 
@@ -160,6 +163,9 @@ def expand_recurring(
     duration = None
     if entry.ends_at is not None:
         duration = entry.ends_at - entry.starts_at
+        # Guard against corrupted rows where ends_at < starts_at
+        if duration.total_seconds() < 0:
+            duration = None
     expanded: list[CalendarEntry] = []
     for occ in occurrences:
         new_ends = occ + duration if duration else None
@@ -180,9 +186,14 @@ def _is_synthetic(entry_id: str) -> bool:
     return SYNTHETIC_ID_SEP in entry_id
 
 
-def _parse_synthetic(entry_id: str) -> tuple[str, str] | None:
+def _parse_synthetic(entry_id: str) -> tuple[str, str]:
+    """Split a synthetic recurring-occurrence id into (parent_id, occ_date).
+
+    Callers must gate with ``_is_synthetic`` — calling this on a non-
+    synthetic id raises ``ValueError``.
+    """
     if SYNTHETIC_ID_SEP not in entry_id:
-        return None
+        raise ValueError(f"not a synthetic entry id: {entry_id!r}")
     parent_id, occ_date = entry_id.split(SYNTHETIC_ID_SEP, 1)
     return parent_id, occ_date
 
@@ -388,11 +399,15 @@ class CalendarSync:
             log.debug("google_calendar_pull_failed", error=str(exc))
             return []
         try:
-            events = json.loads(result.text) if hasattr(result, "text") else []
+            payload = json.loads(result.text) if hasattr(result, "text") else []
         except (json.JSONDecodeError, TypeError):
             return []
-        if not isinstance(events, list):
-            events = events.get("items", []) if isinstance(events, dict) else []
+        if isinstance(payload, list):
+            items: list[Any] = payload
+        elif isinstance(payload, dict):
+            items = payload.get("items", []) or []
+        else:
+            items = []
 
         upserted: list[dict[str, Any]] = []
         db_path = _get_db_path(self._container)
@@ -400,7 +415,7 @@ class CalendarSync:
             return []
         async with aiosqlite.connect(str(db_path)) as db:
             db.row_factory = aiosqlite.Row
-            for evt in events:
+            for evt in items:
                 entry = _google_event_to_entry(evt)
                 if entry is None:
                     continue
@@ -465,14 +480,18 @@ def _google_event_to_entry(evt: dict[str, Any]) -> CalendarEntry | None:
         return None
     ends_at = _parse_dt(end.get("dateTime") or end.get("date"))
     description = evt.get("description") or ""
-    kind = "event"
+    kind: str = "event"
     marker = CalendarSync.KORA_KIND_MARKER
     if marker in description:
         try:
-            tag = description.split(marker, 1)[1].split("]", 1)[0]
-            if tag:
-                kind = tag  # type: ignore[assignment]
-        except IndexError:
+            before, after = description.split(marker, 1)
+            tag, _, remainder = after.partition("]")
+            # Only accept the marker if it's a known kind; otherwise leave
+            # as a plain event and preserve the description verbatim.
+            if tag in _VALID_KINDS:
+                kind = tag
+                description = (before + remainder).strip()
+        except ValueError:
             pass
     now = datetime.now(UTC)
     return CalendarEntry(
@@ -658,18 +677,38 @@ async def create_calendar_entry(
         log.warning("create_calendar_entry.error", error=str(exc))
         return _err(f"database error: {exc}")
 
-    # Best-effort push to Google Calendar (async, non-blocking for failures)
+    # Best-effort push to Google Calendar (async, non-blocking for failures).
+    # Invariant: if push_entry returns a google_event_id, the UPDATE below is
+    # the sole path to synced_at != NULL. If the UPDATE fails after the push
+    # succeeds, the row is orphaned (row has no google_event_id locally, but
+    # the event exists upstream). We log loud enough for an operator to find
+    # and reconcile it — see warning below.
     try:
         sync = CalendarSync(container)
         gid = await sync.push_entry(entry)
         if gid:
-            async with aiosqlite.connect(str(db_path)) as db:
-                await db.execute(
-                    "UPDATE calendar_entries SET google_event_id = ?, "
-                    "synced_at = ? WHERE id = ?",
-                    (gid, _now_iso(), entry.id),
+            try:
+                async with aiosqlite.connect(str(db_path)) as db:
+                    await db.execute(
+                        "UPDATE calendar_entries SET google_event_id = ?, "
+                        "synced_at = ? WHERE id = ?",
+                        (gid, _now_iso(), entry.id),
+                    )
+                    await db.commit()
+            except (OSError, aiosqlite.Error) as update_exc:
+                log.warning(
+                    "google_calendar_push_orphaned",
+                    entry_id=entry.id,
+                    google_event_id=gid,
+                    title=entry.title,
+                    starts_at=entry.starts_at.isoformat(),
+                    error=str(update_exc),
+                    note=(
+                        "google event was created but local row could not be "
+                        "updated; reconcile by setting google_event_id and "
+                        "synced_at on the entry"
+                    ),
                 )
-                await db.commit()
     except Exception:
         log.debug("google_calendar_push_skipped", exc_info=True)
 
@@ -767,7 +806,7 @@ async def update_calendar_entry(
             db.row_factory = aiosqlite.Row
 
             if _is_synthetic(input.entry_id):
-                parent_id, occ_date = _parse_synthetic(input.entry_id)  # type: ignore[misc]
+                parent_id, occ_date = _parse_synthetic(input.entry_id)
                 async with db.execute(
                     "SELECT * FROM calendar_entries WHERE id = ?",
                     (parent_id,),
@@ -846,7 +885,7 @@ async def delete_calendar_entry(
         async with aiosqlite.connect(str(db_path)) as db:
             db.row_factory = aiosqlite.Row
             if _is_synthetic(input.entry_id):
-                parent_id, occ_date = _parse_synthetic(input.entry_id)  # type: ignore[misc]
+                parent_id, occ_date = _parse_synthetic(input.entry_id)
                 async with db.execute(
                     "SELECT * FROM calendar_entries WHERE id = ?",
                     (parent_id,),

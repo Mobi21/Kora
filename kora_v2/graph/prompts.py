@@ -407,7 +407,7 @@ def _render_today_block(day_context: dict[str, Any], state: dict[str, Any]) -> s
                 d = _date.fromisoformat(date_str)
             else:
                 d = date_str
-            header_bits.append(f"{day_of_week}, {d.strftime('%B %-d')}")
+            header_bits.append(f"{day_of_week}, {d.strftime('%B')} {d.day}")
         except (ValueError, TypeError):
             header_bits.append(f"{day_of_week} {date_str}")
     elif day_of_week:

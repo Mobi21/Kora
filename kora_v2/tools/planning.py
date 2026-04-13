@@ -92,11 +92,14 @@ def apply_time_correction(minutes: int, profile: ADHDProfile) -> int:
     worker (agent execution planning) deliberately does NOT apply this
     multiplier, since those plans are agent-executed rather than
     user-executed.
+
+    Respects ``profile.time_correction_factor`` verbatim: if the user has
+    personalized it below 1.0 (e.g. they reliably overestimate), the
+    returned value can be **smaller** than ``minutes``. No floor.
     """
     if minutes <= 0:
         return minutes
-    corrected = int(round(minutes * profile.time_correction_factor))
-    return max(minutes, corrected)
+    return int(round(minutes * profile.time_correction_factor))
 
 
 # ── Natural-language scope parsing ──────────────────────────────────────────
