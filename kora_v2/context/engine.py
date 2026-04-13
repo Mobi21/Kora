@@ -335,7 +335,8 @@ class ContextEngine:
 
         # Assemble a minimal context for ADHD signal generation, then
         # call energy_signals with the *local* now so peak/crash windows
-        # match the profile's local hours.
+        # match the profile's local hours, and pass user_tz so morning
+        # meetings are counted in the user's wall-clock frame.
         proxy_ctx = type(
             "_Proxy",
             (),
@@ -344,7 +345,9 @@ class ContextEngine:
                 "schedule": schedule,
             },
         )()
-        signals = self._adhd.energy_signals(proxy_ctx, now=now_local)
+        signals = self._adhd.energy_signals(
+            proxy_ctx, now=now_local, user_tz=self._user_tz
+        )
 
         last_check_in: dict[str, Any] | None = None
         if last_energy is not None:

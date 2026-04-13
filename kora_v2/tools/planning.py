@@ -21,6 +21,7 @@ import re
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiosqlite
 import structlog
@@ -69,6 +70,18 @@ def _get_profile(container: Any) -> ADHDProfile:
     if isinstance(profile, ADHDProfile):
         return profile
     return ADHDProfile()
+
+
+def _get_user_tz(container: Any) -> ZoneInfo:
+    """Return the container's user timezone, falling back to UTC."""
+    settings = getattr(container, "settings", None)
+    name = getattr(settings, "user_tz", None) if settings is not None else None
+    if not name:
+        return ZoneInfo("UTC")
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
 
 
 def apply_time_correction(minutes: int, profile: ADHDProfile) -> int:
@@ -307,6 +320,7 @@ async def update_plan(input: UpdatePlanInput, container: Any) -> str:
             return _err(f"invalid reschedule_to: {input.reschedule_to!r}")
 
     profile = _get_profile(container)
+    user_tz = _get_user_tz(container)
 
     try:
         async with aiosqlite.connect(str(db_path)) as db:
@@ -357,8 +371,9 @@ async def update_plan(input: UpdatePlanInput, container: Any) -> str:
                             "new_starts_at": reschedule_dt.isoformat(),
                         }
                     )
-                    # Crash window warning
-                    local_hour = reschedule_dt.hour
+                    # Crash window warning — compare against the user's
+                    # local hour so PDT 3pm matches a [14, 16] window.
+                    local_hour = reschedule_dt.astimezone(user_tz).hour
                     for cs, ce in profile.crash_periods:
                         if cs <= local_hour < ce:
                             warnings.append(

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 from kora_v2.adhd import (
     ADHDModule,
@@ -30,6 +31,20 @@ def _make_entry(hour: int, title: str = "Meeting") -> CalendarEntry:
     ts = datetime(2026, 4, 12, hour, 0)
     return CalendarEntry(
         id=f"e{hour}",
+        kind="event",
+        title=title,
+        starts_at=ts,
+        ends_at=ts,
+        created_at=ts,
+        updated_at=ts,
+    )
+
+
+def _make_utc_entry(hour_utc: int, title: str = "Meeting") -> CalendarEntry:
+    """Build an entry whose starts_at is tz-aware UTC, like real rows."""
+    ts = datetime(2026, 4, 12, hour_utc, 0, tzinfo=UTC)
+    return CalendarEntry(
+        id=f"u{hour_utc}",
         kind="event",
         title=title,
         starts_at=ts,
@@ -78,12 +93,23 @@ class TestEnergySignals:
         assert any(s.level_adjustment == MEDS_MISSED_ADJUSTMENT for s in signals)
 
     def test_busy_morning_fires_above_threshold(self):
+        """Morning meetings stored as UTC must be counted as morning in
+        the user's local timezone — a 9am PST meeting is 17:00 UTC and
+        would have failed the < noon check without conversion.
+        """
         mod = ADHDModule(_make_profile())
-        schedule = [_make_entry(h) for h in range(8, 8 + BUSY_MORNING_THRESHOLD)]
+        la = ZoneInfo("America/Los_Angeles")
+        # 9am, 10am, 11am Pacific → 16, 17, 18 UTC.
+        schedule = [
+            _make_utc_entry(h)
+            for h in range(16, 16 + BUSY_MORNING_THRESHOLD)
+        ]
         dc = DayContext(
             date=date.today(), day_of_week="Mon", schedule=schedule
         )
-        signals = mod.energy_signals(dc)
+        # ``now`` is local 11am — also after the local-noon test below.
+        now_local = datetime(2026, 4, 12, 11, 0, tzinfo=la)
+        signals = mod.energy_signals(dc, now=now_local, user_tz=la)
         assert any(
             s.source == "calendar_load"
             and s.level_adjustment == BUSY_MORNING_ADJUSTMENT

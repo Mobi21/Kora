@@ -180,28 +180,38 @@ class TestUpdatePlan:
         assert data["moved"][0]["action"] == "cancelled"
 
     async def test_reschedule_into_crash_window_warns(self, container):
-        # Set up profile with a crash window covering 14-16 local hours.
+        """Crash window check must respect the user's local timezone:
+        a 3pm-PDT reschedule (= 22:00 UTC) must still match a local
+        [14, 16] crash window.
+        """
+        from zoneinfo import ZoneInfo
+
         profile = ADHDProfile(crash_periods=[(14, 16)])
         container.adhd_profile = profile
-        now = datetime.now(UTC).replace(hour=9, minute=0, second=0, microsecond=0)
+        container.settings.user_tz = "America/Los_Angeles"
+        la = ZoneInfo("America/Los_Angeles")
+
+        morning_local = datetime(2026, 4, 12, 9, 0, tzinfo=la)
+        morning_utc = morning_local.astimezone(UTC)
         r = await create_calendar_entry(
             CreateCalendarEntryInput(
                 kind="event",
                 title="Coding",
-                starts_at=now.isoformat(),
-                ends_at=(now + timedelta(minutes=60)).isoformat(),
+                starts_at=morning_utc.isoformat(),
+                ends_at=(morning_utc + timedelta(minutes=60)).isoformat(),
             ),
             container,
         )
         entry_id = json.loads(r)["id"]
 
-        new_time = now.replace(hour=15)
+        afternoon_local = datetime(2026, 4, 12, 15, 0, tzinfo=la)
+        afternoon_utc = afternoon_local.astimezone(UTC)
         r = await update_plan(
             UpdatePlanInput(
                 summary="moved to afternoon",
                 affected_entry_ids=[entry_id],
                 action="reschedule",
-                reschedule_to=new_time.isoformat(),
+                reschedule_to=afternoon_utc.isoformat(),
             ),
             container,
         )

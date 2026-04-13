@@ -235,3 +235,31 @@ async def test_query_missing_entry_errors(container):
     )
     data = json.loads(result)
     assert data["success"] is False
+
+
+async def test_query_calendar_uses_user_tz_for_day_window(container):
+    """``query_calendar(date='2026-04-12')`` for a Pacific user must
+    return a UTC entry at 16:00 (= 9am PDT) on that local date.
+    """
+    container.settings.user_tz = "America/Los_Angeles"
+    # 16:00 UTC = 09:00 America/Los_Angeles on 2026-04-12.
+    starts = datetime(2026, 4, 12, 16, 0, tzinfo=UTC)
+    r = await create_calendar_entry(
+        CreateCalendarEntryInput(
+            kind="event",
+            title="Standup PDT",
+            starts_at=starts.isoformat(),
+            ends_at=(starts + timedelta(minutes=30)).isoformat(),
+        ),
+        container,
+    )
+    assert json.loads(r)["success"] is True
+
+    q = await query_calendar(
+        QueryCalendarInput(date="2026-04-12", days_ahead=1), container
+    )
+    qdata = json.loads(q)
+    titles = [e["title"] for e in qdata["entries"]]
+    assert "Standup PDT" in titles
+    # Local bounds are also reported so callers see the asked-for frame.
+    assert qdata["since_local"].startswith("2026-04-12T00:00:00")

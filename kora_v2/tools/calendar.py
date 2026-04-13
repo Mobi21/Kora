@@ -21,8 +21,9 @@ signatures (matches the pattern used by ``life_management.py``).
 
 import json
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiosqlite
 import structlog
@@ -69,6 +70,18 @@ def _get_db_path(container: Any):
     if data_dir is None:
         return None
     return data_dir / "operational.db"
+
+
+def _get_user_tz(container: Any) -> ZoneInfo:
+    """Return the container's user timezone, falling back to UTC."""
+    settings = getattr(container, "settings", None)
+    name = getattr(settings, "user_tz", None) if settings is not None else None
+    if not name:
+        return ZoneInfo("UTC")
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -689,15 +702,22 @@ async def query_calendar(input: QueryCalendarInput, container: Any) -> str:
     if db_path is None:
         return _err("no database available")
 
+    user_tz = _get_user_tz(container)
+
+    # Build the local-day window first (so "today" means today in the
+    # user's wall clock, not UTC), then convert to UTC for the DB.
     if input.date:
         try:
-            base = datetime.fromisoformat(input.date).replace(tzinfo=UTC)
+            day = datetime.fromisoformat(input.date).date()
         except ValueError:
             return _err(f"invalid date: {input.date!r}")
     else:
-        base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    since = base
-    until = base + timedelta(days=max(1, input.days_ahead))
+        day = datetime.now(user_tz).date()
+    days_ahead = max(1, input.days_ahead)
+    since_local = datetime.combine(day, time.min, tzinfo=user_tz)
+    until_local = since_local + timedelta(days=days_ahead)
+    since = since_local.astimezone(UTC)
+    until = until_local.astimezone(UTC)
 
     try:
         async with aiosqlite.connect(str(db_path)) as db:
@@ -713,6 +733,8 @@ async def query_calendar(input: QueryCalendarInput, container: Any) -> str:
         {
             "since": since.isoformat(),
             "until": until.isoformat(),
+            "since_local": since_local.isoformat(),
+            "until_local": until_local.isoformat(),
             "count": len(entries),
             "entries": [_entry_to_dict(e) for e in entries],
         }

@@ -8,7 +8,7 @@ triggers.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, tzinfo
 from typing import Any
 
 from kora_v2.adhd.profile import ADHDProfile
@@ -57,7 +57,10 @@ class ADHDModule:
     # ── Energy signals ────────────────────────────────────────────────
 
     def energy_signals(
-        self, day_context: Any, now: datetime | None = None
+        self,
+        day_context: Any,
+        now: datetime | None = None,
+        user_tz: tzinfo | None = None,
     ) -> list[EnergySignal]:
         """Produce a list of signals from today's state.
 
@@ -66,10 +69,16 @@ class ADHDModule:
         ``now`` should be the user's *local* datetime when available
         (the context engine converts UTC to ``Settings.user_tz`` before
         calling this); defaults to ``datetime.now(UTC)`` for tests.
+        ``user_tz`` is required for the morning-events comparison
+        to use local wall-clock time on calendar entries that are stored
+        in UTC; if omitted the entry's ``starts_at.tzinfo`` is used as a
+        fallback (which collapses to UTC for tz-aware entries).
         """
         signals: list[EnergySignal] = []
         if now is None:
             now = datetime.now(UTC)
+        if user_tz is None and now.tzinfo is not None:
+            user_tz = now.tzinfo
 
         # Medication timing
         med_status = _get_attr(day_context, "medication_status")
@@ -103,13 +112,14 @@ class ADHDModule:
                     )
                 )
 
-        # Calendar load (morning meetings)
+        # Calendar load (morning meetings) — compare in the user's
+        # local frame so a 9am PST event isn't read as a 5pm UTC event.
         schedule = _get_attr(day_context, "schedule") or []
         morning_events = [
             e
             for e in schedule
             if _get_attr(e, "kind") == "event"
-            and _starts_before(e, time(12, 0))
+            and _starts_before(e, time(12, 0), user_tz)
         ]
         if len(morning_events) >= BUSY_MORNING_THRESHOLD:
             signals.append(
@@ -305,8 +315,17 @@ def _get_attr(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
-def _starts_before(entry: Any, cutoff: time) -> bool:
-    """True if the calendar entry starts before ``cutoff`` (local-naive)."""
+def _starts_before(
+    entry: Any, cutoff: time, user_tz: tzinfo | None = None
+) -> bool:
+    """True if the calendar entry starts before ``cutoff`` in the user's
+    local frame.
+
+    ``user_tz`` should be the user's IANA zoneinfo. If it's None and the
+    entry is tz-aware, the comparison falls back to the entry's own
+    timezone (which is UTC for entries stored in our schema). Naive
+    datetimes are compared as-is.
+    """
     starts_at = _get_attr(entry, "starts_at")
     if starts_at is None:
         return False
@@ -316,6 +335,8 @@ def _starts_before(entry: Any, cutoff: time) -> bool:
         except ValueError:
             return False
     try:
+        if user_tz is not None and starts_at.tzinfo is not None:
+            starts_at = starts_at.astimezone(user_tz)
         return starts_at.time() < cutoff
     except AttributeError:
         return False
