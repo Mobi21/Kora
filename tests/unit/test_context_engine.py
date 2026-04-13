@@ -63,6 +63,28 @@ class TestDayContextBuilder:
         for ins in lc.insights:
             assert isinstance(ins, str)
 
+    async def test_items_due_today_with_bare_date(self, engine):
+        """items_due must match bare YYYY-MM-DD due_date strings.
+
+        Regression: the original SQL used range comparison against full
+        ISO datetime bounds, which is lexically false against the bare
+        date strings ``create_item`` writes. Today's items vanished.
+        """
+        today = date.today()
+        async with aiosqlite.connect(str(engine._db_path)) as db:
+            now = datetime.now(UTC).isoformat()
+            await db.execute(
+                "INSERT INTO items "
+                "(id, type, owner, title, status, due_date, "
+                " goal_scope, priority, created_at, updated_at) "
+                "VALUES (?, 'task', 'kora', ?, 'planned', ?, 'task', 3, ?, ?)",
+                (uuid.uuid4().hex[:8], "Today task", today.isoformat(), now, now),
+            )
+            await db.commit()
+
+        dc = await engine.build_day_context(target_date=today)
+        assert any(item["title"] == "Today task" for item in dc.items_due)
+
 
 class TestEstimateEnergy:
     def test_self_report_short_circuits(self):

@@ -271,13 +271,18 @@ class ContextEngine:
                 "logged_at < ?",
                 (day_start.isoformat(), day_end.isoformat()),
             )
+            # `due_date` is stored as a bare ISO date string (YYYY-MM-DD)
+            # by `tools.planning.create_item`; an exact match against
+            # the target date is the only correct comparison. Range
+            # comparisons against full ISO datetimes break lexically
+            # (e.g. "2026-04-12" < "2026-04-12T00:00:00+00:00").
             items_rows = await self._fetch_rows(
                 db,
                 "SELECT id, title, status, priority, due_date, goal_scope "
                 "FROM items WHERE status NOT IN ('done','cancelled') "
-                "AND due_date IS NOT NULL AND due_date >= ? AND due_date < ? "
+                "AND due_date = ? "
                 "ORDER BY priority ASC",
-                (day_start.isoformat(), day_end.isoformat()),
+                (target_date.isoformat(),),
             )
             last_energy = await self._fetch_one(
                 db,

@@ -630,8 +630,15 @@ async def query_items(input: QueryItemsInput, container: Any) -> str:
         clauses.append("status = ?")
         params.append(input.status)
     if input.due_before:
+        # `due_date` is stored as bare YYYY-MM-DD; slice off any
+        # accidental time component so lexical comparison stays correct.
+        due_before_date = input.due_before[:10]
+        try:
+            datetime.fromisoformat(due_before_date)
+        except ValueError:
+            return _err(f"invalid due_before: {input.due_before!r}")
         clauses.append("due_date IS NOT NULL AND due_date <= ?")
-        params.append(input.due_before)
+        params.append(due_before_date)
     if input.goal_scope:
         clauses.append("goal_scope = ?")
         params.append(input.goal_scope)
