@@ -100,6 +100,9 @@ class Container:
         # Phase 6: Active autonomous execution loops, keyed by session_id.
         self._autonomous_loops: dict[str, Any] = {}
 
+        # Phase 7.5: Orchestration engine (lazy async init).
+        self._orchestration_engine: Any | None = None
+
         log.info(
             "container_initialized",
             llm_model=settings.llm.model,
@@ -491,6 +494,97 @@ class Container:
             self._calendar_sync = CalendarSync(self)
         return self._calendar_sync
 
+    # ── Phase 7.5: Orchestration engine ──────────────────────────
+
+    @property
+    def orchestration_engine(self) -> Any | None:
+        """The :class:`OrchestrationEngine` instance (set by init)."""
+        return self._orchestration_engine
+
+    async def initialize_orchestration(
+        self,
+        *,
+        websocket_broadcast: Any | None = None,
+        session_active_fn: Any | None = None,
+        hyperfocus_active_fn: Any | None = None,
+    ) -> Any:
+        """Create and return the :class:`OrchestrationEngine`.
+
+        This is an async init step because the engine applies SQL
+        migrations (``init_orchestration_schema``) on first ``start()``.
+        The engine itself is cheap to construct — ``start()`` is the
+        expensive call, and the daemon owns when that happens.
+
+        Args:
+            websocket_broadcast: Optional async callable used by the
+                notification gate to push messages to connected CLI
+                clients. The daemon passes ``_broadcast_to_clients``.
+            session_active_fn: Optional predicate returning True when
+                at least one CLI client is connected — used by the gate
+                to decide whether ``send_templated`` requests should
+                actually deliver or wait until a session is live.
+            hyperfocus_active_fn: Optional predicate returning True when
+                the user is in a hyperfocus block — used to suppress
+                notifications per the profile's
+                ``hyperfocus_suppression`` flag.
+
+        Returns:
+            The constructed :class:`OrchestrationEngine` — also cached
+            on ``self._orchestration_engine``.
+        """
+        from kora_v2.runtime.orchestration.engine import OrchestrationEngine
+        from kora_v2.runtime.orchestration.system_state import (
+            UserScheduleProfile,
+        )
+
+        db_path = self.settings.data_dir / "operational.db"
+        memory_root = Path(self.settings.memory.kora_memory_path)
+
+        # Build a best-effort schedule profile from the ADHD profile.
+        # Any missing/typed-wrong field falls back to the default
+        # ``UserScheduleProfile()`` so engine construction never crashes
+        # when the user hasn't finished the first-run wizard.
+        schedule_profile = UserScheduleProfile()
+        try:
+            profile = self.adhd_profile
+            if profile is not None:
+                kwargs: dict[str, Any] = {}
+                for field_name in (
+                    "wake_time",
+                    "sleep_start",
+                    "sleep_end",
+                    "dnd_start",
+                    "dnd_end",
+                    "timezone",
+                    "weekly_review_time",
+                    "weekly_review_weekday",
+                    "hyperfocus_suppression",
+                ):
+                    value = getattr(profile, field_name, None)
+                    if value is not None:
+                        kwargs[field_name] = value
+                if kwargs:
+                    schedule_profile = UserScheduleProfile(**kwargs)
+        except Exception:
+            log.debug("schedule_profile_build_failed", exc_info=True)
+
+        engine = OrchestrationEngine(
+            db_path=db_path,
+            event_emitter=self.event_emitter,
+            schedule_profile=schedule_profile,
+            memory_root=memory_root,
+            websocket_broadcast=websocket_broadcast,
+            session_active_fn=session_active_fn,
+            hyperfocus_active_fn=hyperfocus_active_fn,
+        )
+        self._orchestration_engine = engine
+        log.info(
+            "orchestration_engine_constructed",
+            db_path=str(db_path),
+            memory_root=str(memory_root),
+        )
+        return engine
+
     # ── Cleanup ───────────────────────────────────────────────────
 
     async def close(self) -> None:
@@ -527,6 +621,17 @@ class Container:
                     count=len(tasks),
                 )
             self._autonomous_loops.clear()
+
+        # 0b. Stop the orchestration engine so the dispatcher, trigger
+        #     scheduler, and notification gate get a clean shutdown
+        #     before anything else tears down. A graceful stop allows
+        #     in-flight tasks to complete without being cancelled.
+        if self._orchestration_engine is not None:
+            try:
+                await self._orchestration_engine.stop(graceful=True)
+                log.info("orchestration_engine_stopped_via_container")
+            except Exception:
+                log.debug("orchestration_engine_stop_failed", exc_info=True)
 
         # 1. Flush and close the LangGraph checkpointer (SQLite saver).
         #    Without this, pending checkpoints may not hit disk and the

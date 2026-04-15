@@ -15,8 +15,12 @@ from pathlib import Path
 
 from kora_v2.core.events import EventEmitter, EventType
 from kora_v2.runtime.orchestration import (
+    FailurePolicy,
+    InterruptionPolicy,
     LedgerEventType,
     OrchestrationEngine,
+    Pipeline,
+    PipelineStage,
     RequestClass,
     RequestLimiter,
     StepContext,
@@ -24,9 +28,32 @@ from kora_v2.runtime.orchestration import (
     UserScheduleProfile,
     WorkerTask,
     WorkerTaskState,
-    demo_tick_pipeline,
     init_orchestration_schema,
 )
+
+
+def demo_tick_pipeline() -> Pipeline:
+    """A tiny single-stage pipeline used by the 7.5a acceptance tests.
+
+    Kept local to the test module (rather than shipped from the
+    production package) so the ``templates.py`` boundary stays clean —
+    production code should never import pipeline primitives from the
+    template module.
+    """
+    return Pipeline(
+        name="demo_tick",
+        description="Exercise the dispatcher loop with a single background tick.",
+        stages=[
+            PipelineStage(
+                name="tick",
+                task_preset="bounded_background",
+                goal_template="Emit a single heartbeat for {{instance_id}}",
+            )
+        ],
+        triggers=[],
+        interruption_policy=InterruptionPolicy.RUN_TO_COMPLETION,
+        failure_policy=FailurePolicy.FAIL_PIPELINE,
+    )
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 

@@ -9,10 +9,12 @@ import pytest
 
 from kora_v2.autonomous.overlap import (
     OverlapResult,
+    check_topic_overlap,
+)
+from kora_v2.runtime.orchestration.overlap import (
     _cosine,
     _lexical_jaccard,
     _tokenize,
-    check_topic_overlap,
 )
 
 # ── Unit: _tokenize ───────────────────────────────────────────────────────

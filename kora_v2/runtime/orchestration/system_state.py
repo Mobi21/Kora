@@ -54,6 +54,17 @@ class UserScheduleProfile:
     All ``time`` objects are interpreted in ``timezone`` (IANA name).
     ``None`` fields mean "the corresponding phase is never entered"
     (e.g. a user with no DND window defined never lands in DND).
+
+    Spec §16.3 extends the profile with the fields needed by the
+    orchestration gate and the weekly-review pipeline:
+
+    * ``weekly_review_time`` — the (weekday, time) anchor used by the
+      ``weekly_review`` pipeline's cron trigger. Stored as a plain
+      ``time`` plus a 0-indexed weekday so the trigger engine can do
+      its own cron expansion.
+    * ``hyperfocus_suppression`` — toggled by the user via the life
+      surface to ask Kora to hold non-urgent notifications while a
+      hyperfocus window is active. Defaults to True for safety.
     """
 
     timezone: str = "UTC"
@@ -62,6 +73,9 @@ class UserScheduleProfile:
     sleep_end: time | None = None
     dnd_start: time | None = None
     dnd_end: time | None = None
+    weekly_review_time: time | None = None
+    weekly_review_weekday: int | None = None  # 0 = Monday .. 6 = Sunday
+    hyperfocus_suppression: bool = True
 
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)

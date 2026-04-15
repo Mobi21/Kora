@@ -42,7 +42,12 @@ _container: Container | None = None
 _api_token: str = ""
 _shutdown_event: asyncio.Event | None = None
 _auth_relay: Any = None
-_background_worker: Any = None
+# Phase 7.5b: ``BackgroundWorker`` has been deleted. The orchestration
+# engine is the single scheduler. It is created lazily during
+# ``create_app`` and started inside ``run_server`` so callers who only
+# need the FastAPI app (e.g. tests that mount routes directly) don't
+# pay the engine's startup cost.
+_orchestration_engine: Any = None
 _connected_clients: list[WebSocket] = []
 # Uvicorn server instance; set by run_server(). The /daemon/shutdown
 # endpoint flips `_server.should_exit = True` so uvicorn's main_loop
@@ -111,7 +116,7 @@ def create_app(container: Container) -> FastAPI:
     Returns:
         Configured FastAPI instance.
     """
-    global _container, _api_token, _shutdown_event, _auth_relay, _background_worker  # noqa: PLW0603
+    global _container, _api_token, _shutdown_event, _auth_relay, _orchestration_engine  # noqa: PLW0603
 
     _container = container
     _api_token = _load_or_create_token(container.settings.security.api_token_path)
@@ -121,23 +126,17 @@ def create_app(container: Container) -> FastAPI:
     _auth_relay = AuthRelay()
     container._auth_relay = _auth_relay  # make accessible to supervisor graph
 
-    # Create background worker and register work items
-    from kora_v2.daemon.worker import BackgroundWorker
-    from kora_v2.daemon.work_items import (
-        make_autonomous_update_item,
-        make_bridge_pruning_item,
-        make_memory_consolidation_item,
-        make_signal_scanner_item,
-        make_skill_refinement_item,
-    )
-
-    _background_worker = BackgroundWorker(container)
-    _background_worker.register(make_memory_consolidation_item(container))
-    _background_worker.register(make_signal_scanner_item(container))
-    _background_worker.register(make_autonomous_update_item(container))
-    _background_worker.register(make_bridge_pruning_item(container))
-    _background_worker.register(make_skill_refinement_item(container))
-    log.info("background_work_items_registered", count=5)
+    # Phase 7.5b: BackgroundWorker has been replaced with the
+    # OrchestrationEngine. The engine itself is constructed in
+    # ``run_server`` (which is async) and stored on the container;
+    # ``create_app`` only needs the already-built instance so the
+    # ``/api/v1/status`` endpoint can report pipeline counts.
+    _orchestration_engine = container.orchestration_engine
+    if _orchestration_engine is not None:
+        log.info(
+            "orchestration_engine_ready",
+            pipelines=len(_orchestration_engine.pipelines.all()),
+        )
 
     # Subscribe to events for WebSocket broadcasting
     _setup_event_subscriptions(container)
@@ -254,7 +253,11 @@ def _build_router():
             "turn_count": session.turn_count if session else 0,
             "started_at": session.started_at.isoformat() if session else None,
             "failed_subsystems": failed,
-            "background_worker_items": len(getattr(_background_worker, "items", [])) if _background_worker else 0,
+            "orchestration_pipelines": (
+                len(_orchestration_engine.pipelines.all())
+                if _orchestration_engine
+                else 0
+            ),
         }
 
     # --- Shutdown (auth required) ---
@@ -283,6 +286,69 @@ def _build_router():
         return {"status": "shutting_down"}
 
     # --- Autonomous loop inspection (auth required) ---
+
+    @router.get("/orchestration/status", dependencies=[Depends(verify_token)])
+    async def orchestration_status() -> dict[str, Any]:
+        """Phase 7.5b: snapshot of pipelines, tasks, and gate state.
+
+        Returns:
+            * ``pipelines`` — registered pipeline names + stage count.
+            * ``live_tasks`` — state + stage of every non-terminal task.
+            * ``open_decisions_count`` — how many decisions are pending.
+            * ``system_phase`` — the state machine's current phase.
+        """
+        engine = _orchestration_engine
+        if engine is None:
+            return {
+                "status": "unavailable",
+                "pipelines": [],
+                "live_tasks": [],
+                "open_decisions_count": 0,
+                "system_phase": None,
+            }
+
+        pipelines = [
+            {"name": p.name, "stage_count": len(p.stages)}
+            for p in engine.pipelines.all()
+        ]
+
+        try:
+            live_tasks_raw = await engine.list_tasks()
+        except Exception:  # noqa: BLE001
+            live_tasks_raw = []
+        live_tasks = [
+            {
+                "task_id": getattr(t, "id", None),
+                "stage": getattr(t, "stage_name", None),
+                "state": getattr(getattr(t, "state", None), "value", None)
+                or str(getattr(t, "state", "")),
+                "goal": getattr(t, "goal", None),
+                "pipeline_instance_id": getattr(t, "pipeline_instance_id", None),
+            }
+            for t in live_tasks_raw
+        ]
+
+        try:
+            pending = await engine.get_pending_decisions(limit=100)
+        except Exception:  # noqa: BLE001
+            pending = []
+
+        phase = None
+        try:
+            from datetime import UTC as _UTC
+            from datetime import datetime as _dt
+            phase_obj = engine.state_machine.current_phase(_dt.now(_UTC))
+            phase = getattr(phase_obj, "value", str(phase_obj))
+        except Exception:  # noqa: BLE001
+            phase = None
+
+        return {
+            "status": "ok",
+            "pipelines": pipelines,
+            "live_tasks": live_tasks,
+            "open_decisions_count": len(pending),
+            "system_phase": phase,
+        }
 
     @router.get("/inspect/autonomous", dependencies=[Depends(verify_token)])
     async def inspect_autonomous() -> dict[str, Any]:
@@ -897,6 +963,23 @@ async def run_server(
         log.warning("refusing_non_localhost_bind", requested=host)
         host = "127.0.0.1"
 
+    # Phase 7.5b: build the OrchestrationEngine before create_app so
+    # ``container.orchestration_engine`` is non-None by the time
+    # ``create_app`` needs it for the /status endpoint. The engine
+    # itself is not *started* until the uvicorn bind callback runs.
+    engine = await container.initialize_orchestration(
+        websocket_broadcast=_broadcast_to_clients,
+        session_active_fn=lambda: bool(_connected_clients),
+    )
+    from kora_v2.runtime.orchestration.core_pipelines import (
+        register_core_pipelines,
+    )
+    register_core_pipelines(engine)
+    log.info(
+        "orchestration_engine_constructed_pre_app",
+        pipelines=len(engine.pipelines.all()),
+    )
+
     app = create_app(container)
 
     config = uvicorn.Config(
@@ -914,8 +997,8 @@ async def run_server(
 
     log.info("server_starting", host=host, port=port)
 
-    if _background_worker is not None:
-        await _background_worker.start()
+    if _orchestration_engine is not None:
+        await _orchestration_engine.start()
 
     try:
         # Split serve() into startup + main_loop + shutdown so we can
@@ -944,6 +1027,6 @@ async def run_server(
         if server.started:
             await server.shutdown()
     finally:
-        if _background_worker is not None:
-            await _background_worker.stop()
+        if _orchestration_engine is not None:
+            await _orchestration_engine.stop(graceful=True)
         _server = None

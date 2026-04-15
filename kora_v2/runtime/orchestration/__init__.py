@@ -4,14 +4,23 @@ Public surface of the orchestration package. Everything downstream of
 the dispatcher should import from here rather than from the individual
 sub-modules so the file structure can evolve without breaking callers.
 
-This is Slice 7.5a (Primitives + Dispatcher). Trigger evaluation loop,
-working-doc filesystem contract, and notification gate arrive in 7.5b;
-the template catalogue arrives in 7.5c.
+Slice 7.5a landed the primitives, dispatcher, triggers, limiter, and
+system state machine. Slice 7.5b adds the working-doc filesystem
+contract, the template registry, the notification gate, the decision
+primitives (moved out of ``kora_v2.autonomous``), the open-decisions
+tracker, and the core pipeline catalogue.
 """
 
 from __future__ import annotations
 
 from kora_v2.runtime.orchestration.checkpointing import CheckpointStore
+from kora_v2.runtime.orchestration.decisions import (
+    DecisionManager,
+    DecisionResult,
+    OpenDecision,
+    OpenDecisionsTracker,
+    PendingDecision,
+)
 from kora_v2.runtime.orchestration.dispatcher import Dispatcher
 from kora_v2.runtime.orchestration.engine import OrchestrationEngine
 from kora_v2.runtime.orchestration.ledger import (
@@ -28,8 +37,15 @@ from kora_v2.runtime.orchestration.limiter import (
     RequestLimiter,
 )
 from kora_v2.runtime.orchestration.notifications import (
+    DeliveryChannel,
+    DeliveryResult,
+    GeneratedNotification,
     NotificationGate,
     PendingNotification,
+)
+from kora_v2.runtime.orchestration.overlap import (
+    OverlapResult,
+    check_topic_overlap,
 )
 from kora_v2.runtime.orchestration.pipeline import (
     FailurePolicy,
@@ -38,6 +54,11 @@ from kora_v2.runtime.orchestration.pipeline import (
     PipelineInstance,
     PipelineInstanceState,
     PipelineStage,
+)
+from kora_v2.runtime.orchestration.profile_bootstrap import (
+    DEFAULT_PROFILE_FRONTMATTER,
+    BootstrapResult,
+    ensure_profile_defaults,
 )
 from kora_v2.runtime.orchestration.registry import (
     PipelineInstanceRegistry,
@@ -54,7 +75,13 @@ from kora_v2.runtime.orchestration.system_state import (
     SystemStatePhase,
     UserScheduleProfile,
 )
-from kora_v2.runtime.orchestration.templates import demo_tick_pipeline
+from kora_v2.runtime.orchestration.templates import (
+    DEFAULT_TEMPLATES,
+    RenderedTemplate,
+    Template,
+    TemplatePriority,
+    TemplateRegistry,
+)
 from kora_v2.runtime.orchestration.triggers import (
     ConditionFn,
     Trigger,
@@ -87,7 +114,14 @@ from kora_v2.runtime.orchestration.worker_task import (
     WorkerTaskState,
     get_preset,
 )
-from kora_v2.runtime.orchestration.working_doc import WorkingDocHandle
+from kora_v2.runtime.orchestration.working_doc import (
+    PlanItem,
+    TaskListDiff,
+    WorkingDocHandle,
+    WorkingDocStatus,
+    WorkingDocStore,
+    WorkingDocUpdate,
+)
 
 __all__ = [
     # Engine
@@ -156,9 +190,36 @@ __all__ = [
     "PipelineInstanceRegistry",
     "TriggerStateStore",
     "init_orchestration_schema",
-    # Stubs
+    # Working doc (7.5b)
+    "WorkingDocStore",
+    "WorkingDocUpdate",
     "WorkingDocHandle",
+    "WorkingDocStatus",
+    "PlanItem",
+    "TaskListDiff",
+    # Templates (7.5b)
+    "TemplateRegistry",
+    "Template",
+    "RenderedTemplate",
+    "TemplatePriority",
+    "DEFAULT_TEMPLATES",
+    # Notifications (7.5b)
     "NotificationGate",
+    "GeneratedNotification",
+    "DeliveryChannel",
+    "DeliveryResult",
     "PendingNotification",
-    "demo_tick_pipeline",
+    # Decisions (7.5b, moved from kora_v2.autonomous)
+    "DecisionManager",
+    "PendingDecision",
+    "DecisionResult",
+    "OpenDecisionsTracker",
+    "OpenDecision",
+    # Overlap (7.5b, moved from kora_v2.autonomous)
+    "check_topic_overlap",
+    "OverlapResult",
+    # User Model profile bootstrap (7.5b, spec §16.3)
+    "ensure_profile_defaults",
+    "DEFAULT_PROFILE_FRONTMATTER",
+    "BootstrapResult",
 ]

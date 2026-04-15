@@ -38,18 +38,53 @@ from kora_v2.runtime.orchestration.worker_task import (
 log = structlog.get_logger(__name__)
 
 _MIGRATION_PATH = Path(__file__).parent / "migrations" / "001_orchestration.sql"
+_NOTIFICATIONS_MIGRATION_PATH = (
+    Path(__file__).parent / "migrations" / "002_notifications_templates.sql"
+)
+
+_NOTIFICATION_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("delivery_tier", "TEXT DEFAULT 'llm'"),
+    ("template_id", "TEXT"),
+    ("template_vars", "TEXT"),
+    ("reason", "TEXT"),
+)
 
 
 # ── Schema bootstrap ──────────────────────────────────────────────────────
 
 
 async def init_orchestration_schema(db_path: Path) -> None:
-    """Apply ``001_orchestration.sql`` to *db_path* (idempotent)."""
+    """Apply orchestration migrations to *db_path* (idempotent).
+
+    Runs:
+      * ``001_orchestration.sql`` — the eight Phase 7.5 tables.
+      * ``002_notifications_templates.sql`` (conditionally) — adds the
+        two-tier delivery columns to the existing ``notifications``
+        table. ``ALTER TABLE ADD COLUMN`` is not idempotent in SQLite,
+        so this function inspects ``pragma table_info`` first.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sql = _MIGRATION_PATH.read_text(encoding="utf-8")
     async with aiosqlite.connect(str(db_path)) as db:
         await db.executescript(sql)
         await db.commit()
+
+        # Only touch the notifications table if it already exists —
+        # orchestration-only test databases don't bootstrap the
+        # daemon's core schema.
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='notifications'"
+        )
+        row = await cursor.fetchone()
+        if row is not None:
+            info_cursor = await db.execute("PRAGMA table_info(notifications)")
+            existing = {r[1] for r in await info_cursor.fetchall()}
+            for col_name, col_decl in _NOTIFICATION_EXTRA_COLUMNS:
+                if col_name not in existing:
+                    await db.execute(
+                        f"ALTER TABLE notifications ADD COLUMN {col_name} {col_decl}"
+                    )
+            await db.commit()
     log.debug("orchestration_schema_initialised", path=str(db_path))
 
 

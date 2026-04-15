@@ -19,8 +19,11 @@ class TestSupervisorToolDefinitions:
     def test_tools_is_nonempty_list(self) -> None:
         assert isinstance(SUPERVISOR_TOOLS, list)
         # dispatch_worker, recall, start_autonomous (Phase 6),
-        # search_web + fetch_url (WS2)
-        assert len(SUPERVISOR_TOOLS) == 5
+        # search_web + fetch_url (WS2), plus 7 new orchestration tools
+        # added in Slice 7.5b (spec §17.9): decompose_and_dispatch,
+        # get_task_progress, cancel_task, list_tasks, pose_decision,
+        # resolve_decision, create_routine.
+        assert len(SUPERVISOR_TOOLS) == 12
 
     def test_all_tools_have_required_keys(self) -> None:
         for tool in SUPERVISOR_TOOLS:
