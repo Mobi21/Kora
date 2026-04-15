@@ -1,9 +1,22 @@
-"""Kora V2 — Autonomous budget enforcement.
+"""5-axis budget enforcer for the autonomous pipeline step function.
 
-``BudgetEnforcer`` checks five spending dimensions in priority order before
-each step and before every external LLM call.  It returns a structured
-``BudgetCheckResult`` rather than raising exceptions so callers can decide
-how to respond (warn, pause, hard-stop).
+Moved here from ``kora_v2/autonomous/budget.py`` per spec §17.7c
+(Slice 7.5c cutover + legacy deletion). The class is unchanged —
+every call site still passes an ``AutonomousSettings`` + optional
+``LLMSettings`` and reads a :class:`BudgetCheckResult` back.
+
+The five dimensions checked in priority order are:
+
+1. Provider quota window (1-hour rate limit)
+2. Total request count vs estimated session limit
+3. Wall-clock time vs ``max_session_hours``
+4. Cost estimate vs ``per_session_cost_limit``
+5. Token estimate vs context window
+
+Hard stops from any axis short-circuit lower-priority ones; soft
+warnings are collected but never block a lower-priority hard stop.
+Callers — primarily :func:`kora_v2.autonomous.pipeline_factory._autonomous_step_fn`
+— decide how to respond (warn, pause, hard-stop).
 """
 
 from __future__ import annotations
@@ -33,7 +46,7 @@ class BudgetCheckResult(BaseModel):
 
 
 class BudgetEnforcer:
-    """Stateless budget checker.  Instantiate once per autonomous session.
+    """Stateless budget checker. Instantiate once per autonomous session.
 
     Args:
         autonomous: ``AutonomousSettings`` from ``get_settings().autonomous``.
@@ -119,7 +132,11 @@ class BudgetEnforcer:
             return BudgetCheckResult(ok=True)
 
         ratio = state.request_window_1h / limit
-        return self._make_result(ratio, "quota", f"1-hour request window: {state.request_window_1h}/{limit}")
+        return self._make_result(
+            ratio,
+            "quota",
+            f"1-hour request window: {state.request_window_1h}/{limit}",
+        )
 
     def _check_request_count(self, state: AutonomousState) -> BudgetCheckResult:
         max_hours = getattr(self._auto, "max_session_hours", 0)
@@ -131,7 +148,11 @@ class BudgetEnforcer:
             return BudgetCheckResult(ok=True)
 
         ratio = state.request_count / limit
-        return self._make_result(ratio, "request", f"total requests: {state.request_count}/{limit}")
+        return self._make_result(
+            ratio,
+            "request",
+            f"total requests: {state.request_count}/{limit}",
+        )
 
     def _check_wall_time(self, state: AutonomousState) -> BudgetCheckResult:
         max_hours = getattr(self._auto, "max_session_hours", 0)
@@ -159,7 +180,9 @@ class BudgetEnforcer:
         )
 
     def _check_tokens(self, state: AutonomousState) -> BudgetCheckResult:
-        context_window = getattr(self._llm, "context_window", None) if self._llm else None
+        context_window = (
+            getattr(self._llm, "context_window", None) if self._llm else None
+        )
         if context_window is None or context_window <= 0:
             return BudgetCheckResult(ok=True)
 
@@ -170,7 +193,9 @@ class BudgetEnforcer:
             f"tokens {state.token_estimate} / {context_window}",
         )
 
-    def _make_result(self, ratio: float, dimension: str, detail: str) -> BudgetCheckResult:
+    def _make_result(
+        self, ratio: float, dimension: str, detail: str
+    ) -> BudgetCheckResult:
         """Convert a usage-ratio to a BudgetCheckResult."""
         if ratio >= self._stop_frac:
             log.warning(
@@ -201,3 +226,6 @@ class BudgetEnforcer:
                 dimension=dimension,
             )
         return BudgetCheckResult(ok=True)
+
+
+__all__ = ["BudgetEnforcer", "BudgetCheckResult"]

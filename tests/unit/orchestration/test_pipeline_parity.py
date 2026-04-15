@@ -1,11 +1,21 @@
-"""Parity tests for the dead-code autonomous pipeline declarations.
+"""Parity tests for the autonomous pipeline declarations.
 
-Spec §17.7a: the autonomous execution loop stays live through Slice
-7.5b. The pipeline declarations in ``kora_v2.autonomous.pipeline_factory``
-exist so Phase 8 has a ready target to cut over to. These tests keep
-the dead-code declarations honest by parsing the live dispatcher in
-``kora_v2/autonomous/loop.py`` and asserting every dispatched node
-name is represented in ``AUTONOMOUS_NODES``.
+Spec §17.7c: with Slice 7.5c the legacy ``kora_v2/autonomous/loop.py``
+dispatcher is gone — the ``user_autonomous_task`` pipeline declared in
+``kora_v2/autonomous/pipeline_factory.py`` is the single source of
+truth. These tests pin the new contract:
+
+* ``pipeline_factory.py``'s internal node dispatch table contains
+  exactly :data:`AUTONOMOUS_NODES`,
+* the ``build_user_autonomous_task_pipeline`` and
+  ``build_user_routine_task_pipeline`` declarations both expose the
+  same stage list, and
+* ``live_graph_node_names()`` agrees with both.
+
+The earlier walker parsed ``loop.py``; with that file deleted, the
+walker now parses ``pipeline_factory.py``'s ``_run_internal_node`` and
+``_resolve_reflect_action`` helpers. Parity becomes "the AST literals
+in the new dispatch helper match :data:`AUTONOMOUS_NODES`".
 """
 
 from __future__ import annotations
@@ -28,47 +38,47 @@ from kora_v2.runtime.orchestration.pipeline import (
 )
 from kora_v2.runtime.orchestration.triggers import TriggerKind
 
-# ── AST-based live graph node extraction ─────────────────────────────────
+# ── AST-based dispatch-helper node extraction ────────────────────────────
 
 
-_LOOP_PATH = (
+_PIPELINE_FACTORY_PATH = (
     Path(__file__).resolve().parents[3]
     / "kora_v2"
     / "autonomous"
-    / "loop.py"
+    / "pipeline_factory.py"
 )
 
 
 # Dispatch-variable names and sentinels must stay in lockstep with the
-# production helper — the test-side walker deliberately re-derives the
-# same set so a broken helper cannot silently fix the test.
+# production helper — the test-side walker re-derives the same set so a
+# broken helper cannot silently fix the test.
 _DISPATCH_VAR_NAMES: frozenset[str] = frozenset(
     {"node_name", "next_node", "next_action"}
 )
 _DISPATCH_SENTINELS: frozenset[str] = frozenset({"END", "continue"})
 
 
-def _extract_live_dispatch_nodes() -> set[str]:
-    """Walk ``loop.py`` (entire module) and collect every node name dispatched.
+def _extract_dispatch_nodes() -> set[str]:
+    """Walk ``pipeline_factory.py`` and collect every dispatched node name.
 
-    ``loop.py`` dispatches graph nodes from three methods:
+    The new step function dispatches graph nodes from two helpers:
 
-    * ``_run_node`` — the primary ``if node_name == "foo": ...`` chain.
-    * ``run()`` — short-circuits ``waiting_on_user`` via
-      ``if next_node == "waiting_on_user":`` *before* the ``_run_node`` call.
-    * ``_handle_reflect_action`` — dispatches ``decision_request`` (plus
-      ``complete`` / ``paused_for_overlap`` / ``replan``) via
-      ``if next_action == "...":`` branches.
+    * ``_run_internal_node`` — the primary ``if node_name == "foo": ...``
+      chain that maps each of the 12 nodes to its
+      :mod:`kora_v2.autonomous.graph` coroutine.
+    * ``_resolve_reflect_action`` — handles the post-``reflect`` fan-out
+      to ``complete`` / ``paused_for_overlap`` / ``decision_request`` /
+      ``replan`` via ``if next_action == "...":`` branches.
 
-    The walker therefore scans the entire module for equality
-    comparisons of the form ``<dispatch_var> == "<literal>"`` (or the
-    mirrored form) where *dispatch_var* is one of
-    :data:`_DISPATCH_VAR_NAMES`, excluding non-node sentinels like
-    ``"END"`` / ``"continue"``. We parse the file rather than importing
-    it so the test does not pay the autonomous module's import cost and
-    cannot be silently broken by runtime side effects.
+    The walker scans the entire module for equality comparisons of the
+    form ``<dispatch_var> == "<literal>"`` (or the mirrored form) where
+    *dispatch_var* is one of :data:`_DISPATCH_VAR_NAMES`, excluding
+    non-node sentinels like ``"END"`` / ``"continue"``. We parse the
+    file rather than importing it so the test does not pay the
+    autonomous module's import cost and cannot be silently broken by
+    runtime side effects.
     """
-    tree = ast.parse(_LOOP_PATH.read_text(encoding="utf-8"))
+    tree = ast.parse(_PIPELINE_FACTORY_PATH.read_text(encoding="utf-8"))
     nodes: set[str] = set()
 
     for node in ast.walk(tree):
@@ -103,40 +113,38 @@ def _extract_live_dispatch_nodes() -> set[str]:
     return nodes
 
 
-def test_live_graph_node_names_matches_autonomous_nodes_exactly() -> None:
-    """Bidirectional drift check: the set of dispatch node literals in
-    ``loop.py`` and the :data:`AUTONOMOUS_NODES` constant must be
-    identical.
+def test_dispatch_literals_match_autonomous_nodes_exactly() -> None:
+    """Bidirectional drift check between dispatch literals and the constant.
 
     * Adding a new ``if node_name == "fake_new_node":`` branch (or a
-      ``next_node`` / ``next_action`` equality) without updating the
-      constant fails this test with *source has nodes missing from
-      constant*.
-    * Removing an entry from :data:`AUTONOMOUS_NODES` while the runtime
-      still dispatches it fails with *constant has nodes missing from
-      source*.
+      ``next_action`` equality) without updating the constant fails
+      this test with *missing from constant*.
+    * Removing an entry from :data:`AUTONOMOUS_NODES` while the
+      dispatcher still references it fails with *missing from source*.
     """
-    dispatched = _extract_live_dispatch_nodes()
+    dispatched = _extract_dispatch_nodes()
     # Sanity: parsing should yield at least the core sequence
-    assert dispatched, "failed to extract any node names from loop.py"
+    assert dispatched, "failed to extract any node names from pipeline_factory.py"
     assert dispatched == set(AUTONOMOUS_NODES), (
-        "AUTONOMOUS_NODES is out of sync with loop.py dispatch literals. "
+        "AUTONOMOUS_NODES is out of sync with pipeline_factory.py dispatch "
+        "literals. "
         f"missing from constant: {sorted(dispatched - set(AUTONOMOUS_NODES))}, "
         f"missing from source: {sorted(set(AUTONOMOUS_NODES) - dispatched)}"
     )
 
 
 def test_live_graph_node_names_helper_matches_ast_extraction() -> None:
-    """``live_graph_node_names`` is the production source of truth used by
-    callers. It must return *exactly* the set of dispatch literals the
-    test-side AST walker finds — any drift means the helper is lying
-    about what the live loop runs.
+    """``live_graph_node_names()`` is the production source-of-truth helper.
+
+    It must return *exactly* the set of dispatch literals the test-side
+    AST walker finds in ``pipeline_factory.py``. Any drift means the
+    helper is lying about what the new step function actually walks.
     """
-    dispatched = _extract_live_dispatch_nodes()
+    dispatched = _extract_dispatch_nodes()
     helper = set(live_graph_node_names())
     assert helper == dispatched, (
-        f"live_graph_node_names() drifted from loop.py dispatch literals: "
-        f"helper={sorted(helper)} ast={sorted(dispatched)}"
+        f"live_graph_node_names() drifted from pipeline_factory.py dispatch "
+        f"literals: helper={sorted(helper)} ast={sorted(dispatched)}"
     )
 
 

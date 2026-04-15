@@ -76,10 +76,7 @@ async def _stub_step(
     task: WorkerTask, ctx: StepContext
 ) -> StepResult:
     """Log-and-complete stub used by all Phase 8 pipelines."""
-    from kora_v2.runtime.orchestration.worker_task import (
-        StepOutcome,
-        StepResult,
-    )
+    from kora_v2.runtime.orchestration.worker_task import StepResult
 
     log.debug(
         "core_pipeline_stub_step",
@@ -88,8 +85,8 @@ async def _stub_step(
         pipeline_instance_id=task.pipeline_instance_id,
     )
     return StepResult(
-        outcome=StepOutcome.COMPLETED,
-        summary=f"stub:{task.stage_name}",
+        outcome="complete",
+        result_summary=f"stub:{task.stage_name}",
     )
 
 
@@ -103,18 +100,17 @@ async def _session_bridge_pruning_step(
     they are no longer useful and should be cleaned up. This
     replaces the corresponding legacy BackgroundWorker job.
     """
-    from kora_v2.runtime.orchestration.worker_task import (
-        StepOutcome,
-        StepResult,
-    )
+    from kora_v2.runtime.orchestration.worker_task import StepResult
 
     log.info("session_bridge_pruning_tick", task_id=task.id)
     # The real implementation would call into the memory projection
     # layer; for Slice 7.5b we only need the pipeline to *run* so
     # triggers are honoured. Phase 5/8 will supply the body.
     return StepResult(
-        outcome=StepOutcome.COMPLETED,
-        summary="session_bridge_pruning: no-op (projection wiring in Phase 8)",
+        outcome="complete",
+        result_summary=(
+            "session_bridge_pruning: no-op (projection wiring in Phase 8)"
+        ),
     )
 
 
@@ -129,15 +125,12 @@ async def _skill_refinement_step(
     reviewer; we supply a no-op here for Slice 7.5b so the trigger
     state machine has something to record.
     """
-    from kora_v2.runtime.orchestration.worker_task import (
-        StepOutcome,
-        StepResult,
-    )
+    from kora_v2.runtime.orchestration.worker_task import StepResult
 
     log.info("skill_refinement_tick", task_id=task.id)
     return StepResult(
-        outcome=StepOutcome.COMPLETED,
-        summary="skill_refinement: no-op (reviewer wiring in Phase 8)",
+        outcome="complete",
+        result_summary="skill_refinement: no-op (reviewer wiring in Phase 8)",
     )
 
 
@@ -255,13 +248,23 @@ def build_core_pipelines() -> list[Pipeline]:
         _stub_step,
     )
 
-    # 4. user_autonomous_task
+    # 4. user_autonomous_task — real step function from pipeline_factory.
+    # Imported here (not at module top) to keep the core_pipelines import
+    # graph free of the autonomous subpackage for tests that boot a
+    # minimal engine without autonomous wiring.
+    from kora_v2.autonomous.pipeline_factory import get_autonomous_step_fn
+
     _add(
         "user_autonomous_task",
         "Plan → execute → review → replan (formerly AutonomousExecutionLoop).",
-        [user_action("user_autonomous_task", action_name="start_autonomous")],
+        # L1: the retired ``start_autonomous`` supervisor tool was
+        # replaced by ``decompose_and_dispatch`` (see §17.9). The
+        # USER_ACTION trigger here is a diagnostic placeholder — the
+        # real dispatch path goes through
+        # ``engine.start_pipeline_instance`` directly.
+        [user_action("user_autonomous_task", action_name="decompose_and_dispatch")],
         "long_background",
-        _stub_step,
+        get_autonomous_step_fn(),
         intent_duration="long",
     )
 

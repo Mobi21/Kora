@@ -97,10 +97,14 @@ class Container:
         # Auth relay (set by RuntimeKernel)
         self._auth_relay: Any | None = None
 
-        # Phase 6: Active autonomous execution loops, keyed by session_id.
-        self._autonomous_loops: dict[str, Any] = {}
-
         # Phase 7.5: Orchestration engine (lazy async init).
+        #
+        # Slice 7.5c §17.7c retired the legacy ``_autonomous_loops``
+        # dict that used to hold ``asyncio.Task`` handles for
+        # ``AutonomousExecutionLoop`` instances. Autonomous work now
+        # runs as a ``user_autonomous_task`` pipeline on the
+        # orchestration engine, and shutdown cancellation is handled
+        # by ``self._orchestration_engine.stop(graceful=True)`` below.
         self._orchestration_engine: Any | None = None
 
         log.info(
@@ -576,6 +580,7 @@ class Container:
             websocket_broadcast=websocket_broadcast,
             session_active_fn=session_active_fn,
             hyperfocus_active_fn=hyperfocus_active_fn,
+            container=self,
         )
         self._orchestration_engine = engine
         log.info(
@@ -595,34 +600,7 @@ class Container:
         enclosing connection is torn down. Then projection DB, then the
         embedding model (unloaded last because it has no durable state).
         """
-        # 0. Cancel autonomous background tasks. Each entry in
-        #    ``_autonomous_loops`` holds an ``asyncio.Task`` under the
-        #    ``task`` key (see graph/dispatch.start_autonomous).
-        #    Without this, a long-running autonomous loop outlives
-        #    uvicorn's main_loop and the process never exits.
-        if self._autonomous_loops:
-            import asyncio as _asyncio
-
-            tasks: list[_asyncio.Task] = []
-            for entry in list(self._autonomous_loops.values()):
-                task = entry.get("task") if isinstance(entry, dict) else None
-                if task is not None and not task.done():
-                    task.cancel()
-                    tasks.append(task)
-            if tasks:
-                try:
-                    # Give cancellations a moment to propagate so any
-                    # finally blocks inside the loops can run.
-                    await _asyncio.wait(tasks, timeout=2.0)
-                except Exception:
-                    pass
-                log.info(
-                    "autonomous_loops_cancelled_via_container",
-                    count=len(tasks),
-                )
-            self._autonomous_loops.clear()
-
-        # 0b. Stop the orchestration engine so the dispatcher, trigger
+        # 0. Stop the orchestration engine so the dispatcher, trigger
         #     scheduler, and notification gate get a clean shutdown
         #     before anything else tears down. A graceful stop allows
         #     in-flight tasks to complete without being cancelled.

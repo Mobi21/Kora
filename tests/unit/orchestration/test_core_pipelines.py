@@ -56,12 +56,24 @@ def test_real_step_functions_wired_for_bgworker_replacements() -> None:
     assert fns["skill_refinement"] is _skill_refinement_step
 
 
+def test_user_autonomous_task_wired_to_pipeline_factory_step_fn() -> None:
+    """Slice 7.5c: user_autonomous_task uses the real autonomous step fn
+    from :mod:`kora_v2.autonomous.pipeline_factory`, not the stub.
+    """
+    from kora_v2.autonomous.pipeline_factory import get_autonomous_step_fn
+
+    build_core_pipelines()
+    fns = core_step_fns()
+    assert fns["user_autonomous_task"] is get_autonomous_step_fn()
+
+
 def test_other_pipelines_use_stub_step() -> None:
     build_core_pipelines()
     fns = core_step_fns()
     stub_names = EXPECTED_PIPELINE_NAMES - {
         "session_bridge_pruning",
         "skill_refinement",
+        "user_autonomous_task",
     }
     for name in stub_names:
         assert fns[name] is _stub_step

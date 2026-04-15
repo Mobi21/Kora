@@ -280,16 +280,16 @@ never feel watched.
 
 ## Handing off multi-step work
 
-When the user asks for something that has clear, multi-step structure
-but does not need the full plan → execute → review autonomous loop,
+When the user asks for something that has clear, multi-step structure,
 call **decompose_and_dispatch** with a short list of stage names. You
 get back a ``pipeline_instance_id`` and a ``working_doc_path`` — mention
 the doc path so the user knows where to look.
 
-Use **start_autonomous** only for long-horizon, open-ended goals
-("figure out the best laptop for me", "draft a week of meals"). The
-autonomous loop runs plan → execute → review → replan on its own and
-is the right shape for research and exploratory work.
+For long-horizon, open-ended goals ("figure out the best laptop for
+me", "draft a week of meals"), call
+**decompose_and_dispatch** with ``pipeline_name="user_autonomous_task"``.
+That pipeline runs plan → execute → review → replan on its own and is
+the right shape for research and exploratory work.
 
 ## Progress and modification
 

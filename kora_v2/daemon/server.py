@@ -26,6 +26,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 import structlog
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
@@ -352,22 +353,85 @@ def _build_router():
 
     @router.get("/inspect/autonomous", dependencies=[Depends(verify_token)])
     async def inspect_autonomous() -> dict[str, Any]:
-        """Return active autonomous loop state for all sessions."""
-        loops = getattr(_container, "_autonomous_loops", {}) if _container else {}
+        """Return active autonomous task state from the orchestration engine.
+
+        Slice 7.5c §17.7c retired the legacy ``_autonomous_loops`` dict;
+        autonomous work is now modelled as ``user_autonomous_task``
+        pipeline instances on the orchestration engine. This endpoint
+        walks the engine's task registry and returns any running or
+        paused worker tasks whose parent pipeline matches that name,
+        preserving the legacy ``/inspect/autonomous`` response shape so
+        external callers do not break.
+        """
+        engine = getattr(_container, "_orchestration_engine", None) if _container else None
+        if engine is None:
+            return {"loops": {}, "count": 0}
+
         result: dict[str, Any] = {}
-        for sid, entry in loops.items():
-            task = entry.get("task")
-            loop = entry.get("loop")
-            state = loop.state if loop is not None else None
-            result[sid] = {
-                "goal": entry.get("goal", ""),
-                "running": task is not None and not task.done(),
-                "status": state.status if state is not None else "unknown",
-                "steps_completed": len(state.completed_step_ids) if state is not None else 0,
-                "steps_pending": len(state.pending_step_ids) if state is not None else 0,
-                "request_count": state.request_count if state is not None else 0,
-                "elapsed_seconds": state.elapsed_seconds if state is not None else 0,
+        task_registry = engine.task_registry
+        instance_registry = engine.instance_registry
+        checkpoint_store = engine.checkpoint_store
+        try:
+            tasks = await task_registry.load_all_non_terminal()
+        except (aiosqlite.OperationalError, AttributeError) as exc:
+            log.debug("inspect_autonomous_task_load_failed", error=str(exc))
+            return {"loops": {}, "count": 0}
+
+        for task in tasks:
+            if task.pipeline_instance_id is None:
+                continue
+            try:
+                instance = await instance_registry.load(task.pipeline_instance_id)
+            except aiosqlite.OperationalError as exc:
+                log.debug("inspect_autonomous_instance_load_failed", error=str(exc))
+                continue
+            if instance is None or instance.pipeline_name not in (
+                "user_autonomous_task",
+                "user_routine_task",
+            ):
+                continue
+
+            # M4: derive steps_completed / steps_pending / elapsed_seconds
+            # from the AutonomousState stashed in the scratch_state.
+            steps_completed = 0
+            steps_pending = 0
+            elapsed_seconds = 0
+            try:
+                checkpoint = await checkpoint_store.load(task.id)
+            except aiosqlite.OperationalError:
+                checkpoint = None
+            if checkpoint is not None and isinstance(
+                checkpoint.scratch_state, dict
+            ):
+                from kora_v2.autonomous.pipeline_factory import (
+                    _SCRATCH_STATE_KEY,
+                )
+                from kora_v2.autonomous.state import AutonomousState
+
+                raw_state = checkpoint.scratch_state.get(_SCRATCH_STATE_KEY)
+                if isinstance(raw_state, dict):
+                    try:
+                        auto_state = AutonomousState.model_validate(raw_state)
+                        steps_completed = len(auto_state.completed_step_ids)
+                        steps_pending = len(auto_state.pending_step_ids)
+                        elapsed_seconds = int(auto_state.elapsed_seconds)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "inspect_autonomous_state_parse_failed",
+                            error=str(exc),
+                        )
+
+            session_id = instance.parent_session_id or task.id
+            result[session_id] = {
+                "goal": instance.goal,
+                "running": task.state.value in ("running", "planning"),
+                "status": task.state.value,
+                "steps_completed": steps_completed,
+                "steps_pending": steps_pending,
+                "request_count": task.request_count,
+                "elapsed_seconds": elapsed_seconds,
             }
+
         return {"loops": result, "count": len(result)}
 
     # --- Generic inspect topic dispatcher (auth required) ---
@@ -524,23 +588,30 @@ async def _check_autonomous_overlap(
     container: Any,
     ws: WebSocket,
 ) -> None:
-    """Compute topic overlap with any running autonomous loop.
+    """Compute topic overlap with any running autonomous pipeline task.
 
-    If an active loop is found, updates its overlap score via
-    ``loop.set_overlap_score()``.  When the score is >= 0.70 an
-    informational message is sent to the client notifying it that
-    background work will pause at the next safe point.
+    Slice 7.5c §17.7c reroutes this check onto the orchestration
+    engine. We look up the single in-flight ``user_autonomous_task``
+    or ``user_routine_task`` instance owned by the current session,
+    extract its goal from ``PipelineInstance.goal``, run the unchanged
+    ``check_topic_overlap`` scoring function, and cache the score on
+    the container so the supervisor prompt can mention it.
+
+    Unlike the legacy implementation we do not push a score back into
+    a live loop — the orchestration engine's dispatcher performs the
+    actual pause at the next safe tick via the ``paused_for_overlap``
+    route inside ``_autonomous_step_fn``.
 
     Args:
         message: Incoming user message text.
-        container: DI container; may expose ``_autonomous_loops``.
+        container: DI container (may expose ``_orchestration_engine``).
         ws: Active WebSocket connection (for sending info messages).
     """
     if container is None:
         return
 
-    loops = getattr(container, "_autonomous_loops", {})
-    if not loops:
+    engine = getattr(container, "_orchestration_engine", None)
+    if engine is None:
         return
 
     # Resolve current session_id from session manager when available.
@@ -551,34 +622,36 @@ async def _check_autonomous_overlap(
         if active is not None:
             session_id = getattr(active, "session_id", None)
 
-    loop_entry = loops.get(session_id) if session_id else None
-    if loop_entry is None:
-        # No session-specific loop — fall back to scanning all entries.
-        for entry in loops.values():
-            task = entry.get("task")
-            if task is not None and not task.done():
-                loop_entry = entry
-                break
-
-    if loop_entry is None:
+    try:
+        task_registry = engine.task_registry
+        instance_registry = engine.instance_registry
+        tasks = await task_registry.load_all_non_terminal()
+    except aiosqlite.OperationalError:
         return
 
-    task = loop_entry.get("task")
-    loop = loop_entry.get("loop")
-    if task is None or task.done() or loop is None:
-        return
+    goal = ""
+    for task in tasks:
+        if task.pipeline_instance_id is None:
+            continue
+        try:
+            instance = await instance_registry.load(task.pipeline_instance_id)
+        except aiosqlite.OperationalError:
+            continue
+        if instance is None:
+            continue
+        if instance.pipeline_name not in ("user_autonomous_task", "user_routine_task"):
+            continue
+        # Prefer a session-matched instance, but fall back to the first
+        # in-flight autonomous task so we still compute a score even
+        # when session_id is unset.
+        if session_id and instance.parent_session_id != session_id and goal:
+            continue
+        goal = instance.goal or ""
+        if session_id and instance.parent_session_id == session_id:
+            break
 
-    # Extract goal and active step description from loop state.
-    state = loop.state
-    if state is None:
+    if not goal:
         return
-
-    goal: str = state.metadata.get("goal", loop_entry.get("goal", ""))
-    steps_meta: dict = state.metadata.get("steps", {})
-    current_step_id: str | None = state.current_step_id
-    active_step_desc: str = ""
-    if current_step_id and current_step_id in steps_meta:
-        active_step_desc = steps_meta[current_step_id].get("description", "")
 
     try:
         from kora_v2.autonomous.overlap import check_topic_overlap
@@ -586,17 +659,14 @@ async def _check_autonomous_overlap(
         result = await check_topic_overlap(
             user_message=message,
             autonomous_goal=goal,
-            active_step_description=active_step_desc or goal,
+            active_step_description=goal,
             container=container,
         )
         log.debug("overlap_check_result", score=result.score, action=result.action)
 
-        # Propagate score to the loop (it will pause at the next safe boundary
-        # when score >= 0.70 triggers the paused_for_overlap route).
-        loop.set_overlap_score(result.score)
-
-        # Store for injection into graph_input so the supervisor prompt
-        # can mention active autonomous work to the LLM.
+        # Cache on the container so supervisor prompts can surface the
+        # score; the actual pause happens inside the autonomous step fn
+        # on the next dispatcher tick.
         container._last_overlap_score = result.score  # type: ignore[attr-defined]
         container._last_overlap_action = result.action  # type: ignore[attr-defined]
 
@@ -731,18 +801,29 @@ async def _websocket_handler(ws: WebSocket) -> None:
                 decision_id = data.get("decision_id", "")
                 chosen = data.get("chosen", "")
                 if decision_id and chosen:
-                    loops = getattr(_container, "_autonomous_loops", {}) if _container else {}
-                    for entry in loops.values():
-                        loop = entry.get("loop")
-                        if loop is not None:
-                            try:
-                                loop.submit_decision(decision_id, chosen)
-                            except Exception as exc:
-                                log.debug(
-                                    "decision_submit_error",
-                                    decision_id=decision_id,
-                                    error=str(exc),
-                                )
+                    # Slice 7.5c §17.7c: decision submission flows
+                    # through ``record_decision`` on the supervisor
+                    # tool surface rather than a per-loop hook. The
+                    # orchestration dispatcher wakes the waiting task
+                    # via the decision manager on the next tick.
+                    try:
+                        from kora_v2.autonomous.runtime_context import (
+                            get_autonomous_context,
+                        )
+                        from kora_v2.runtime.orchestration.decisions import (
+                            DecisionManager,
+                        )
+
+                        ctx = get_autonomous_context()
+                        if ctx is not None:
+                            manager = DecisionManager()
+                            manager.submit_decision(decision_id, chosen)
+                    except Exception as exc:
+                        log.debug(
+                            "decision_submit_error",
+                            decision_id=decision_id,
+                            error=str(exc),
+                        )
                     await _safe_send_json(ws, {
                         "type": "decision_ack",
                         "decision_id": decision_id,

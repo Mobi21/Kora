@@ -6,13 +6,15 @@ implementations.
 
 Phase 4.67: dispatch_worker is real (delegates to worker harnesses).
             recall is real (hybrid memory search).
-Phase 6:    start_autonomous is real (spawns AutonomousExecutionLoop
-            as an asyncio background task).
+Phase 6:    autonomous dispatch originally lived here as the
+            ``start_autonomous`` tool. Phase 7.5c retired that tool —
+            autonomous goals now flow through
+            ``decompose_and_dispatch(pipeline_name="user_autonomous_task")``
+            and the orchestration engine. See spec §17.7c.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from typing import Any
@@ -132,33 +134,6 @@ def _active_session_id(container: Any | None) -> str | None:
 # =====================================================================
 
 SUPERVISOR_TOOLS: list[dict[str, Any]] = [
-    {
-        "name": "start_autonomous",
-        "description": (
-            "Start a multi-step autonomous background task. "
-            "Returns immediately — the task runs in the background with "
-            "periodic checkpoints. Use for complex goals that require "
-            "multiple steps (research, code projects, analysis). "
-            "Do NOT use for simple single-turn requests."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "goal": {
-                    "type": "string",
-                    "description": (
-                        "Clear natural-language description of what to accomplish. "
-                        "Be specific about deliverables and constraints."
-                    ),
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Additional context for the task.",
-                },
-            },
-            "required": ["goal"],
-        },
-    },
     {
         "name": "dispatch_worker",
         "description": (
@@ -500,7 +475,7 @@ SUPERVISOR_TOOLS: list[dict[str, Any]] = [
 
 
 # Tools that require initialized workers to be useful.
-_WORKER_DEPENDENT_TOOLS = {"dispatch_worker", "start_autonomous"}
+_WORKER_DEPENDENT_TOOLS = {"dispatch_worker"}
 
 
 def get_available_tools(
@@ -620,7 +595,9 @@ async def execute_tool(
 
     Phase 3: dispatch_worker delegates to real worker harnesses.
              recall() is real (Phase 2).
-    Phase 6: start_autonomous() spawns AutonomousExecutionLoop.
+    Phase 7.5c: start_autonomous was retired — autonomous goals now
+                flow through decompose_and_dispatch + the orchestration
+                engine's ``user_autonomous_task`` pipeline. See spec §17.7c.
 
     Args:
         tool_name: Name of the tool to execute.
@@ -659,9 +636,6 @@ async def execute_tool(
             "error_category": "permission",
             "message": f"Permission denied for tool: {tool_name}",
         })
-
-    if tool_name == "start_autonomous":
-        return await _execute_start_autonomous(tool_args, container)
 
     if tool_name == "dispatch_worker":
         return await _execute_dispatch_worker(tool_args, container)
@@ -844,135 +818,6 @@ async def _execute_dispatch_worker(
             "worker": worker_name,
             "error": str(exc),
         })
-
-
-# =====================================================================
-# Autonomous Task Dispatch (Phase 6)
-# =====================================================================
-
-
-async def _execute_start_autonomous(
-    tool_args: dict[str, Any],
-    container: Any,
-) -> str:
-    """Start a multi-step autonomous background task.
-
-    Creates an AutonomousExecutionLoop, spawns it as an asyncio Task,
-    and stores it on the container so the server can track it.
-
-    Returns immediately with a confirmation message.
-
-    Args:
-        tool_args: Must contain ``goal``, optionally ``context``.
-        container: DI container; must expose ``settings.data_dir``.
-
-    Returns:
-        JSON-encoded confirmation with session tracking info.
-    """
-    from pathlib import Path
-
-    from kora_v2.autonomous.loop import AutonomousExecutionLoop
-
-    goal = tool_args.get("goal", "").strip()
-    context = tool_args.get("context", "")
-    if not goal:
-        return json.dumps({"status": "error", "error": "goal is required"})
-
-    # Determine session ID from the active session manager
-    session_id = _active_session_id(container) or f"auto_{time.monotonic_ns()}"
-
-    # Determine DB path
-    settings = getattr(container, "settings", None)
-    data_dir = getattr(settings, "data_dir", None) or Path("data")
-    db_path = Path(data_dir) / "operational.db"
-
-    # Check if autonomous is enabled
-    auto_settings = getattr(settings, "autonomous", None)
-    if auto_settings is not None and not getattr(auto_settings, "enabled", True):
-        return json.dumps({
-            "status": "error",
-            "error": "Autonomous execution is disabled in settings.",
-        })
-
-    # Inject context into goal
-    full_goal = goal
-    if context:
-        full_goal = f"{goal}\n\nAdditional context: {context}"
-
-    # Create loop
-    loop = AutonomousExecutionLoop(
-        goal=full_goal,
-        session_id=session_id,
-        container=container,
-        db_path=db_path,
-        checkpoint_interval_minutes=getattr(
-            auto_settings, "checkpoint_interval_minutes", 30
-        ),
-        auto_continue_seconds=getattr(auto_settings, "auto_continue_seconds", 30),
-    )
-
-    # Track active loops on container
-    if not hasattr(container, "_autonomous_loops"):
-        container._autonomous_loops = {}
-
-    # Guard against leaking the previous task when called twice in the same session.
-    existing = container._autonomous_loops.get(session_id)
-    if existing:
-        existing_task = existing.get("task")
-        existing_loop = existing.get("loop")
-        if existing_task and not existing_task.done():
-            # Actually running — tell user
-            return json.dumps({
-                "status": "already_running",
-                "message": (
-                    "An autonomous task is already running for this session. "
-                    "It will checkpoint at the next safe boundary."
-                ),
-                "goal": existing.get("goal", ""),
-            })
-        # Completed/failed/cancelled — clean up any 'planned' orphan plans in the DB
-        if existing_loop and existing_loop.state:
-            plan_id = existing_loop.state.plan_id
-            if plan_id:
-                try:
-                    import aiosqlite as _aiosqlite
-
-                    async with _aiosqlite.connect(str(db_path)) as _db:
-                        await _db.execute(
-                            "UPDATE autonomous_plans SET status='superseded' "
-                            "WHERE id=? AND status='planned'",
-                            (plan_id,),
-                        )
-                        await _db.commit()
-                except Exception:
-                    pass
-        # Allow new run — fall through
-
-    # Spawn background task
-    task = asyncio.create_task(loop.run(), name=f"autonomous_{session_id}")
-    container._autonomous_loops[session_id] = {
-        "loop": loop,
-        "task": task,
-        "goal": goal,
-        "started_at": time.monotonic(),
-    }
-
-    log.info(
-        "start_autonomous_dispatched",
-        session_id=session_id,
-        goal=goal[:80],
-    )
-
-    return json.dumps({
-        "status": "started",
-        "session_id": session_id,
-        "goal": goal,
-        "message": (
-            "I'll work on this in the background. "
-            "I'll check in at each checkpoint and let you know how it's going. "
-            "You can keep chatting while I work."
-        ),
-    })
 
 
 # =====================================================================

@@ -18,12 +18,12 @@ class TestSupervisorToolDefinitions:
 
     def test_tools_is_nonempty_list(self) -> None:
         assert isinstance(SUPERVISOR_TOOLS, list)
-        # dispatch_worker, recall, start_autonomous (Phase 6),
-        # search_web + fetch_url (WS2), plus 7 new orchestration tools
-        # added in Slice 7.5b (spec §17.9): decompose_and_dispatch,
-        # get_task_progress, cancel_task, list_tasks, pose_decision,
-        # resolve_decision, create_routine.
-        assert len(SUPERVISOR_TOOLS) == 12
+        # dispatch_worker, recall, search_web + fetch_url (WS2), plus
+        # 7 orchestration tools added in Slice 7.5b (spec §17.9):
+        # decompose_and_dispatch, get_running_tasks, get_task_progress,
+        # get_working_doc, cancel_task, modify_task, record_decision.
+        # Slice 7.5c §17.7c removed the legacy ``start_autonomous`` tool.
+        assert len(SUPERVISOR_TOOLS) == 11
 
     def test_all_tools_have_required_keys(self) -> None:
         for tool in SUPERVISOR_TOOLS:
@@ -58,17 +58,15 @@ class TestSupervisorToolDefinitions:
         assert "max_results" in props
         assert tool["input_schema"]["required"] == ["query"]
 
-    def test_start_autonomous_in_tools(self) -> None:
-        """start_autonomous must appear in SUPERVISOR_TOOLS (added back in Phase 6)."""
-        names = {t["name"] for t in SUPERVISOR_TOOLS}
-        assert "start_autonomous" in names
+    def test_start_autonomous_removed(self) -> None:
+        """Slice 7.5c §17.7c: the legacy ``start_autonomous`` tool is gone.
 
-    def test_start_autonomous_tool_shape(self) -> None:
-        """start_autonomous tool has correct schema."""
-        tool = next(t for t in SUPERVISOR_TOOLS if t["name"] == "start_autonomous")
-        props = tool["input_schema"]["properties"]
-        assert "goal" in props
-        assert tool["input_schema"]["required"] == ["goal"]
+        Autonomous goals now flow through ``decompose_and_dispatch`` with
+        ``pipeline_name="user_autonomous_task"`` so the supervisor never
+        talks to the legacy runtime directly.
+        """
+        names = {t["name"] for t in SUPERVISOR_TOOLS}
+        assert "start_autonomous" not in names
 
 
 class TestExecuteTool:

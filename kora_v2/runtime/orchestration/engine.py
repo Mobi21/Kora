@@ -188,6 +188,43 @@ class OrchestrationEngine:
                 memory_root=str(self._memory_root),
                 exc_info=True,
             )
+        # Slice 7.5c — install the process-level autonomous runtime
+        # context so the ``user_autonomous_task`` step function can
+        # reach the DI container and operational DB. The dispatcher
+        # deliberately does not plumb a container into StepContext so
+        # this module-level registry is the single narrow leak.
+        try:
+            from kora_v2.autonomous.runtime_context import (
+                set_autonomous_context,
+            )
+
+            set_autonomous_context(
+                container=self._container, db_path=self._db_path
+            )
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "autonomous_runtime_context_install_failed", exc_info=True
+            )
+        # Slice 7.5c §17.7b — idempotent migration of in-flight
+        # legacy autonomous_checkpoints rows into the new
+        # worker_tasks + pipeline_instances tables. Guarded by a
+        # marker row in work_ledger so reruns are no-ops.
+        try:
+            from kora_v2.runtime.orchestration.autonomous_migration import (
+                migrate_legacy_autonomous_checkpoints,
+            )
+
+            await migrate_legacy_autonomous_checkpoints(
+                db_path=self._db_path,
+                ledger=self.ledger,
+                task_registry=self.task_registry,
+                instance_registry=self.instance_registry,
+                checkpoint_store=self.checkpoint_store,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "autonomous_migration_failed", exc_info=True
+            )
         await self.dispatcher.start()
         self._started = True
         log.debug("orchestration_engine_started")

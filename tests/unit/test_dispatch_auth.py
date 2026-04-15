@@ -95,10 +95,11 @@ class TestExecuteToolAuthParam:
     async def test_backward_compatible_without_auth_relay(self):
         """execute_tool still works without auth_relay (backward compat).
 
-        start_autonomous without a container returns an error (no DB access),
-        but the call completes without raising — backward compat is preserved.
+        ``recall`` without a container returns a structured error
+        (no memory wiring) but the call completes without raising —
+        backward compat is preserved.
         """
-        result = await execute_tool("start_autonomous", {"plan_id": "x"})
+        result = await execute_tool("recall", {"query": "x"})
         data = json.loads(result)
-        # Returns error JSON when no container is available (no DB), not a crash
-        assert "status" in data or "error" in data
+        # Returns structured result/error JSON even with no container
+        assert isinstance(data, dict)

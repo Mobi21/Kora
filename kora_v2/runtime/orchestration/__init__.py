@@ -13,6 +13,10 @@ tracker, and the core pipeline catalogue.
 
 from __future__ import annotations
 
+from kora_v2.runtime.orchestration.autonomous_budget import (
+    BudgetCheckResult,
+    BudgetEnforcer,
+)
 from kora_v2.runtime.orchestration.checkpointing import CheckpointStore
 from kora_v2.runtime.orchestration.decisions import (
     DecisionManager,
@@ -184,6 +188,9 @@ __all__ = [
     "LedgerEvent",
     # Checkpoint
     "CheckpointStore",
+    # Autonomous budget (7.5c, moved from kora_v2.autonomous.budget)
+    "BudgetEnforcer",
+    "BudgetCheckResult",
     # Registry
     "PipelineRegistry",
     "WorkerTaskRegistry",
