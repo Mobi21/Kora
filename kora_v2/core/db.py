@@ -423,6 +423,32 @@ CREATE INDEX IF NOT EXISTS idx_energy_log_logged
 
 -- Autonomous plan budget columns: request_count, token_estimate, cost_estimate
 -- Added as ALTER TABLE below since autonomous_plans was created without them.
+
+-- Phase 8a: Signal extraction queue ----------------------------------------
+CREATE TABLE IF NOT EXISTS signal_queue (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    message_text TEXT NOT NULL,
+    assistant_response TEXT,
+    signal_types TEXT NOT NULL,      -- JSON array of SignalType values
+    priority INTEGER NOT NULL,       -- 1=highest
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    processed_at TEXT,
+    error_message TEXT
+);
+
+-- Phase 8a: Session transcripts for Memory Steward consumption -------------
+CREATE TABLE IF NOT EXISTS session_transcripts (
+    session_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    message_count INTEGER NOT NULL,
+    messages TEXT NOT NULL,           -- JSON array of {role, content, timestamp}
+    tool_calls TEXT,                  -- JSON array of tool invocations
+    emotional_trajectory TEXT,        -- from session bridge
+    processed_at TEXT                 -- NULL until extraction stage consumes it
+);
 """
 
 _TURN_TRACE_MIGRATIONS: tuple[tuple[str, str], ...] = (

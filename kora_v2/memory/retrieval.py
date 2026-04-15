@@ -138,6 +138,7 @@ async def vector_search(
         f"FROM {vec_table} v "
         f"INNER JOIN {table} m ON m.rowid = v.rowid "
         f"WHERE v.embedding MATCH ? AND k = ? "
+        f"AND m.status = 'active' "
         f"ORDER BY v.distance"
     )
 
@@ -203,6 +204,7 @@ async def fts5_search(
         f"FROM {fts_table} f "
         f"INNER JOIN {table} m ON m.rowid = f.rowid "
         f"WHERE {fts_table} MATCH ? "
+        f"AND m.status = 'active' "
         f"ORDER BY score "
         f"LIMIT ?"
     )
