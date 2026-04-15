@@ -172,6 +172,7 @@ class Container:
             projection_db=self.projection_db,
             embedding_model=self.embedding_model,
             llm=None,  # LLM for dedup wired when needed
+            event_emitter=self.event_emitter,
         )
         log.info("write_pipeline_initialized")
 
@@ -357,7 +358,10 @@ class Container:
         from kora_v2.quality.tier1 import QualityCollector
 
         self.fast_emotion = FastEmotionAssessor()
-        self.llm_emotion = LLMEmotionAssessor(self.llm)
+        self.llm_emotion = LLMEmotionAssessor(
+            self.llm,
+            event_emitter=self.event_emitter,
+        )
         self.quality_collector = QualityCollector(
             db_path=self.settings.data_dir / "operational.db"
         )

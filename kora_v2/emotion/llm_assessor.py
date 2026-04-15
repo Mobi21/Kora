@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 from collections import OrderedDict
+from typing import Any
 
 import structlog
 from pydantic import BaseModel, Field, ValidationError
@@ -109,6 +110,7 @@ class LLMEmotionAssessor:
         *,
         timeout: float | None = None,
         cache_capacity: int | None = None,
+        event_emitter: Any = None,
     ) -> None:
         """Initialise with an LLM provider.
 
@@ -119,6 +121,11 @@ class LLMEmotionAssessor:
                      falling back.  Defaults to ``DEFAULT_TIMEOUT`` (30 s).
             cache_capacity: Max number of cached message-window → PAD
                      entries. Defaults to ``CACHE_CAPACITY`` (32).
+            event_emitter: Optional :class:`kora_v2.core.events.EventEmitter`.
+                     When supplied, :meth:`assess` emits
+                     ``EMOTION_STATE_ASSESSED`` on success and
+                     ``EMOTION_SHIFT_DETECTED`` when any PAD axis moves
+                     by more than 0.4 compared to ``current_state``.
         """
         self.llm = llm
         self.timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
@@ -126,6 +133,7 @@ class LLMEmotionAssessor:
             cache_capacity if cache_capacity is not None else self.CACHE_CAPACITY
         )
         self._cache: OrderedDict[str, EmotionalState] = OrderedDict()
+        self._emitter = event_emitter
 
     @staticmethod
     def _window_key(recent_messages: list[str]) -> str:
@@ -215,7 +223,45 @@ class LLMEmotionAssessor:
             dominance=round(pad.dominance, 3),
             mood_label=pad.mood_label,
         )
+        await self._emit_events(result, current_state)
         return result
+
+    async def _emit_events(
+        self,
+        new_state: EmotionalState,
+        previous: EmotionalState | None,
+    ) -> None:
+        if self._emitter is None:
+            return
+        try:
+            from kora_v2.core.events import EventType
+
+            await self._emitter.emit(
+                EventType.EMOTION_STATE_ASSESSED,
+                valence=new_state.valence,
+                arousal=new_state.arousal,
+                dominance=new_state.dominance,
+                mood_label=new_state.mood_label,
+                confidence=new_state.confidence,
+                source="llm",
+            )
+            if previous is None:
+                return
+            delta_v = abs(new_state.valence - previous.valence)
+            delta_a = abs(new_state.arousal - previous.arousal)
+            delta_d = abs(new_state.dominance - previous.dominance)
+            if max(delta_v, delta_a, delta_d) >= 0.4:
+                await self._emitter.emit(
+                    EventType.EMOTION_SHIFT_DETECTED,
+                    delta_valence=delta_v,
+                    delta_arousal=delta_a,
+                    delta_dominance=delta_d,
+                    from_mood=previous.mood_label,
+                    to_mood=new_state.mood_label,
+                    source="llm",
+                )
+        except Exception:
+            logger.exception("llm_emotion_emit_failed")
 
     async def _call_llm(
         self, *, user_message: str, repair_hint: str | None

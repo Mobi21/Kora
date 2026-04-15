@@ -966,6 +966,17 @@ def build_supervisor_graph(container: Any) -> Any:
                 # FastEmotionAssessor is synchronous
                 fast_result = fast_emotion.assess(latest_user, recent_texts, current_emotional)
                 base["emotional_state"] = fast_result.model_dump()
+                # Async event emission (EMOTION_STATE_ASSESSED +
+                # EMOTION_SHIFT_DETECTED) is decoupled from the sync
+                # assess() call so callers on the sync path stay sync.
+                try:
+                    await fast_emotion.emit_assessment(
+                        getattr(container, "event_emitter", None),
+                        fast_result,
+                        current_emotional,
+                    )
+                except Exception:
+                    log.debug("fast_emotion_emit_skipped")
 
                 # Check whether LLM-tier emotion assessment should fire
                 if llm_emotion_assessor is not None:

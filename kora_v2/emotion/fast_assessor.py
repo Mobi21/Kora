@@ -12,12 +12,22 @@ Computes Pleasure-Arousal-Dominance values from text signals:
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 import structlog
 
 from kora_v2.core.models import EmotionalState
 
+if TYPE_CHECKING:
+    from kora_v2.core.events import EventEmitter
+
 logger = structlog.get_logger()
+
+# PAD axis delta threshold that qualifies a shift worth emitting as
+# EMOTION_SHIFT_DETECTED. Matches the 0.4 threshold used by the LLM
+# re-assessment trigger so fast-path shifts and LLM re-assessments stay
+# consistent.
+EMOTION_SHIFT_DELTA = 0.4
 
 # ── Sentiment Lexicon ─────────────────────────────────────────────────────────
 
@@ -185,7 +195,47 @@ class FastEmotionAssessor:
     """Synchronous, rule-based PAD emotion assessor.
 
     All computation is pure Python with no I/O. Target: <1ms per call.
+    Event emission is done via :meth:`emit_assessment`, which the caller
+    invokes separately (async) after using :meth:`assess` (sync) so that
+    synchronous call sites don't need to become async.
     """
+
+    async def emit_assessment(
+        self,
+        emitter: EventEmitter | None,
+        current: EmotionalState,
+        previous: EmotionalState | None,
+    ) -> None:
+        """Emit EMOTION_STATE_ASSESSED and optionally EMOTION_SHIFT_DETECTED."""
+        if emitter is None:
+            return
+        from kora_v2.core.events import EventType
+
+        await emitter.emit(
+            EventType.EMOTION_STATE_ASSESSED,
+            valence=current.valence,
+            arousal=current.arousal,
+            dominance=current.dominance,
+            mood_label=current.mood_label,
+            confidence=current.confidence,
+            source=current.source,
+        )
+
+        if previous is None:
+            return
+        delta_v = abs(current.valence - previous.valence)
+        delta_a = abs(current.arousal - previous.arousal)
+        delta_d = abs(current.dominance - previous.dominance)
+        if max(delta_v, delta_a, delta_d) >= EMOTION_SHIFT_DELTA:
+            await emitter.emit(
+                EventType.EMOTION_SHIFT_DETECTED,
+                delta_valence=delta_v,
+                delta_arousal=delta_a,
+                delta_dominance=delta_d,
+                from_mood=previous.mood_label,
+                to_mood=current.mood_label,
+                source=current.source,
+            )
 
     def assess(
         self,
