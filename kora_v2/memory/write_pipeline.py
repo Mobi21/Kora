@@ -19,6 +19,7 @@ from typing import Any
 import structlog
 from pydantic import BaseModel
 
+from kora_v2.core.events import EventEmitter, EventType
 from kora_v2.memory.dedup import DedupAction, dedup_check
 from kora_v2.memory.embeddings import LocalEmbeddingModel
 from kora_v2.memory.projection import ProjectionDB
@@ -121,11 +122,13 @@ class WritePipeline:
         projection_db: ProjectionDB,
         embedding_model: LocalEmbeddingModel,
         llm: Any = None,
+        event_emitter: EventEmitter | None = None,
     ) -> None:
         self._store = store
         self._db = projection_db
         self._embed = embedding_model
         self._llm = llm
+        self._emitter = event_emitter
 
     async def store(
         self,
@@ -235,6 +238,17 @@ class WritePipeline:
             memory_type=memory_type,
             entities=entity_names,
         )
+
+        if self._emitter is not None:
+            await self._emitter.emit(
+                EventType.MEMORY_STORED,
+                note_id=note_meta.id,
+                memory_type=memory_type,
+                layer="long_term",
+                importance=importance,
+                entities=entity_names,
+                source_path=note_meta.source_path,
+            )
 
         return WriteResult(
             note_id=note_meta.id,
@@ -361,6 +375,18 @@ class WritePipeline:
             domain=domain,
             entities=entity_names,
         )
+
+        if self._emitter is not None:
+            await self._emitter.emit(
+                EventType.MEMORY_STORED,
+                note_id=note_meta.id,
+                memory_type="user_model",
+                layer="user_model",
+                domain=domain,
+                importance=importance,
+                entities=entity_names,
+                source_path=note_meta.source_path,
+            )
 
         return WriteResult(
             note_id=note_meta.id,

@@ -191,7 +191,7 @@ The `log_medication` description contains an aggressive instruction: "ALWAYS cal
 | `create_reminder(title, description, remind_at, recurring)` | `ASK_FIRST` | `reminders` | INSERT; `remind_at` is an ISO timestamp string or empty |
 | `query_reminders(status, limit)` | `ALWAYS_ALLOWED` | `reminders` | SELECT WHERE status=? ORDER BY remind_at ASC |
 
-Reminders are currently stored-only: there is no background delivery daemon polling `reminders.remind_at`. The `upcoming_nudges` in `DayContext` uses `calendar_entries` (the richer timeline), not this table. See "Limitations" below.
+Reminders are currently stored-only: there is no background delivery daemon polling `reminders.remind_at`. The `upcoming_nudges` in `DayContext` uses `calendar_entries` (the richer timeline), not this table. Phase 8 is expected to wire `reminders` into a `time_of_day` or `condition` trigger on an `OrchestrationEngine` pipeline so the dispatcher rather than a dedicated poller owns delivery. See "Limitations" below.
 
 ### Finance / expense tracking
 
@@ -281,6 +281,38 @@ CREATE TABLE IF NOT EXISTS energy_log (
     logged_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```
+
+---
+
+## Part 2.5: Open decisions (Phase 7.5)
+
+Before Phase 7.5 the autonomous graph had its own ad-hoc `DecisionManager` that only tracked decisions a `WorkerTask` was blocked on. There was no general surface for "the user and Kora are in the middle of deciding something" — life-domain decisions like "where do I reroute my dentist" lived only in conversation transcripts.
+
+Phase 7.5 replaces that model with a single `OpenDecisionsTracker` at `kora_v2/runtime/orchestration/decisions.py`. The table is owned by the orchestration layer but the semantics are life-module semantics: an open decision is a pending choice with a `prompt`, an optional `task_id` (set when a `WorkerTask` is the one waiting), a `deadline`, and a `resolution`. Decisions raised by autonomous work trigger `OPEN_DECISION_POSED` events and can pause the owning task into `PAUSED_FOR_DECISION`; decisions raised by the conversation flow are recorded without blocking anything and surface later via recall.
+
+A legacy shim at `kora_v2/autonomous/decisions.py` re-exports the new module so any code or test that still imports the old name continues to work without edits.
+
+### `record_decision` supervisor tool
+
+The supervisor exposes a new tool at `kora_v2/graph/dispatch.py` — `record_decision(prompt, options, context, task_id=None, deadline=None)`. Auth: `ALWAYS_ALLOWED` (read-mostly — it only inserts into `open_decisions`). The tool is how Kora captures in-conversation choices without having to re-derive them later:
+
+| Argument | Meaning |
+|---|---|
+| `prompt` | One-line framing of the choice ("Should I reroute the dentist?") |
+| `options` | List of strings; may be empty if the choice is open-ended |
+| `context` | Free-form string preserved with the decision so recall has something to show |
+| `task_id` | Optional — link to an in-flight `WorkerTask` if the decision is blocking it |
+| `deadline` | Optional ISO timestamp after which the decision should be surfaced as stale |
+
+The tool appends a row to the `open_decisions` table (defined in `runtime/orchestration/migrations/001_orchestration.sql` — see [`../01-runtime-core/core.md`](../01-runtime-core/core.md) § Orchestration tables). Resolution is a separate action: calling `get_task_progress` or `get_working_doc` on a task whose decision has been resolved reads the resolved row, and the dispatcher auto-transitions the owning task out of `PAUSED_FOR_DECISION`.
+
+### How this changes the life domain
+
+- **Routing through pipelines.** Decisions raised by background pipelines (e.g., a proactive scan that finds a scheduling conflict) go through the same tracker as conversation-raised decisions — no parallel path.
+- **Event stream.** `OPEN_DECISION_POSED` fires on insert, `TASK_LINGERING` fires when a decision passes its `deadline` without resolution; both are consumable by the signal scanner for surfacing.
+- **Recall.** Because every decision is a real row rather than a transient message attribute, the recall path can return open decisions as first-class results.
+
+See [`../01-runtime-core/orchestration.md`](../01-runtime-core/orchestration.md) § OpenDecisionsTracker for the full method surface and the FSM interaction with `WorkerTask.PAUSED_FOR_DECISION`.
 
 ---
 
@@ -441,6 +473,8 @@ Note: All insight strings are written to avoid blame framing ("no judgment" is e
 - **`core/di.py`**: `context_engine` property lazy-builds `ContextEngine(db_path, adhd_module, user_tz_name=settings.user_tz)`. `routine_manager` initialized in `initialize_phase4()`.
 - **`core/db.py`**: `init_operational_db()` creates all life-domain tables in `data/operational.db`.
 - **`adhd/module.py`**: `ADHDModule.energy_signals()` is the signal source for `_estimate_energy`.
+- **`runtime/orchestration/decisions.py`**: `OpenDecisionsTracker` replaces the old autonomous-only decision path; `record_decision` supervisor tool writes to it, autonomous `WorkerTask`s transition to `PAUSED_FOR_DECISION` via it. See [`../01-runtime-core/orchestration.md`](../01-runtime-core/orchestration.md).
+- **`runtime/orchestration/notifications.py`**: `NotificationGate` is the delivery chokepoint for every proactive surfacing produced by this module; see [`adhd.md`](adhd.md) § NotificationGate.
 
 ## Known limitations and stubs
 

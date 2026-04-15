@@ -1,4 +1,11 @@
-"""Tests for kora_v2.autonomous.budget — Phase 6 budget enforcement."""
+"""Tests for BudgetEnforcer — Phase 6 budget enforcement.
+
+Slice 7.5c relocated :class:`BudgetEnforcer` from
+``kora_v2.autonomous.budget`` to
+:mod:`kora_v2.runtime.orchestration.autonomous_budget` (spec §17.7c).
+The class itself is unchanged, so these tests still assert the same
+behaviour — only the import path moved.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +13,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from kora_v2.autonomous.budget import BudgetEnforcer
 from kora_v2.autonomous.state import AutonomousState
 from kora_v2.core.settings import AutonomousSettings, LLMSettings
+from kora_v2.runtime.orchestration.autonomous_budget import BudgetEnforcer
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 

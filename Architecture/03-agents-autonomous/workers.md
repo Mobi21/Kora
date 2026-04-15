@@ -4,6 +4,17 @@ The three worker harnesses — Planner, Executor, and Reviewer — are the struc
 
 All three workers inherit from `AgentHarness` (`kora_v2/agents/harness.py`), which provides the `execute(input_data)` public entry point, middleware hooks, and quality gate wiring. The workers hold a reference to the DI container for LLM access.
 
+### Dispatch contexts (Phase 7.5)
+
+Workers are stateless per call and are dispatched from two different contexts, both of which are now budget-accounted through the Phase 7.5 orchestration layer:
+
+| Context | Caller | `WorkerTask` preset | Budget class |
+|---|---|---|---|
+| Conversation turn | Supervisor graph via `container.resolve_worker(name)` | `IN_TURN` (300s hard cap) | `CONVERSATION` (always-reserved 300 slots) |
+| Autonomous plan | `_autonomous_step_fn()` in `autonomous/pipeline_factory.py`, called by the `OrchestrationEngine` dispatcher for one `LONG_BACKGROUND` `WorkerTask` per plan | `LONG_BACKGROUND` (unbounded wall, pauses on conversation, pauses on topic overlap) | `BACKGROUND` (counts against the 4500-slot 5h window) |
+
+The worker code itself is identical in both paths. What changes is the envelope: the supervisor-tool dispatch wraps the call in an `IN_TURN` preset for the current turn, while the autonomous path wraps every execute/review tick inside a long-running `WorkerTask` that the dispatcher can pause, checkpoint, and resume. See [`../01-runtime-core/orchestration.md`](../01-runtime-core/orchestration.md) for the preset definitions and [`autonomous.md`](autonomous.md) for the autonomous step function that ticks workers inside the pipeline wrapper.
+
 ---
 
 ## Files in this module
@@ -216,8 +227,8 @@ After parsing, three fixups are applied:
 ## Integration points
 
 - Workers are resolved via `container.resolve_worker(name)` — the DI container owns instantiation.
-- The supervisor graph dispatches to workers during conversation turns.
-- The autonomous execution graph dispatches to workers from `graph.py`'s `_dispatch_to_executor()`, `_dispatch_to_reviewer()`, and the `plan()` node (`container.resolve_worker("planner")`).
+- The supervisor graph dispatches to workers during conversation turns inside an `IN_TURN` `WorkerTask` envelope.
+- The 12-node autonomous state machine in `autonomous/graph.py` still calls `_dispatch_to_executor()`, `_dispatch_to_reviewer()`, and `container.resolve_worker("planner")` inside the `plan()` node, but those nodes are now ticked one at a time by the dispatcher through `_autonomous_step_fn()` in `autonomous/pipeline_factory.py` — the loop lives in the `OrchestrationEngine`, not in `autonomous/` anymore.
 - `PlannerWorkerHarness` calls `get_schema_tool()` from `kora_v2/tools/registry.py` to build the structured-output tool definition.
 - `ExecutorWorkerHarness` imports `ToolRegistry` from `kora_v2/tools/registry.py` and filesystem tools from `kora_v2/tools/filesystem.py`.
 - `ReviewerWorkerHarness` calls `check_output()` from `kora_v2/core/rsd_filter.py` for the ADHD safety pass.

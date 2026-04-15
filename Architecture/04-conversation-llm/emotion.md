@@ -263,6 +263,25 @@ LLM-assessed results receive `confidence=0.85` and `source="llm"`.
 
 ---
 
+## Events
+
+Both tiers publish events into the `EventEmitter` (`kora_v2/core/events.py`)
+so that downstream subsystems — the orchestration engine, the life module,
+and the notification gate — can react to affective changes without polling
+the session state:
+
+| Event | Payload | Fired by |
+|---|---|---|
+| `EMOTION_STATE_ASSESSED` | `{state: EmotionalState, source: "fast" \| "llm", turn_id}` | After every fast or LLM assessment completes and the result is written to `SessionState.emotional_state`. The `ContextEngine` listens for this to stamp the current PAD vector into the ambient `DayContext`; the `NotificationGate` listens so that hyperfocus detection can react to an arousal jump within the same turn. |
+| `EMOTION_SHIFT_DETECTED` | `{previous: EmotionalState, current: EmotionalState, delta: dict[str, float]}` | Fired only when any PAD axis changes by more than 0.4 between consecutive assessments. The life module uses this to trigger a proactive check-in pipeline via the orchestration engine's `EVENT` trigger kind; the signal scanner uses it to elevate the shift into a `Signal` candidate. |
+
+Subscribing to these events is how the rest of the system stays in sync with
+the two-tier assessor without importing emotion-module internals. See
+[`../01-runtime-core/core.md`](../01-runtime-core/core.md) for the full
+`EventType` enum.
+
+---
+
 ## Integration points
 
 - **Session manager** (`kora_v2/daemon/sessions.py`): calls `FastEmotionAssessor.assess()`
@@ -270,6 +289,12 @@ LLM-assessed results receive `confidence=0.85` and `source="llm"`.
 - **System prompt construction** (graph / supervisor): reads `emotional_state`
   from session context to adjust response tone.
 - **Life engine** (`kora_v2/life/`): reads `emotional_state.mood_label` and
-  `valence` for proactive notification decisions.
+  `valence` for proactive notification decisions; subscribes to
+  `EMOTION_SHIFT_DETECTED` via the event emitter.
+- **Notification gate** (`kora_v2/runtime/orchestration/notification_gate.py`):
+  subscribes to `EMOTION_STATE_ASSESSED` so that hyperfocus detection — which
+  relies on sustained high arousal — reacts inside the same turn as the
+  assessment that triggered it. See
+  [`../01-runtime-core/orchestration.md`](../01-runtime-core/orchestration.md).
 - **DI container** (`kora_v2/core/di.py`): instantiates both assessors; injects
   the LLM provider into `LLMEmotionAssessor`.

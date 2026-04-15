@@ -11,7 +11,9 @@ Kora is a local-first, ADHD-aware AI assistant. The life engine and ADHD subsyst
 | Energy level shown as "medium/normal" (with honest "guess" tag) | `ContextEngine._estimate_energy` blending ADHD signals |
 | Step-by-step morning routine with "You started. That's the hardest part." | `RoutineManager.get_progress` + `RoutineSessionState` tracking |
 | Tasks scheduled to avoid the afternoon crash window | `update_plan` warning when rescheduling into `ADHDProfile.crash_periods` |
-| No "you forgot" in any Kora response | `ADHDModule.output_rules()` + `RSDFilter` in `kora_v2/core/rsd_filter.py` |
+| No "you forgot" in any Kora response | `ADHDModule.output_rules()` + `RSDFilter` in `kora_v2/core/rsd_filter.py`; every notification also passes through the `NotificationGate` RSD hook |
+| Notifications respect hyperfocus and DND | `NotificationGate` in `runtime/orchestration/notifications.py` — see [`adhd.md`](adhd.md) § NotificationGate |
+| Open decisions persist across turns instead of only living in transcript | `OpenDecisionsTracker` in `runtime/orchestration/decisions.py` — see [`life.md`](life.md) § Open decisions |
 | Focus hours trend in weekly review | `ContextEngine._aggregate_focus_summary` trend detection |
 
 ## Is ADHD a feature of `life/`, or a cross-cutting concern?
@@ -49,12 +51,12 @@ Phase 6B added guided routines (`life/routines.py`) in a separate pass.
 
 ## Proactive surfacing model (current state)
 
-`DayContext` carries two proactive fields that are populated but not yet acted on by a dedicated agent:
+`DayContext` carries two proactive fields that are populated every turn:
 
 - `check_in_suggestion` — a string like "You've been going for 135min — how's your energy?" surfaced when the session exceeds 120 minutes with no self-report, or when a medication dose window has been missed.
 - `upcoming_nudges` — a list like `["standup in 12min", "Adderall window in 45min"]` built from the next 5 calendar entries within 2 hours.
 
-These are rendered in the supervisor's dynamic suffix (see `graph/prompts.py:_render_today_block`). A future ProactiveAgent (referenced as "Phase 8" in comments) will act on them autonomously; today the supervisor model reads them and decides whether to surface them in conversation.
+These are rendered in the supervisor's dynamic suffix (see `graph/prompts.py:_render_today_block`) and the supervisor model decides whether to surface them in conversation. Phase 7.5b added the *delivery* infrastructure for the autonomous route: `OrchestrationEngine` pipelines can raise notifications that route through the `NotificationGate` (see [`adhd.md`](adhd.md)), and the pipeline wrapper for proactive surfacing is one of the 17 stubs in `core_pipelines.py` waiting for Phase 8 to ship real step functions. The `DayContext` fields stay the same; what changes with Phase 8 is that a dispatched `WorkerTask` — not a prompt hint — will decide when to emit.
 
 ## Files in this cluster
 
@@ -81,3 +83,4 @@ These are rendered in the supervisor's dynamic suffix (see `graph/prompts.py:_re
 - **`agents/workers/reviewer.py`**: has `adhd_friendliness` as an explicit review category.
 - **`core/models.py`**: `DayContext`, `LifeContext`, `MedicationStatus`, `FocusBlockStatus`, `RoutineStatus`, `EnergyEstimate` are all Phase 5 additions.
 - **`core/db.py`**: `operational.db` houses the life-domain tables (`medication_log`, `meal_log`, `focus_blocks`, `finance_log`, `energy_log`, `reminders`, `routines`, `routine_sessions`, `quick_notes`, `calendar_entries`).
+- **`runtime/orchestration/`**: `NotificationGate` delivers every proactive message raised by this cluster; `OpenDecisionsTracker` persists decisions raised in conversation or by background pipelines; `SleepSchedule` / `UserScheduleProfile` own the DND and hyperfocus window that the gate enforces. See [`../01-runtime-core/orchestration.md`](../01-runtime-core/orchestration.md).

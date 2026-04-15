@@ -363,7 +363,75 @@ class RSDFilterResult(BaseModel):
     rewritten: str | None             # always None in Phase 5
 ```
 
-**Current usage**: the filter is called in tests and is available for callers to invoke on any text. In the current supervisor graph, the filter is not wired into the main response path — the `output_rules()` patterns are injected into the frozen prefix as instructions to the LLM, not as a post-processing gate. Hooking the filter as a mandatory post-processing step before delivery is a known gap.
+**Current usage**: the filter is called in tests and is available for callers to invoke on any text. In the main conversation turn, the `output_rules()` patterns are still injected into the frozen prefix as instructions to the LLM, so the filter itself is not a mandatory post-processing step for the primary response. What *is* enforced is every non-conversation message emitted into the user's attention: Phase 7.5b's `NotificationGate` (see below) runs a two-tier softening pass on every notification body before the daemon broadcasts it, so all background-originated text goes through an RSD-aware gate even though the conversation response path still relies on prompt-level guidance.
+
+---
+
+## Part 4.5: NotificationGate — the outbound chokepoint (Phase 7.5b)
+
+Every message that reaches the user from anywhere other than a direct conversation response passes through `NotificationGate` (`kora_v2/runtime/orchestration/notifications.py`). It is constructed by `OrchestrationEngine` at daemon startup and owns two send paths: `send_llm()` for generative replies and `send_templated()` for zero-request deterministic messages rendered from the YAML template registry (`kora_v2/runtime/orchestration/templates.py`).
+
+### Why it matters for ADHD support
+
+The gate is the single place where the `SleepSchedule`, `HyperfocusDetector`, and user's DND window actually get *enforced*. Before Phase 7.5 the life module read these signals but nothing in the delivery path honoured them — a background task could emit a check-in mid-hyperfocus because the RSD guidance lived only in the supervisor system prompt. The gate turns the signals into deliverable/not-deliverable decisions.
+
+### The 7-step `_deliver()` pipeline
+
+```
+send_llm() / send_templated()
+        │
+        ▼
+  _deliver(notification_id, text, priority, tier, template_id, template_vars, bypass_dnd, via, metadata)
+        │
+        ├── 1. Manual suppression window? → DeliveryChannel.SUPPRESSED
+        │       (suppress_until honoured unless bypass_dnd=True)
+        │
+        ├── 2. Hyperfocus suppression (unoverridable)
+        │       if hyperfocus_active_fn() and profile.hyperfocus_suppression:
+        │           → DeliveryChannel.SUPPRESSED, reason="hyperfocus"
+        │       bypass_dnd does NOT override this — spec §10 rubric
+        │
+        ├── 3. DND window check
+        │       if in DND and not bypass_dnd:
+        │           queue the PendingNotification for later drain
+        │           → DeliveryChannel.QUEUE, reason="dnd_queued"
+        │
+        ├── 4. RSD softening hook (currently identity)
+        │       text = self._rsd_filter(text)
+        │       — placeholder; supervisor prompt still carries the rules.
+        │       The hook exists so a future wording sanitiser has one slot.
+        │
+        ├── 5. Channel routing
+        │       WEBSOCKET → broadcast via session_active_fn() callback
+        │       TURN_RESPONSE → caller appends to current turn payload
+        │       INBOX → working-doc writer handles persistence
+        │       else → queue for drain
+        │
+        ├── 6. Record in `notifications` table with (tier, template_id, template_vars)
+        │
+        └── 7. Return DeliveryResult
+```
+
+### Two tiers
+
+| Tier | Path | Provider cost | Typical senders |
+|---|---|---|---|
+| `llm` | `send_llm(GeneratedNotification)` — the caller already produced the text and pays against the `NOTIFICATION` reserve in `RequestLimiter` (100 slots in the 5h window) | 1 LLM request | Proactive life-module check-ins, autonomous task progress updates |
+| `templated` | `send_templated(template_id, **kwargs)` → `TemplateRegistry.render()` resolves a YAML template by ID, substitutes variables, returns priority + bypass_dnd + text | 0 LLM requests | "I'm catching up on my window", rate-limit pauses, DND resume, morning-briefing shells. These still deliver when the rate limiter is exhausted. |
+
+### The `bypass_dnd` asymmetry
+
+A templated entry can set `bypass_dnd: true` in its YAML definition (e.g., a safety-critical medication reminder). When that fires, step 3 is skipped — but step 2 (hyperfocus) is still honoured. Hyperfocus is a separate axis from DND and is never overridable by `bypass_dnd`.
+
+### Hot-reload templates
+
+`TemplateRegistry` reads YAML files from `kora_v2/runtime/orchestration/templates/` at startup and on every `reload()` call. `OrchestrationEngine` exposes a `reload_templates()` entry point so templates can be edited live without a daemon restart. Each template carries `id`, `priority`, `bypass_dnd`, and a Jinja-style `{var}` template body.
+
+### Integration with the supervisor
+
+The supervisor graph's main response path still delivers text directly on the WebSocket `response` frame — it does *not* route through the gate. Only notifications (autonomous task updates, proactive check-ins, morning briefings, life-module nudges) go through `NotificationGate`. This intentional split keeps the per-turn hot path simple while guaranteeing that every *unsolicited* message obeys hyperfocus and DND.
+
+See [`../01-runtime-core/orchestration.md`](../01-runtime-core/orchestration.md) § NotificationGate for the full method surface, YAML template schema, and interaction with the `request_limiter` notification reserve.
 
 ---
 
@@ -540,9 +608,9 @@ graph/supervisor.py: supervisor_node()
 
 ## Known limitations and stubs
 
-- **RSD filter is not wired into the response pipeline**: `check_output()` exists and is tested, but the supervisor does not call it on the final response before delivery. Phase 8 is referenced as the target for automatic rewriting.
+- **RSD filter is prompt-level for conversation responses**: `check_output()` exists and is tested, and the `NotificationGate._rsd_filter()` hook is now the one place where a future wording sanitiser plugs in. But for the primary supervisor response path (direct answers on the WebSocket `response` frame), enforcement is still prompt-level — the `output_rules()` patterns are injected into the frozen prefix for the LLM to honour, not post-processed. Notifications, by contrast, *do* go through the gate's hook. Phase 8 is referenced as the target for automatic text rewriting at the gate.
 - **`rewritten` is always None**: the `RSDFilterResult.rewritten` field is reserved for Phase 8 LLM-based rewriting.
 - **No multi-module support in production**: `NeurodivergentModule` is a Protocol designed for multiple modules, but `ContextEngine` and `di.py` hardwire a single `ADHDModule`. The `_adhd` attribute in `ContextEngine` is not a list.
 - **`turns_in_current_topic` is not always maintained**: the supervisor state field `turns_in_current_topic` must be incremented by the turn runner when the topic stays the same. If it is not maintained, `focus_detection` always returns `"scattered"` for fresh sessions.
-- **`profile.yaml` is not hot-reloaded**: if the user edits `profile.yaml` after startup, the change is not visible until daemon restart. The `adhd_profile` property is cached on first access (`self._adhd_profile is None` guard).
+- **`profile.yaml` is not hot-reloaded**: if the user edits `profile.yaml` after startup, the change is not visible until daemon restart. The `adhd_profile` property is cached on first access (`self._adhd_profile is None` guard). Notification YAML templates *are* hot-reloadable via `OrchestrationEngine.reload_templates()` — this asymmetry is intentional for Phase 7.5b.
 - **Overwhelm triggers are prose-only**: `overwhelm_triggers` from the profile are injected as text into the frozen prefix, but there is no programmatic detection — the LLM reads the list and decides whether a situation matches.

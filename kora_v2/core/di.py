@@ -97,8 +97,15 @@ class Container:
         # Auth relay (set by RuntimeKernel)
         self._auth_relay: Any | None = None
 
-        # Phase 6: Active autonomous execution loops, keyed by session_id.
-        self._autonomous_loops: dict[str, Any] = {}
+        # Phase 7.5: Orchestration engine (lazy async init).
+        #
+        # Slice 7.5c §17.7c retired the legacy ``_autonomous_loops``
+        # dict that used to hold ``asyncio.Task`` handles for
+        # ``AutonomousExecutionLoop`` instances. Autonomous work now
+        # runs as a ``user_autonomous_task`` pipeline on the
+        # orchestration engine, and shutdown cancellation is handled
+        # by ``self._orchestration_engine.stop(graceful=True)`` below.
+        self._orchestration_engine: Any | None = None
 
         log.info(
             "container_initialized",
@@ -172,6 +179,7 @@ class Container:
             projection_db=self.projection_db,
             embedding_model=self.embedding_model,
             llm=None,  # LLM for dedup wired when needed
+            event_emitter=self.event_emitter,
         )
         log.info("write_pipeline_initialized")
 
@@ -357,7 +365,10 @@ class Container:
         from kora_v2.quality.tier1 import QualityCollector
 
         self.fast_emotion = FastEmotionAssessor()
-        self.llm_emotion = LLMEmotionAssessor(self.llm)
+        self.llm_emotion = LLMEmotionAssessor(
+            self.llm,
+            event_emitter=self.event_emitter,
+        )
         self.quality_collector = QualityCollector(
             db_path=self.settings.data_dir / "operational.db"
         )
@@ -487,6 +498,98 @@ class Container:
             self._calendar_sync = CalendarSync(self)
         return self._calendar_sync
 
+    # ── Phase 7.5: Orchestration engine ──────────────────────────
+
+    @property
+    def orchestration_engine(self) -> Any | None:
+        """The :class:`OrchestrationEngine` instance (set by init)."""
+        return self._orchestration_engine
+
+    async def initialize_orchestration(
+        self,
+        *,
+        websocket_broadcast: Any | None = None,
+        session_active_fn: Any | None = None,
+        hyperfocus_active_fn: Any | None = None,
+    ) -> Any:
+        """Create and return the :class:`OrchestrationEngine`.
+
+        This is an async init step because the engine applies SQL
+        migrations (``init_orchestration_schema``) on first ``start()``.
+        The engine itself is cheap to construct — ``start()`` is the
+        expensive call, and the daemon owns when that happens.
+
+        Args:
+            websocket_broadcast: Optional async callable used by the
+                notification gate to push messages to connected CLI
+                clients. The daemon passes ``_broadcast_to_clients``.
+            session_active_fn: Optional predicate returning True when
+                at least one CLI client is connected — used by the gate
+                to decide whether ``send_templated`` requests should
+                actually deliver or wait until a session is live.
+            hyperfocus_active_fn: Optional predicate returning True when
+                the user is in a hyperfocus block — used to suppress
+                notifications per the profile's
+                ``hyperfocus_suppression`` flag.
+
+        Returns:
+            The constructed :class:`OrchestrationEngine` — also cached
+            on ``self._orchestration_engine``.
+        """
+        from kora_v2.runtime.orchestration.engine import OrchestrationEngine
+        from kora_v2.runtime.orchestration.system_state import (
+            UserScheduleProfile,
+        )
+
+        db_path = self.settings.data_dir / "operational.db"
+        memory_root = Path(self.settings.memory.kora_memory_path)
+
+        # Build a best-effort schedule profile from the ADHD profile.
+        # Any missing/typed-wrong field falls back to the default
+        # ``UserScheduleProfile()`` so engine construction never crashes
+        # when the user hasn't finished the first-run wizard.
+        schedule_profile = UserScheduleProfile()
+        try:
+            profile = self.adhd_profile
+            if profile is not None:
+                kwargs: dict[str, Any] = {}
+                for field_name in (
+                    "wake_time",
+                    "sleep_start",
+                    "sleep_end",
+                    "dnd_start",
+                    "dnd_end",
+                    "timezone",
+                    "weekly_review_time",
+                    "weekly_review_weekday",
+                    "hyperfocus_suppression",
+                ):
+                    value = getattr(profile, field_name, None)
+                    if value is not None:
+                        kwargs[field_name] = value
+                if kwargs:
+                    schedule_profile = UserScheduleProfile(**kwargs)
+        except Exception:
+            log.debug("schedule_profile_build_failed", exc_info=True)
+
+        engine = OrchestrationEngine(
+            db_path=db_path,
+            event_emitter=self.event_emitter,
+            schedule_profile=schedule_profile,
+            memory_root=memory_root,
+            websocket_broadcast=websocket_broadcast,
+            session_active_fn=session_active_fn,
+            hyperfocus_active_fn=hyperfocus_active_fn,
+            container=self,
+        )
+        self._orchestration_engine = engine
+        log.info(
+            "orchestration_engine_constructed",
+            db_path=str(db_path),
+            memory_root=str(memory_root),
+        )
+        return engine
+
     # ── Cleanup ───────────────────────────────────────────────────
 
     async def close(self) -> None:
@@ -497,32 +600,16 @@ class Container:
         enclosing connection is torn down. Then projection DB, then the
         embedding model (unloaded last because it has no durable state).
         """
-        # 0. Cancel autonomous background tasks. Each entry in
-        #    ``_autonomous_loops`` holds an ``asyncio.Task`` under the
-        #    ``task`` key (see graph/dispatch.start_autonomous).
-        #    Without this, a long-running autonomous loop outlives
-        #    uvicorn's main_loop and the process never exits.
-        if self._autonomous_loops:
-            import asyncio as _asyncio
-
-            tasks: list[_asyncio.Task] = []
-            for entry in list(self._autonomous_loops.values()):
-                task = entry.get("task") if isinstance(entry, dict) else None
-                if task is not None and not task.done():
-                    task.cancel()
-                    tasks.append(task)
-            if tasks:
-                try:
-                    # Give cancellations a moment to propagate so any
-                    # finally blocks inside the loops can run.
-                    await _asyncio.wait(tasks, timeout=2.0)
-                except Exception:
-                    pass
-                log.info(
-                    "autonomous_loops_cancelled_via_container",
-                    count=len(tasks),
-                )
-            self._autonomous_loops.clear()
+        # 0. Stop the orchestration engine so the dispatcher, trigger
+        #     scheduler, and notification gate get a clean shutdown
+        #     before anything else tears down. A graceful stop allows
+        #     in-flight tasks to complete without being cancelled.
+        if self._orchestration_engine is not None:
+            try:
+                await self._orchestration_engine.stop(graceful=True)
+                log.info("orchestration_engine_stopped_via_container")
+            except Exception:
+                log.debug("orchestration_engine_stop_failed", exc_info=True)
 
         # 1. Flush and close the LangGraph checkpointer (SQLite saver).
         #    Without this, pending checkpoints may not hit disk and the

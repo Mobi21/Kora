@@ -110,6 +110,15 @@ class GraphTurnRunner:
             trace_id, session_id, turn_number, started_at, user_input,
         )
 
+        # Phase 7.5b: turn-start task query. Stash any live tasks the
+        # four-case OR surfaces into graph_input so the supervisor's
+        # dynamic suffix can mention them. Best-effort: if the engine
+        # is missing or the query fails, the turn runs without the
+        # hint and we log a debug line.
+        await self._prefetch_relevant_tasks(
+            graph_input, session_id=session_id, user_message=user_input,
+        )
+
         try:
             result = await graph.ainvoke(graph_input, config=config)
             latency_ms = int(
@@ -129,6 +138,12 @@ class GraphTurnRunner:
                     [self._tool_name(tc) for tc in tool_calls],
                 ),
             )
+
+            # Phase 7.5b: turn-end acknowledgement. Any tasks we
+            # surfaced at turn start are now "seen" and should not
+            # re-surface next turn.
+            await self._acknowledge_tasks(graph_input)
+
             return result
 
         except Exception as exc:
@@ -233,6 +248,74 @@ class GraphTurnRunner:
                 trace_id=trace_id,
                 event_type=event_type,
             )
+
+    # ── Orchestration turn-start / turn-end hooks ──────────────────────
+
+    async def _prefetch_relevant_tasks(
+        self,
+        graph_input: dict,
+        *,
+        session_id: str,
+        user_message: str,
+    ) -> None:
+        """Pre-populate ``_orchestration_tasks`` on *graph_input*.
+
+        Implements the spec §13.3 four-case OR by delegating to
+        ``engine.list_tasks(relevant_to_session=..., user_message=...)``.
+        We shape the response into a small list of dicts so the
+        supervisor's dynamic suffix doesn't need to import engine
+        types.
+        """
+        engine = getattr(self._container, "orchestration_engine", None)
+        if engine is None:
+            return
+        try:
+            tasks = await engine.list_tasks(
+                relevant_to_session=session_id if session_id != "unknown" else None,
+                user_message=user_message or None,
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("orchestration_prefetch_failed", exc_info=True)
+            return
+
+        shaped: list[dict[str, Any]] = []
+        seen_ids: list[str] = []
+        for task in tasks[:5]:
+            state_obj = getattr(task, "state", None)
+            state_val = getattr(state_obj, "value", None) or str(state_obj or "")
+            shaped.append(
+                {
+                    "task_id": getattr(task, "id", None),
+                    "stage": getattr(task, "stage_name", None),
+                    "state": state_val,
+                    "goal": getattr(task, "goal", None),
+                    "pipeline_instance_id": getattr(task, "pipeline_instance_id", None),
+                }
+            )
+            tid = getattr(task, "id", None)
+            if tid:
+                seen_ids.append(tid)
+        if shaped:
+            graph_input["_orchestration_tasks"] = shaped
+            graph_input["_orchestration_seen_task_ids"] = seen_ids
+
+    async def _acknowledge_tasks(self, graph_input: dict) -> None:
+        """Mark any tasks we surfaced this turn as acknowledged."""
+        seen_ids = graph_input.get("_orchestration_seen_task_ids") or []
+        if not seen_ids:
+            return
+        engine = getattr(self._container, "orchestration_engine", None)
+        if engine is None:
+            return
+        for task_id in seen_ids:
+            try:
+                await engine.acknowledge_task(task_id)
+            except Exception:  # noqa: BLE001
+                log.debug(
+                    "orchestration_ack_failed",
+                    task_id=task_id,
+                    exc_info=True,
+                )
 
     # ── Private helpers ─────────────────────────────────────────────────
 

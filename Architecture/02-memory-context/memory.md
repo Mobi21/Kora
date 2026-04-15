@@ -469,3 +469,31 @@ The system prompt instructs the Memory Worker on:
 - `sentence_transformers.SentenceTransformer` — external model loader
 - `sqlite_vec` — optional C extension for vector search
 - `aiosqlite` — async SQLite driver
+
+---
+
+## Memory events
+
+`WritePipeline` and the projection layer emit three `EventType` values on the shared `EventEmitter`:
+
+| Event | When it fires |
+|-------|---------------|
+| `MEMORY_STORED` | A new note is written to `_KoraMemory/` and projected into `projection.db`. Consumed by `proactive_pattern_scan` (wakes pattern-scan triggers) and the `post_session_memory` pipeline. |
+| `MEMORY_SOFT_DELETED` | A note is tombstoned rather than physically deleted. The filesystem copy stays put; the projection row is flipped to `deleted=1`. |
+| `ENTITY_MERGED` | Two entity rows are merged into one. Emits the surviving id + the merged-in id so downstream consumers can rebind references. |
+
+These three live under the `# Memory` block of `kora_v2/core/events.py` alongside the older `MEMORY_STORED` event. See [core.md § core/events.py](../01-runtime-core/core.md#coreeventspy--eventemitter) for the full enum.
+
+---
+
+## Working documents — `_KoraMemory/Inbox/`
+
+Long-running orchestration tasks (`LONG_BACKGROUND` preset, e.g. `user_autonomous_task`) write a per-instance working document to `_KoraMemory/Inbox/<task_id>.md`. These are intentionally stored alongside user memory rather than in the SQL layer so the supervisor can quote section contents back to the user in the turn response and so the user themselves can edit the file to steer an in-flight task.
+
+Each document has:
+
+- YAML frontmatter with `task_id`, `pipeline`, `created_at`, `last_updated_at`, `status`
+- Free-form markdown sections the step function owns (e.g. `## Plan`, `## Progress`, `## Open Decisions`)
+- A `status: done` sentinel written once the task reaches a terminal state — the supervisor tool `get_working_doc` uses this to decide whether to show a live or archived view
+
+Writes are atomic (temp file + rename) and serialised through a per-instance `asyncio.Lock` held by the `WorkingDocStore` class in `kora_v2/runtime/orchestration/working_doc.py`. See [orchestration.md § Working documents](../01-runtime-core/orchestration.md#working-documents--_koramemoryinbox) for the full lifecycle.

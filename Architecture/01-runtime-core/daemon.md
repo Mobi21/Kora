@@ -1,8 +1,8 @@
 # Daemon Subsystem
 
-`kora_v2/daemon/` — FastAPI server, launcher, lockfile, auth relay, session manager, and background worker.
+`kora_v2/daemon/` — FastAPI server, launcher, lockfile, auth relay, and session manager.
 
-The daemon is the long-running process that owns the conversation loop, background work, and session continuity. It exposes REST and WebSocket APIs over localhost, enforces single-instance semantics via an OS-level lockfile, and manages a two-tier background worker for memory consolidation and autonomous task delivery.
+The daemon is the long-running process that owns the conversation loop and session continuity. It exposes REST and WebSocket APIs over localhost, enforces single-instance semantics via an OS-level lockfile, and — as of Phase 7.5b — constructs and runs the `OrchestrationEngine` that owns every piece of background and autonomous work. The legacy `BackgroundWorker` / `work_items.py` pair was deleted in that same slice.
 
 ---
 
@@ -10,14 +10,14 @@ The daemon is the long-running process that owns the conversation loop, backgrou
 
 | File | Lines | Role |
 |------|-------|------|
-| `launcher.py` | ~689 | `kora` CLI entrypoint; daemon spawn, port discovery, client attachment |
-| `server.py` | ~950 | FastAPI app; REST + WebSocket routes; per-connection turn queue |
-| `lockfile.py` | ~342 | OS-level exclusive lock; `DaemonState` machine; PID tracking |
-| `auth_relay.py` | ~384 | Three-layer MCP auth; WebSocket-based permission prompting |
-| `session.py` | ~735 | Session lifecycle; bridge notes; emotion decay; turn history |
-| `worker.py` | ~183 | Two-tier background worker; conversation-aware scheduling |
-| `work_items.py` | ~234 | Five background task factories with priority and cooldown |
+| `launcher.py` | ~688 | `kora` CLI entrypoint; daemon spawn, port discovery, client attachment |
+| `server.py` | ~1113 | FastAPI app; REST + WebSocket routes; orchestration engine lifecycle |
+| `lockfile.py` | ~341 | OS-level exclusive lock; `DaemonState` machine; PID tracking |
+| `auth_relay.py` | ~383 | Three-layer MCP auth; WebSocket-based permission prompting |
+| `session.py` | ~734 | Session lifecycle; bridge notes; emotion decay; turn history |
 | `__init__.py` | ~0 | Package marker |
+
+Background work that used to live in `daemon/worker.py` + `daemon/work_items.py` is now owned entirely by `kora_v2/runtime/orchestration/` — see [orchestration.md](orchestration.md).
 
 ---
 
@@ -89,15 +89,16 @@ async def run_server(container: Container, token: str) -> None:
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/health` | None | Returns DaemonState + version + phase |
-| GET | `/status` | Token | Runtime metrics, memory stats, phase info |
-| POST | `/session/end` | Token | End current session, flush bridge |
-| GET | `/session/info` | Token | Current session_id, turn_count, thread_id |
-| POST | `/turns` | Token | Single-turn REST API (non-streaming) |
-| GET | `/inspect/{topic}` | Token | RuntimeInspector dispatch |
-| GET | `/autonomous/updates` | Token | Pending autonomous update summaries |
-| POST | `/autonomous/updates/{id}/read` | Token | Mark update as read |
-| DELETE | `/autonomous/stop` | Token | Cancel running autonomous task |
+| GET | `/health` | None | Returns DaemonState + version |
+| GET | `/status` | Token | Runtime metrics, memory stats, orchestration pipeline count |
+| POST | `/daemon/shutdown` | Token | Graceful shutdown (flips `_server.should_exit`) |
+| GET | `/orchestration/status` | Token | Pipelines registered, non-terminal task count, current `SystemStatePhase` |
+| GET | `/inspect/autonomous` | Token | Live state of the `user_autonomous_task` instance owned by this session |
+| GET | `/inspect/{topic}` | Token | Generic `RuntimeInspector` dispatch for non-autonomous topics |
+| GET | `/memory/recall` | Token | Direct `recall()` passthrough for debugging |
+| POST | `/compact` | Token | Force working-memory compaction |
+| GET | `/permissions` | Token | List MCP permission grants |
+| POST | `/auth-mode` | Token | Flip `trust_all` / per-scope auth policy |
 
 ### WebSocket Route
 
@@ -395,112 +396,79 @@ If `data/session_id` contains an ID already present in the bridge archive, `star
 
 ---
 
-## worker.py — `kora_v2/daemon/worker.py`
+## OrchestrationEngine lifecycle — `run_server()` in `server.py`
 
-Two-tier background worker. Runs low-priority maintenance tasks without blocking conversations.
-
-### `BackgroundWorker` Class
+Phase 7.5b deleted `BackgroundWorker` / `work_items.py` outright. The daemon no longer schedules anything on its own; instead, `run_server()` builds an `OrchestrationEngine` before the FastAPI app is created, registers the 20 core pipelines, and starts/stops the engine around the uvicorn loop.
 
 ```python
-class BackgroundWorker:
-    async def start(self) -> None:
-        """Launch bg_safe_loop and bg_idle_loop asyncio tasks."""
+async def run_server(container, *, host, port, on_bind) -> None:
+    # 1. Build the engine BEFORE create_app so /status can report counts.
+    engine = await container.initialize_orchestration(
+        websocket_broadcast=_broadcast_to_clients,
+        session_active_fn=lambda: bool(_connected_clients),
+    )
 
-    async def stop(self) -> None:
-        """Cancel both tasks; await their completion."""
+    # 2. Declare the 20 core pipelines (spec §4.3) on the engine.
+    from kora_v2.runtime.orchestration.core_pipelines import (
+        register_core_pipelines,
+    )
+    register_core_pipelines(engine)
 
-    async def _bg_safe_loop(self) -> None:
-        """Safe tier: runs tasks during conversations (when _conversation_active=True)."""
+    # 3. Create the FastAPI app — it reaches back into
+    #    ``container.orchestration_engine`` through the module-level
+    #    ``_orchestration_engine`` reference for /status and
+    #    /orchestration/status.
+    app = create_app(container)
 
-    async def _bg_idle_loop(self) -> None:
-        """Idle tier: runs tasks only between sessions."""
+    # 4. Start the engine (dispatcher loop + trigger evaluator).
+    await engine.start()
+
+    try:
+        # ...uvicorn startup / main_loop / shutdown...
+    finally:
+        # 5. Stop the engine gracefully: cancel in-flight tasks, checkpoint
+        #    RUNNING tasks to PAUSED_FOR_STATE, close the DB pool.
+        await engine.stop(graceful=True)
 ```
 
-### Two-Tier Scheduling
+The engine is constructed pre-`create_app()` so the `/status` and `/orchestration/status` REST endpoints can report `len(engine.pipelines.all())` without a null check. `engine.start()` is deferred until after uvicorn has everything it needs so tests that import `create_app` without running a server don't pay the dispatcher startup cost.
 
-| Tier | Condition | Use Case |
-|------|-----------|----------|
-| `safe` | Always (including mid-conversation) | Signal scanning, autonomous update delivery |
-| `idle` | Only when `_conversation_active=False` | Memory consolidation, bridge pruning, skill refinement |
+### WebSocket hooks passed to the engine
 
-```python
-async def _bg_safe_loop(self):
-    while True:
-        eligible = [t for t in self._tasks if t.tier == "safe" and t.is_due()]
-        if eligible:
-            task = min(eligible, key=lambda t: t.priority)
-            await task.run()        # run exactly one per cycle
-            break                   # break after first eligible
-        await asyncio.sleep(5)
+`initialize_orchestration()` receives two callbacks that let the dispatcher make conversation-aware decisions without importing `server.py`:
 
-async def _bg_idle_loop(self):
-    while True:
-        if not self._conversation_active:
-            # same pattern as safe loop but tier == "idle"
-            ...
-        await asyncio.sleep(30)
-```
+| Callback | Purpose |
+|----------|---------|
+| `websocket_broadcast` | `NotificationGate` calls this to push `WEBSOCKET` channel notifications to every connected CLI. It wraps `_broadcast_to_clients`, which iterates `_connected_clients` and tolerates disconnected sockets silently. |
+| `session_active_fn` | Dispatcher checks this every tick to decide whether `CONVERSATION` phase is active. `bool(_connected_clients)` is a cheap proxy: any WebSocket connection means the user is (or might be) present. |
 
-One item per cycle — the loops `break` after executing the first eligible task. This prevents a backlog of stale tasks from saturating the event loop.
+### Graceful shutdown
 
-### Conversation Tracking
+`engine.stop(graceful=True)` does three things in order:
 
-```python
-_conversation_active: bool = False
+1. Cancels the dispatcher's async task so no new work is picked up.
+2. For each `RUNNING` / `PLANNING` / `CHECKPOINTING` WorkerTask: request a cooperative stop and, if the step function yields, transition the task to `PAUSED_FOR_STATE` with `reason="shutdown"`. On next boot, crash recovery treats those rows identically to a real crash.
+3. Closes the orchestration DB pool.
 
-# Subscribed to EventEmitter:
-on SESSION_START → _conversation_active = True
-on SESSION_END   → _conversation_active = False
-```
+The same graceful path runs on a crash if uvicorn itself throws — `run_server()` wraps the whole serve block in `try / finally`.
 
-Subscriptions are set up in `create_app()` via `container.events.on(EventType.SESSION_START, ...)`.
+### The legacy work items, mapped to pipelines
 
----
+The five `work_items.py` factories that existed before 7.5b have all moved into `kora_v2/runtime/orchestration/core_pipelines.py`:
 
-## work_items.py — `kora_v2/daemon/work_items.py`
+| Old background task | New pipeline | Trigger |
+|---------------------|--------------|---------|
+| `memory_consolidation` | `post_session_memory` | `event(SESSION_END)` |
+| `signal_scanner` | `proactive_pattern_scan` | `any_of(INSIGHT_AVAILABLE, EMOTION_SHIFT_DETECTED, MEMORY_STORED, interval(1800s, idle))` |
+| `autonomous_update_delivery` | folded into `user_autonomous_task` step function | dispatched via `decompose_and_dispatch` |
+| `session_bridge_pruning` | `session_bridge_pruning` (real step fn) | `interval(3600s, deep_idle)` |
+| `skill_refinement` | `skill_refinement` (real step fn) | `time_of_day(3:00)` |
 
-Factory functions that create `BackgroundTask` instances registered with `BackgroundWorker`.
+Only the two housekeeping items at the bottom have real step functions in Slice 7.5b; the rest carry stub steps that the Phase 8 slices will flesh out. See [orchestration.md § 20 core pipelines](orchestration.md#the-20-core-pipelines) for the full catalogue.
 
-### Task Registry
+### `_check_autonomous_overlap()` — rerouted onto the engine
 
-| Factory | Tier | Priority | Cooldown | Description |
-|---------|------|----------|----------|-------------|
-| `memory_consolidation()` | idle | 1 (highest) | 600s | Flush working memory to filesystem store |
-| `signal_scanner()` | safe | 2 | 120s | Scan memory signals for pattern detection |
-| `autonomous_update_delivery()` | safe | 3 | 30s | Deliver pending autonomous task summaries |
-| `session_bridge_pruning()` | idle | 4 | 3600s | Delete bridge files older than retention window |
-| `skill_refinement()` | idle | 5 (lowest) | 86400s | Nightly skill quality improvement pass |
-
-### `BackgroundTask` Structure
-
-```python
-@dataclass
-class BackgroundTask:
-    name: str
-    tier: Literal["safe", "idle"]
-    priority: int               # Lower = higher priority
-    cooldown_seconds: float
-    run: Callable[[], Awaitable[None]]
-    _last_run: datetime | None = None
-
-    def is_due(self) -> bool:
-        if self._last_run is None:
-            return True
-        return (datetime.now() - self._last_run).total_seconds() >= self.cooldown_seconds
-```
-
-### Registration Pattern
-
-```python
-# In create_app() (server.py):
-worker = BackgroundWorker(container)
-worker.register(memory_consolidation(container))
-worker.register(signal_scanner(container))
-worker.register(autonomous_update_delivery(container))
-worker.register(session_bridge_pruning(container))
-worker.register(skill_refinement(container))
-await worker.start()
-```
+The one piece of background-aware logic still in `server.py` is `_check_autonomous_overlap()`, which runs on every incoming chat message and computes a topic-overlap score against any running `user_autonomous_task` / `user_routine_task` pipeline. Slice 7.5c rewrote it to look up the in-flight instance via `engine.task_registry.load_all_non_terminal()` + `engine.instance_registry.load()` instead of reaching into the deleted loop. It only caches the score on the container; the actual pause happens at the next dispatcher tick via `_autonomous_step_fn`'s `paused_for_overlap` branch.
 
 ---
 
@@ -510,10 +478,11 @@ await worker.start()
 
 | Source | What | How |
 |--------|------|-----|
-| `kora_v2/core/di.py` | `Container` with all services | Passed to `create_app()` and `_run_daemon()` |
+| `kora_v2/core/di.py` | `Container` with all services | Passed to `create_app()` and `run_server()` |
 | `kora_v2/graph/supervisor.py` | `build_supervisor_graph()` | Called once during `_run_daemon()`; result stored as `container.supervisor_graph` |
 | `kora_v2/runtime/turn_runner.py` | `GraphTurnRunner` | Wraps `graph.ainvoke()` with tracing |
-| `kora_v2/core/db.py` | `operational.db` | Auth grants, turn traces, autonomous updates |
+| `kora_v2/runtime/orchestration/engine.py` | `OrchestrationEngine` | Constructed by `container.initialize_orchestration()` before `create_app`; started in `run_server`, stopped in the finally block. Core pipelines registered via `register_core_pipelines(engine)`. |
+| `kora_v2/core/db.py` | `operational.db` | Auth grants, turn traces, orchestration tables |
 | `kora_v2/core/settings.py` | `Settings` | Port, token, paths, trust_all flag |
 
 ### Outbound (daemon produces)
@@ -524,6 +493,7 @@ await worker.start()
 | Lockfile readers | Port + state | `data/kora.lock` (JSON) |
 | `_KoraMemory/System/bridges/` | Bridge notes | Filesystem (YAML + JSON sidecar) |
 | `kora_v2/core/events.py` | `SESSION_START`, `SESSION_END` events | In-process `EventEmitter` |
+| `OrchestrationEngine` | `websocket_broadcast` + `session_active_fn` callbacks | Injected at `initialize_orchestration()` time so the `NotificationGate` can reach WebSocket clients and the dispatcher can tell whether a conversation is active. |
 
 ### WebSocket Message Types
 
@@ -573,4 +543,4 @@ _websocket_handler()
 - `request_permission()` in `auth_relay.py` is marked deprecated (legacy path); only `request_permission_with_policy()` is used by new callers
 - `_build_working_on()` uses pattern matching rather than LLM extraction to keep session-end latency low — accuracy depends on consistent message phrasing
 - Bridge sidecar JSON is written separately from the YAML; a crash between writes can leave an inconsistent pair — no reconciliation logic currently exists
-- `skill_refinement` task factory (86400s cooldown) is registered but its `run()` implementation is a stub in Phase 5 (`work_items.py`)
+- 17 of the 20 core pipelines registered by `register_core_pipelines()` still point at stub step functions; only `session_bridge_pruning`, `skill_refinement`, and `user_autonomous_task` have real bodies in Slice 7.5b (see [orchestration.md](orchestration.md))

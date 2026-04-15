@@ -42,6 +42,12 @@ class EventType(Enum):
 
     # Memory
     MEMORY_STORED = auto()
+    MEMORY_SOFT_DELETED = auto()
+    ENTITY_MERGED = auto()
+
+    # Emotion
+    EMOTION_STATE_ASSESSED = auto()
+    EMOTION_SHIFT_DETECTED = auto()
 
     # Quality
     QUALITY_GATE_RESULT = auto()
@@ -53,6 +59,20 @@ class EventType(Enum):
     AUTONOMOUS_CHECKPOINT = auto()
     AUTONOMOUS_COMPLETE = auto()
     AUTONOMOUS_FAILED = auto()
+
+    # Phase 7.5 — Orchestration layer
+    TASK_CHECKPOINTED = auto()
+    TASK_COMPLETED = auto()
+    TASK_FAILED = auto()
+    PIPELINE_COMPLETE = auto()
+    INSIGHT_AVAILABLE = auto()
+    SYSTEM_STATE_CHANGED = auto()
+    RATE_LIMIT_APPROACHING = auto()
+    OPEN_DECISION_POSED = auto()
+    TASK_LINGERING = auto()
+    LONG_FOCUS_BLOCK_ENDED = auto()
+    USER_STATED_INTENT = auto()
+    USER_STATED_NEED = auto()
 
     # Errors
     ERROR_OCCURRED = auto()

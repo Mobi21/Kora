@@ -10,7 +10,7 @@ Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a Rich C
 
 | # | Cluster | What lives here | Read when you want to understand… |
 |---|---------|-----------------|-----------------------------------|
-| 01 | [Runtime core](01-runtime-core/README.md) | `core/`, `daemon/`, `runtime/`, `graph/` | How a turn runs. The DI container, FastAPI server, WebSocket protocol, LangGraph supervisor, checkpointing, turn tracing. |
+| 01 | [Runtime core](01-runtime-core/README.md) | `core/`, `daemon/`, `runtime/`, `runtime/orchestration/`, `graph/` | How a turn runs and how every non-conversation job is scheduled. The DI container, FastAPI server, WebSocket protocol, LangGraph supervisor, turn tracing, and the Phase 7.5 `OrchestrationEngine` that replaced `BackgroundWorker`. |
 | 02 | [Memory & context](02-memory-context/README.md) | `memory/`, `context/`, `tools/` | How Kora remembers. Filesystem-canonical memory, projection DB, hybrid retrieval, compaction, the `recall()` fast path, all 23 registered tools. |
 | 03 | [Agents & autonomous](03-agents-autonomous/README.md) | `agents/workers/`, `autonomous/`, `capabilities/`, `skills/`, `routing/` | How Kora *does* things. Worker harnesses (planner/executor/reviewer), multi-step autonomous plans, capability packs, YAML skills. |
 | 04 | [Conversation & LLM](04-conversation-llm/README.md) | `llm/`, `emotion/`, `cli/`, `mcp/`, `quality/` | How Kora talks. LLM providers (MiniMax via Anthropic SDK, Claude Code delegate), two-tier PAD emotion, Rich CLI, MCP manager, quality sampling. |
@@ -21,9 +21,10 @@ Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a Rich C
 ### 01 — Runtime core
 - [Cluster README](01-runtime-core/README.md) — request→turn→response flow, lifecycle, cross-subsystem map
 - [core.md](01-runtime-core/core.md) — DI container, settings, `operational.db` schema, event bus, retry, logging
-- [daemon.md](01-runtime-core/daemon.md) — FastAPI routes, WebSocket turn queue, launcher, lockfile, auth relay, session bridge
+- [daemon.md](01-runtime-core/daemon.md) — FastAPI routes, WebSocket turn queue, launcher, lockfile, auth relay, session bridge, orchestration engine lifecycle
 - [runtime.md](01-runtime-core/runtime.md) — `GraphTurnRunner`, compaction circuit breaker, inspector, artifact store, checkpointer lifecycle
-- [graph.md](01-runtime-core/graph.md) — LangGraph supervisor: full topology, every node, every edge, tool-footprint tracker, CJK filter
+- [orchestration.md](01-runtime-core/orchestration.md) — `OrchestrationEngine`, `WorkerTask` FSM, pipelines, triggers, dispatcher, `SystemState`, `RequestLimiter`, `NotificationGate`, working docs (Phase 7.5)
+- [graph.md](01-runtime-core/graph.md) — LangGraph supervisor: full topology, every node, every edge, tool-footprint tracker, CJK filter, the 7 new orchestration supervisor tools
 
 ### 02 — Memory & context
 - [Cluster README](02-memory-context/README.md) — filesystem vs projection DB, write/read flows, working vs long-term memory
@@ -33,8 +34,8 @@ Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a Rich C
 
 ### 03 — Agents & autonomous
 - [Cluster README](03-agents-autonomous/README.md) — worker vs capability vs skill distinction, turn-lifecycle fit
-- [workers.md](03-agents-autonomous/workers.md) — planner, executor (with fast deterministic path), reviewer harnesses
-- [autonomous.md](03-agents-autonomous/autonomous.md) — 12-node autonomous graph, checkpoint format, budget, overlap with runtime
+- [workers.md](03-agents-autonomous/workers.md) — planner, executor (with fast deterministic path), reviewer harnesses; dispatch contexts for in-turn and long-background `WorkerTask` presets
+- [autonomous.md](03-agents-autonomous/autonomous.md) — the 12-node state machine now running inside a single `LONG_BACKGROUND` `WorkerTask`, the pipeline wrapper, step function, budget, open decisions, topic-overlap flow, and the legacy `autonomous_checkpoints` migration (Phase 7.5c)
 - [capabilities.md](03-agents-autonomous/capabilities.md) — all 4 packs, base abstractions, policy system, registry
 - [skills.md](03-agents-autonomous/skills.md) — YAML schema, loader, all 14 skill definitions, skills-vs-capabilities
 - [routing.md](03-agents-autonomous/routing.md) — empty directory (aspirational); actual routing lives in `autonomous/graph.py` and the supervisor
@@ -56,7 +57,7 @@ Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a Rich C
 
 This atlas was built by reading every `.py` file in `kora_v2/`. Five Sonnet agents worked in parallel — one per cluster — each instructed to base every claim on real code with `file:line` references. No content was sourced from `Documentation/`, `README.md`, or legacy spec folders. When source disagrees with any legacy doc, **the atlas follows source**.
 
-If you notice the atlas drift out of sync with the code, it was generated against the commit at the tip of `main` on 2026-04-14. Regenerate any cluster by re-running that cluster's agent prompt against the current HEAD.
+The initial pass was generated against the commit at the tip of `main` on 2026-04-14. Phase 7.5 (orchestration layer) updates were folded in on 2026-04-15 against branch `feature/phase-7-5-orchestration` at commits `d35e3a5` / `9a0d0d6`. Regenerate any cluster by re-running that cluster's agent prompt against the current HEAD.
 
 ## Ground rules for reading
 

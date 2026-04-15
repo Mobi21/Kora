@@ -1,8 +1,8 @@
 # Runtime Core — Architecture Cluster
 
-This cluster documents the four subsystems that form Kora's runtime core: the dependency injection and shared utilities (`core/`), the FastAPI daemon process (`daemon/`), the turn execution and inspection layer (`runtime/`), and the LangGraph conversation graph (`graph/`).
+This cluster documents the five subsystems that form Kora's runtime core: the dependency injection and shared utilities (`core/`), the FastAPI daemon process (`daemon/`), the turn execution and inspection layer (`runtime/`), the orchestration engine that owns every background and autonomous job (`runtime/orchestration/`), and the LangGraph conversation graph (`graph/`).
 
-All documentation is derived from live source. File and line references are accurate as of commit `cb1fe83`.
+All documentation is derived from live source. File and line references are accurate as of commit `9a0d0d6` on branch `feature/phase-7-5-orchestration` — the slice that replaced `BackgroundWorker` with the `OrchestrationEngine`.
 
 ---
 
@@ -10,24 +10,30 @@ All documentation is derived from live source. File and line references are accu
 
 ```
 kora_v2/
-├── core/        → Shared infrastructure: DI, settings, DB schema, events, models, logging
-├── daemon/      → Long-running process: HTTP/WS server, launcher, lockfile, auth, sessions
-├── runtime/     → Turn execution contract: GraphTurnRunner, inspector, protocol, stores
-└── graph/       → LangGraph graph: 5 nodes, tool dispatch, state, reducers, prompts
+├── core/                      → Shared infrastructure: DI, settings, DB schema, events, models, logging
+├── daemon/                    → Long-running process: HTTP/WS server, launcher, lockfile, auth, sessions
+├── runtime/                   → Turn execution contract: GraphTurnRunner, inspector, protocol, stores
+├── runtime/orchestration/     → OrchestrationEngine, WorkerTasks, Pipelines, Dispatcher, SystemState,
+│                                RequestLimiter, NotificationGate, WorkingDocStore (Phase 7.5)
+└── graph/                     → LangGraph graph: 5 nodes, tool dispatch, state, reducers, prompts
 ```
 
 ### Dependency Direction
 
 ```
-daemon/ ──uses──► graph/
-daemon/ ──uses──► runtime/
-graph/  ──uses──► runtime/ (stores, protocol)
-daemon/ ──uses──► core/
-graph/  ──uses──► core/ (errors, models, exceptions)
-runtime/ ─uses──► core/ (settings, db)
+daemon/                  ──uses──► graph/
+daemon/                  ──uses──► runtime/
+daemon/                  ──uses──► runtime/orchestration/  (constructs + starts + stops the engine)
+graph/                   ──uses──► runtime/                (stores, protocol)
+graph/                   ──uses──► runtime/orchestration/  (supervisor tools dispatch pipelines,
+                                                            list_tasks reads the task registry)
+runtime/orchestration/   ──uses──► core/                   (events, db, settings)
+daemon/                  ──uses──► core/
+graph/                   ──uses──► core/                   (errors, models, exceptions)
+runtime/                 ──uses──► core/                   (settings, db)
 ```
 
-All four subsystems depend on `core/`. `daemon/` is the only subsystem that sees the other three.
+All subsystems depend on `core/`. `daemon/` is the only subsystem that sees the others directly — it constructs the `OrchestrationEngine` in `run_server()` before `create_app()` and is responsible for starting and stopping it. `graph/` talks to the engine through `OrchestrationEngine`'s public methods only; there is no shared mutable state.
 
 ---
 
@@ -36,8 +42,9 @@ All four subsystems depend on `core/`. `daemon/` is the only subsystem that sees
 | File | Covers |
 |------|--------|
 | `core.md` | `kora_v2/core/` — DI container, settings, DB schema, events, models, logging, errors |
-| `daemon.md` | `kora_v2/daemon/` — launcher, FastAPI server, lockfile, auth relay, session manager, worker |
+| `daemon.md` | `kora_v2/daemon/` — launcher, FastAPI server, lockfile, auth relay, session manager, orchestration engine lifecycle |
 | `runtime.md` | `kora_v2/runtime/` — turn runner, checkpointer, inspector, protocol, stores, CLI |
+| `orchestration.md` | `kora_v2/runtime/orchestration/` — engine, worker tasks, pipelines, dispatcher, system state, request limiter, notification gate, working docs (Phase 7.5) |
 | `graph.md` | `kora_v2/graph/` — supervisor graph, dispatch, state, reducers, prompts, capability bridge |
 
 ---
@@ -153,14 +160,17 @@ kora (CLI)
             └─ _run_daemon()
                  ├─ Container.initialize_phase1() ... initialize_phase5()
                  ├─ build_supervisor_graph(container) → compiled graph
-                 ├─ create_app(container, token)
-                 │    ├─ BackgroundWorker: start bg_safe_loop + bg_idle_loop
-                 │    └─ EventEmitter subscriptions (SESSION_START/END)
-                 └─ run_server(container, token)
+                 └─ run_server(container)
+                      ├─ container.initialize_orchestration() → engine built
+                      ├─ register_core_pipelines(engine) → 20 pipelines declared
+                      ├─ create_app(container)
+                      │    └─ EventEmitter subscriptions (SESSION_START/END, NOTIFICATION_SENT)
+                      ├─ engine.start() → dispatcher + trigger evaluator running
                       ├─ server.startup() → binds port=0
                       ├─ lockfile.update(state=READY, port=actual_port)
                       ├─ server.main_loop() ← serving requests
-                      └─ server.shutdown()
+                      ├─ server.shutdown()
+                      └─ engine.stop(graceful=True) → paused RUNNING tasks, pool closed
 
 launcher polls wait_for_ready(90s)
   └─ GET /health → DaemonState.READY
@@ -183,22 +193,18 @@ The `frozen_prefix` field is cached in the checkpoint — it is only rebuilt on 
 
 ## Background Work
 
-`BackgroundWorker` (`daemon/worker.py`) runs two asyncio tasks:
+Phase 7.5 replaced the two-tier `BackgroundWorker` with the `OrchestrationEngine` (`runtime/orchestration/engine.py`). A single dispatcher loop owns every background and autonomous job: memory consolidation, signal scanning, session-bridge pruning, skill refinement, proactive area scans, morning briefings, and user autonomous tasks.
 
-| Task | Tier | Active when |
-|------|------|-------------|
-| `bg_safe_loop` | safe | Always (including mid-conversation) |
-| `bg_idle_loop` | idle | Only when no session is active |
+Instead of tier-based cooldowns, each job is a declarative `Pipeline` with explicit triggers (8 kinds: `INTERVAL`, `EVENT`, `CONDITION`, `TIME_OF_DAY`, `SEQUENCE_COMPLETE`, `USER_ACTION`, `ANY_OF`, `ALL_OF`). The dispatcher:
 
-Registered tasks and their cooldowns:
+1. Classifies the current `SystemStatePhase` (7 values: `CONVERSATION`, `ACTIVE_IDLE`, `LIGHT_IDLE`, `DEEP_IDLE`, `WAKE_UP_WINDOW`, `DND`, `SLEEPING`).
+2. Evaluates every trigger; any pipeline whose predicate fires in the current phase is eligible.
+3. Picks the highest-priority eligible pipeline that fits within the `RequestLimiter`'s 5-hour window (4500-request cap, 300 reserved for `CONVERSATION`, 100 reserved for `NOTIFICATION`).
+4. Dispatches one `WorkerTask` per tick using one of three presets: `IN_TURN` (300s hard cap, conversation-class budget), `BOUNDED_BACKGROUND` (1800s, idle-only, background class), `LONG_BACKGROUND` (unbounded, pauses on conversation, pauses on topic overlap).
 
-| Task | Tier | Cooldown |
-|------|------|----------|
-| `memory_consolidation` | idle | 600s |
-| `signal_scanner` | safe | 120s |
-| `autonomous_update_delivery` | safe | 30s |
-| `session_bridge_pruning` | idle | 3600s |
-| `skill_refinement` | idle | 86400s |
+The 20 core pipelines are declared in `runtime/orchestration/core_pipelines.py`. Two have real step functions in Slice 7.5b — `session_bridge_pruning` (replaces the old idle task, `interval(3600s, deep_idle)`) and `skill_refinement` (replaces the old idle task, `time_of_day(3:00)`). The `user_autonomous_task` pipeline wraps the 12-node autonomous graph through a factory-built step function. The remaining 17 pipelines have stub steps that Phase 8 will flesh out.
+
+See [orchestration.md](orchestration.md) for the full treatment (WorkerTask FSM, pipeline validation, dispatcher fairness, request limiter rules, notification gate, working docs).
 
 ---
 
