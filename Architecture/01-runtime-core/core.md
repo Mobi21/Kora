@@ -158,7 +158,7 @@ Manages `data/operational.db` — the runtime database for everything that is no
 | `sessions` | One row per session: start/end time, turn count, emotional states |
 | `quality_metrics` | Per-turn numeric quality measurements |
 | `quality_evaluations` | LLM-graded quality evaluations (sampled at 10%) |
-| `autonomous_checkpoints` | Serialised checkpoint state for autonomous execution loops |
+| `autonomous_checkpoints` | **Legacy.** Serialised checkpoint state for the retired `AutonomousExecutionLoop`. Slice 7.5b replaced it with `worker_tasks` + `pipeline_instances` in the orchestration DB; rows are migrated by `autonomous_migration.py` on first engine boot and kept for back-compat only. See [orchestration.md](orchestration.md#preservation-contract-177). |
 | `notifications` | Delivered notifications with acknowledgment tracking |
 | `notification_engagement` | Per-category engagement stats for DND optimisation |
 | `telemetry` | Per-turn: tokens, latency, tool calls, quality gate result |
@@ -182,6 +182,8 @@ Manages `data/operational.db` — the runtime database for everything that is no
 | `calendar_entries` | Unified timeline (events, meds, focus blocks, reminders, deadlines) |
 | `finance_log` | Financial entries with impulse flag |
 | `energy_log` | Energy/focus check-in records |
+
+**Orchestration tables (Phase 7.5).** Eight additional tables live in the same `operational.db` but are created by a separate migration runner in `kora_v2/runtime/orchestration/migrations/001_orchestration.sql`: `pipeline_instances`, `worker_tasks` (with a `checkpoint_blob` column, not a separate table), `work_ledger`, `trigger_state`, `request_limiter_log`, `system_state_log`, `open_decisions`, `runtime_pipelines`. A companion migration `002_notifications_templates.sql` adds the two-tier columns (`tier`, `severity`, `bypass_dnd`, `template_id`, `delivered_channel`) to the existing `notifications` table. Full schema is documented in [orchestration.md § Database tables](orchestration.md#database-tables).
 
 **Additive column migration pattern** [`db.py:497`](../../kora_v2/core/db.py#L497)
 - `_ensure_columns(db, table, migrations)` reads `PRAGMA table_info(table)`, skips already-existing columns, runs `ALTER TABLE ADD COLUMN` for new ones
@@ -218,12 +220,22 @@ A lightweight in-process pub/sub bus. One instance lives on the container (`cont
 |---|---|
 | `SESSION_START / SESSION_END` | Session lifecycle |
 | `TURN_START / TURN_END` | Turn lifecycle |
-| `WORKER_DISPATCHED / WORKER_COMPLETED / WORKER_FAILED` | Worker harness lifecycle |
+| `WORKER_DISPATCHED / WORKER_COMPLETED / WORKER_FAILED` | Worker harness lifecycle (in-turn dispatch from the supervisor graph) |
 | `TOOL_CALLED / TOOL_RESULT` | Tool execution |
-| `MEMORY_STORED` | Memory write pipeline |
+| `MEMORY_STORED / MEMORY_SOFT_DELETED / ENTITY_MERGED` | Memory write pipeline + projection layer |
+| `EMOTION_STATE_ASSESSED / EMOTION_SHIFT_DETECTED` | Two-tier emotion assessor (fast + LLM) |
 | `QUALITY_GATE_RESULT` | Quality collector output |
 | `NOTIFICATION_SENT` | Notification delivery (triggers WS broadcast) |
-| `AUTONOMOUS_CHECKPOINT / AUTONOMOUS_COMPLETE / AUTONOMOUS_FAILED` | Autonomous loop milestones |
+| `AUTONOMOUS_CHECKPOINT / AUTONOMOUS_COMPLETE / AUTONOMOUS_FAILED` | Legacy autonomous loop events — still emitted for back-compat from the `user_autonomous_task` step function |
+| `TASK_CHECKPOINTED / TASK_COMPLETED / TASK_FAILED` | **Phase 7.5.** Fired by the orchestration dispatcher whenever a `WorkerTask` transitions to a terminal or checkpoint state |
+| `PIPELINE_COMPLETE` | **Phase 7.5.** Fired when a `PipelineInstance` finishes its final stage |
+| `INSIGHT_AVAILABLE` | **Phase 7.5.** Emitted by pattern scan / memory signal scanner to wake `proactive_pattern_scan` triggers |
+| `SYSTEM_STATE_CHANGED` | **Phase 7.5.** Fired by `SystemStatePhaseMonitor` on phase transitions |
+| `RATE_LIMIT_APPROACHING` | **Phase 7.5.** `RequestLimiter` warning when the 5h window approaches the cap |
+| `OPEN_DECISION_POSED` | **Phase 7.5.** Fired by `OpenDecisionsTracker` when a task parks itself in `PAUSED_FOR_DECISION` |
+| `TASK_LINGERING` | **Phase 7.5.** Contextual-engagement trigger when a task has been open past its soft deadline |
+| `LONG_FOCUS_BLOCK_ENDED` | **Phase 7.5.** Contextual-engagement trigger when a focus block longer than N minutes wraps |
+| `USER_STATED_INTENT / USER_STATED_NEED` | **Phase 7.5.** Fired by the supervisor graph when a message matches intent/need detectors; feeds `follow_through_draft` and `draft_on_observation` pipelines |
 | `ERROR_OCCURRED` | General error reporting |
 
 **`EventEmitter.emit(event_type, **data)`** [`events.py:100`](../../kora_v2/core/events.py#L100)

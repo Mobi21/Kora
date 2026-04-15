@@ -1,6 +1,6 @@
 # Kora — Top-Level Architecture
 
-Kora is a **local-first, ADHD-aware AI companion** that runs as a long-lived daemon on your machine. It remembers everything in a filesystem canonical store, orchestrates LLM-backed workers through a LangGraph supervisor, and proactively supports the user through a dedicated life/ADHD engine. Everything local: the memory, the projection DB, the emotion state, the tools. The only network calls are to the configured LLM provider (MiniMax by default, via an Anthropic-compatible endpoint) and optionally Claude Code for code delegation.
+Kora is a **local-first, ADHD-aware AI companion** that runs as a long-lived daemon on your machine. It remembers everything in a filesystem canonical store, orchestrates LLM-backed workers through a LangGraph supervisor, runs every background and autonomous job through a single unified `OrchestrationEngine` (Phase 7.5), and proactively supports the user through a dedicated life/ADHD engine. Everything local: the memory, the projection DB, the emotion state, the tools. The only network calls are to the configured LLM provider (MiniMax by default, via an Anthropic-compatible endpoint) and optionally Claude Code for code delegation.
 
 This document gives you the full mental model in one read. The [cluster docs](README.md) are where you go when you need depth on any single subsystem.
 
@@ -55,6 +55,32 @@ This document gives you the full mental model in one read. The [cluster docs](RE
                             │ MiniMax (anthropic SDK) │
                             │ Claude Code subprocess  │
                             └──────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│       ORCHESTRATION ENGINE  (Phase 7.5 — single unified scheduler)   │
+│            kora_v2/runtime/orchestration/  (cluster 01)              │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────────┐  │
+│  │ WorkerTasks  │  │  Pipelines   │  │ Dispatcher (single loop)   │  │
+│  │ 11-state FSM │  │ 20 core DAGs │  │ ready set → phase filter → │  │
+│  │ 3 presets    │  │ 8 triggers   │  │ priority sort → step_fn    │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬─────────────────┘  │
+│         │                 │                     │                   │
+│         ▼                 ▼                     ▼                   │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────────┐  │
+│  │SystemState   │  │RequestLimiter│  │  NotificationGate          │  │
+│  │ 7 phases     │  │ 5h/4500 cap  │  │  two-tier, hyperfocus      │  │
+│  │ DST-safe tz  │  │ conv reserve │  │  DND bypass, templates     │  │
+│  └──────────────┘  └──────────────┘  └────────────────────────────┘  │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────────┐  │
+│  │WorkingDocStore│  │OpenDecisions│  │ WorkLedger (audit trail)   │  │
+│  │_KoraMemory/   │  │ tracker     │  │  every transition, persist │  │
+│  │Inbox/*.md     │  │ SQL-backed  │  │  to work_ledger rows       │  │
+│  └──────────────┘  └──────────────┘  └────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+              ▲                                ▲
+              │ dispatches from supervisor     │ drives scheduled
+              │ (decompose_and_dispatch tool)  │ pipelines + autonomous
+              └─────────── graph/ ────────── life/ / autonomous/ ─────
 ```
 
 Every box above maps to a real folder. Every folder is documented in depth in its cluster.
@@ -79,7 +105,7 @@ A pass through the whole system on one user message:
 6. `ContextBudgetMonitor` tracks the running token count. If the conversation breaches the compaction threshold, the 4-stage compaction pipeline runs (mask observations → structured LLM summary → UPDATE merge → heuristic hard-stop bridge). A **circuit breaker** caps this at 3 compactions per session. See [context.md](02-memory-context/context.md).
 7. Any new facts the user stated are routed by the memory `WritePipeline` through a dedup check into the filesystem canonical store. The projection DB is updated incrementally (FTS5 + vec0 rows). See [memory.md](02-memory-context/memory.md).
 8. The ADHD + life engine observes the turn ambiently — `ContextEngine` will read the updated DB on the next turn to compute the next `DayContext`. No explicit hook fires; the state propagates through shared SQLite tables. See [05-life-adhd](05-life-adhd/README.md).
-9. Background workers run in their own tiered cooldowns (memory consolidation, emotion decay, proactive surfacing). See `BackgroundWorker` in [daemon.md](01-runtime-core/daemon.md).
+9. Every background and autonomous job runs inside the `OrchestrationEngine` — the Phase 7.5 layer that replaced `BackgroundWorker`. Memory housekeeping, proactive scans, session-bridge pruning, skill refinement, the autonomous 12-node graph, and ad-hoc in-turn sub-agents are all `WorkerTask` dispatches scheduled by a single `Dispatcher` loop under a 7-phase `SystemState` gate, a 5-hour sliding `RequestLimiter`, and a two-tier `NotificationGate`. See [orchestration.md](01-runtime-core/orchestration.md).
 
 ---
 
@@ -104,8 +130,8 @@ Routines are **stateful sessions**, not checklists. `RoutineManager` tracks part
 - Some skills (`obsidian_vault`, `screen_control`) are empty guidance containers with zero tools.
 - `DoctorCapability` is a registered stub — shows up in health checks as `UNIMPLEMENTED`. Details in [capabilities.md](03-agents-autonomous/capabilities.md) and [skills.md](03-agents-autonomous/skills.md).
 
-### 4. Autonomous execution has its own checkpoint format
-Multi-step autonomous plans run through a **separate 12-node graph** in `kora_v2/autonomous/graph.py`, parallel to (not reusing) the runtime LangGraph checkpointer. Checkpoints serialize as JSON into the `plan_json` column of `autonomous_checkpoints` in `operational.db`. There's **no `session_id` column** in that table — session filtering is done in Python at query time, a known schema limitation. Details in [autonomous.md](03-agents-autonomous/autonomous.md).
+### 4. Autonomous execution runs through the orchestration layer
+Multi-step autonomous plans are dispatched as a single `user_autonomous_task` pipeline instance. The engine hands off one `LONG_BACKGROUND` `WorkerTask` whose step function internally walks the 12-node state machine from `kora_v2/autonomous/graph.py`, persisting `AutonomousState` in the task's `checkpoint_blob.scratch_state` between dispatcher ticks. The acyclic pipeline stage list mirrors the 12-node sequence for parity tests, but the real cycles (`execute_step → review_step → reflect → replan`) live inside the step function. Spec §17.7 pins a 10-row **preservation contract** (`tests/integration/orchestration/test_preservation_contract.py`) so the migration must keep: the 14-value status enum, overlap pause at 0.70, 5-axis budget enforcement, the reflect heuristic (avg confidence <0.35 → replan), the same-node watchdog (5 repeats → failed), and more. A one-shot idempotent migration moves in-flight rows from the legacy `autonomous_checkpoints` table into `worker_tasks` + `pipeline_instances` on engine start. Details in [autonomous.md](03-agents-autonomous/autonomous.md) and [orchestration.md](01-runtime-core/orchestration.md).
 
 ### 5. Executor has a deterministic fast path
 For exact task names `write_file` / `create_directory` with valid params, the executor **bypasses the LLM entirely** and does the filesystem operation directly in Python, then verifies the file exists on disk before claiming success. Details in [workers.md](03-agents-autonomous/workers.md).
@@ -134,8 +160,18 @@ The SQLite checkpointer stores state after every supervisor graph node, not once
 | Store | Path | Role | Schema lives in |
 |-------|------|------|-----------------|
 | Canonical memory | `_KoraMemory/**/*.md` | Source of truth for user memory | Filesystem (markdown) |
+| Working docs | `_KoraMemory/Inbox/*.md` | Per-pipeline-instance working doc; YAML frontmatter, section-parsed, atomic temp+rename writes | `runtime/orchestration/working_doc.py` |
 | Projection DB | `data/operational.db` tables `memory_*` | Fast retrieval index | `memory.projection_db` |
-| Operational DB | `data/operational.db` (27 tables) | Life domain, routines, calendars, logs, budgets, autonomous checkpoints | `core/db.py` |
+| Operational DB | `data/operational.db` (27+ tables) | Life domain, routines, calendars, logs, budgets, legacy `autonomous_checkpoints` | `core/db.py` |
+| Pipeline instances | `data/operational.db` `pipeline_instances` | Pipeline runs (active + historical) | `runtime/orchestration/migrations/001_orchestration.sql` |
+| Worker tasks | `data/operational.db` `worker_tasks` | 11-state FSM rows, `checkpoint_blob` JSON column for durable resume | `runtime/orchestration/migrations/001_orchestration.sql` |
+| Work ledger | `data/operational.db` `work_ledger` | Append-only audit trail for every task/pipeline transition | `runtime/orchestration/migrations/001_orchestration.sql` |
+| Trigger state | `data/operational.db` `trigger_state` | Persistent last-fire / next-eligible timestamps per trigger | `runtime/orchestration/migrations/001_orchestration.sql` |
+| Request limiter log | `data/operational.db` `request_limiter_log` | 5-hour sliding window rows replayed on engine start | `runtime/orchestration/migrations/001_orchestration.sql` |
+| System state log | `data/operational.db` `system_state_log` | Phase-transition audit, written on every change | `runtime/orchestration/migrations/001_orchestration.sql` |
+| Open decisions | `data/operational.db` `open_decisions` | User-posed decisions awaiting resolution | `runtime/orchestration/migrations/001_orchestration.sql` |
+| Runtime pipelines | `data/operational.db` `runtime_pipelines` | User-created pipelines from `decompose_and_dispatch` (declaration JSON) | `runtime/orchestration/migrations/001_orchestration.sql` |
+| Notifications | `data/operational.db` `notifications` | Two-tier delivery log (`delivery_tier`, `template_id`, `template_vars`, `reason`) | `core/db.py` + `002_notifications_templates.sql` |
 | Checkpointer DB | per-session SQLite | LangGraph state after every node | `runtime/checkpointer.py` |
 | Session bridge | `data/sessions/<id>.yaml + .sidecar.json` | Session config + live state | `daemon/session_bridge.py` |
 | Lockfile | per-user OS lock path | Daemon port discovery, zombie detection | `daemon/lockfile.py` |
@@ -152,18 +188,23 @@ The SQLite checkpointer stores state after every supervisor graph node, not once
 5. **All filesystem tool calls go through a path-safety check.** No tool can escape the project and memory roots. See [tools.md](02-memory-context/tools.md).
 6. **Observations are masked before LLM compaction.** Compaction stage 1 strips raw tool observations to prevent the summary step from faithfully parroting sensitive content. See [context.md](02-memory-context/context.md).
 7. **Turn tracing is best-effort.** Trace writes never block a turn. If the tracer fails, the turn still completes. See [runtime.md](01-runtime-core/runtime.md).
+8. **Every background/autonomous request goes through the `RequestLimiter`.** A 5-hour sliding window with a 4500 absolute cap, a 300-request conversation reserve, and a 100-request notification reserve. Conversation traffic never fails; background tasks refuse dispatch when the remaining budget would eat either reserve. Rows persist in `request_limiter_log` and replay on engine start. See [orchestration.md](01-runtime-core/orchestration.md).
+9. **Notifications go through a single `NotificationGate`.** Two tiers (templated / llm), hyperfocus suppression is unoverridable, DND is bypassable only via templated entries with `bypass_dnd=True`, and templates hot-reload from `_KoraMemory/.kora/templates/`. See [adhd.md](05-life-adhd/adhd.md).
+10. **Pipelines are acyclic; cycles live inside step functions.** `Pipeline.validate()` runs Tarjan SCC on the stage DAG and raises on any cycle. The 12-node autonomous graph keeps its cycles inside the single `user_autonomous_task` step function. See [orchestration.md](01-runtime-core/orchestration.md).
 
 ---
 
 ## Where to read next
 
 - If you want to **understand a turn end-to-end**: [`01-runtime-core/README.md`](01-runtime-core/README.md) then [`graph.md`](01-runtime-core/graph.md).
+- If you want to **understand how Kora schedules background work**: [`01-runtime-core/orchestration.md`](01-runtime-core/orchestration.md).
 - If you want to **understand how Kora remembers**: [`02-memory-context/README.md`](02-memory-context/README.md) then [`memory.md`](02-memory-context/memory.md).
 - If you want to **understand what Kora can *do***: [`03-agents-autonomous/README.md`](03-agents-autonomous/README.md) then [`capabilities.md`](03-agents-autonomous/capabilities.md).
+- If you want to **understand autonomous execution**: [`03-agents-autonomous/autonomous.md`](03-agents-autonomous/autonomous.md).
 - If you want to **understand why Kora is ADHD-aware**: [`05-life-adhd/README.md`](05-life-adhd/README.md) then [`adhd.md`](05-life-adhd/adhd.md).
 - If you want to **plug in a new LLM**: [`04-conversation-llm/llm.md`](04-conversation-llm/llm.md).
 - If you want to **debug a turn**: [`01-runtime-core/runtime.md`](01-runtime-core/runtime.md) → `RuntimeInspector` section.
 
 ---
 
-*Generated from live `kora_v2/` source on 2026-04-14. When the atlas disagrees with CLAUDE.md or `Documentation/`, the atlas is right — it was read from code.*
+*Generated from live `kora_v2/` source on 2026-04-15 (branch `feature/phase-7-5-orchestration`, commits d35e3a5 / 9a0d0d6). Phase 7.5 shipped the `OrchestrationEngine` and retired `BackgroundWorker`, the `start_autonomous` supervisor tool, and the standalone `AutonomousExecutionLoop`. When the atlas disagrees with CLAUDE.md or `Documentation/`, the atlas is right — it was read from code.*

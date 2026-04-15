@@ -363,3 +363,34 @@ Scans `stdout + stderr` (lowercased) for keywords:
   from `MINIMAX_API_KEY` env var or `.env`/`.env.local` files.
 - **Context budget** (`kora_v2/context/budget.py`): `count_tokens` and
   `count_messages_tokens` are imported by `minimax.py` for pre-call safety.
+
+---
+
+## Phase 7.5: every non-conversation LLM call is rate-limited
+
+Every non-conversation call into `LLMProviderBase` now passes through the
+`RequestLimiter` (`kora_v2/runtime/orchestration/request_limiter.py`). The
+limiter enforces a single 5-hour sliding window with a 4 500-request cap and
+two reserves:
+
+| Class | Reserve | Reached when |
+|---|---|---|
+| `CONVERSATION` | 300 slots | Supervisor graph turn, reflection, in-turn worker dispatch |
+| `NOTIFICATION` | 100 slots | Templated or LLM-softened notifications through the `NotificationGate` |
+| `BACKGROUND` | 4 100 slots (remaining) | Every autonomous worker tick, memory consolidation, signal scan, skill refinement, proactive scans, morning briefings |
+
+The `CONVERSATION` reserve is always honoured: a conversation-class request
+never fails on rate limit because the limiter keeps those 300 slots
+inaccessible to the `BACKGROUND` and `NOTIFICATION` classes. When the window
+is full for a background class, the dispatcher pauses the requesting
+`WorkerTask` into `PAUSED_FOR_RATE_LIMIT` with a `resume_at` timestamp rather
+than failing the call — the LLM provider itself never sees a 429.
+
+The limiter is a pre-call check, not an Anthropic client wrapper. Providers
+stay ignorant of it: the orchestration engine calls
+`request_limiter.reserve(request_class)` before handing a tick to a step
+function, and releases the reservation when the step finishes. See
+[`../01-runtime-core/orchestration.md`](../01-runtime-core/orchestration.md)
+for the full reservation / release lifecycle and the `SystemState` phase
+gates that further restrict when `BACKGROUND` classes can even attempt a
+reservation.

@@ -4,6 +4,8 @@
 
 The runtime layer sits between the daemon (which owns the HTTP surface and session lifecycle) and the supervisor graph (which owns LLM reasoning). It provides the execution contract for every conversation turn, durable conversation state persistence, and a structured control-plane interface for operator visibility — all without requiring LLM access.
 
+Phase 7.5b added `kora_v2/runtime/orchestration/` alongside the existing runtime modules. That subpackage owns the `OrchestrationEngine` and the 20 core pipelines that replace the deleted `BackgroundWorker`; it is documented separately in [orchestration.md](orchestration.md) and is intentionally isolated from `turn_runner.py` / `inspector.py` so the turn-execution contract stays LLM-free.
+
 ---
 
 ## Files
@@ -158,7 +160,7 @@ The doctor method runs checks in sequence and accumulates a `checks` list:
 | `session_persist` | `SessionManager` source references `SessionStore` and `BridgeStore` |
 | `turn_traces` | `turn_traces` table present in `operational.db` |
 | `permission_persist` | `permission_grants` table present |
-| `no_start_autonomous` | `start_autonomous` attribute absent from `server` module |
+| `no_start_autonomous` | `start_autonomous` attribute absent from `server` module (retired in Slice 7.5a; replaced by `decompose_and_dispatch` — see [orchestration.md](orchestration.md) and [graph.md](graph.md)) |
 | `typed_workers` | `ExecutorWorkerHarness` and `ReviewerWorkerHarness` lack plain-text fallback patterns |
 | `ws_turn_runner` | `_handle_chat()` source references `GraphTurnRunner` or `stream_turn` |
 | `sqlite_checkpointer` | Doctor's `sqlite_checkpointer` check passes |
@@ -242,6 +244,8 @@ class AutonomousUpdateStore:
 ```
 
 `update_type` values: `'checkpoint'` (mid-plan progress) or `'completion'` (plan finished). The `_unread_autonomous_updates` field in `SupervisorState` is populated from undelivered rows and injected into the dynamic suffix by `build_suffix` so the supervisor can proactively surface background progress to the user.
+
+As of Slice 7.5b the `autonomous_updates` table is a legacy surface: writes still happen for back-compat so older CLI clients keep receiving checkpoint summaries, but the canonical source of truth for in-flight work is now the orchestration engine's `worker_tasks` + `pipeline_instances` pair. The dispatcher emits `TASK_CHECKPOINTED` / `TASK_COMPLETED` / `PIPELINE_COMPLETE` events, and the supervisor's `list_tasks()` tool (documented in [graph.md](graph.md)) reads from those tables directly. See [orchestration.md](orchestration.md#the-20-core-pipelines) for the `user_autonomous_task` pipeline that replaced the legacy loop.
 
 Both stores are defensive against schema lag: `"no such table"` and `"no such column"` errors are caught and logged as `WARNING`, not raised. Any other exception propagates.
 

@@ -11,7 +11,7 @@ These subsystems are distinct from the LangGraph supervisor graph (documented se
 | Subsystem | Path | Files |
 |---|---|---|
 | Worker harnesses | `kora_v2/agents/workers/` | 3 py + `__init__` |
-| Autonomous execution | `kora_v2/autonomous/` | 7 py + `__init__` |
+| Autonomous execution | `kora_v2/autonomous/` | 6 py + `__init__` (2 are one-line shims re-exporting from `runtime/orchestration/`) |
 | Capabilities | `kora_v2/capabilities/` | 24 py files across 4 packs |
 | Skills | `kora_v2/skills/` | 1 py loader + 14 YAML definitions |
 | Routing | `kora_v2/routing/` | Empty directory (no code) |
@@ -34,7 +34,9 @@ These three terms appear throughout the codebase and mean distinct things:
 
 A **single-turn worker dispatch** happens when the supervisor graph routes to a worker (planner/executor/reviewer) during the main conversation turn. The worker runs, returns its output, and control returns to the supervisor within the same turn. This uses `container.resolve_worker(name)`.
 
-**Autonomous multi-step execution** is a completely separate runtime: an `AutonomousExecutionLoop` spawned as a background asyncio task. It runs a 12-node graph (`classify → plan → persist_plan → execute_step → review_step → checkpoint → reflect → [continue | replan | decision_request | paused_for_overlap] → complete | failed`) independently of the main conversation thread. It has its own checkpoint format written to `operational.db`, its own budget enforcer, and its own decision manager. The foreground conversation can interrupt it via `request_interruption()` or communicate an updated overlap score via `set_overlap_score()`.
+**Autonomous multi-step execution** is the same 12-node state machine (`classify → plan → persist_plan → execute_step → review_step → checkpoint → reflect → [continue | replan | decision_request | paused_for_overlap] → complete | failed`), but as of Phase 7.5c it no longer runs in its own background loop. The standalone `AutonomousExecutionLoop` has been deleted. Instead, the nodes run **inside a single `LONG_BACKGROUND` `WorkerTask`** dispatched by the `OrchestrationEngine` (see [`../01-runtime-core/orchestration.md`](../01-runtime-core/orchestration.md)). The supervisor tool `decompose_and_dispatch` creates one `WorkerTask` per autonomous plan; the engine's dispatcher ticks the task through the 12 nodes via a step function built in `kora_v2/autonomous/pipeline_factory.py`.
+
+Budget, decisions, and overlap coordination moved with the nodes: `AutonomousBudgetEnforcer` now lives at `runtime/orchestration/autonomous_budget.py`, `OpenDecisionsTracker` replaces `DecisionManager` (with a compatibility shim at `autonomous/decisions.py`), and topic-overlap feedback flows through `SystemState` rather than a direct method call. The foreground supervisor can still pause an autonomous task via `cancel_task` / `modify_task` supervisor tools; the dispatcher reads those signals and transitions the `WorkerTask` FSM accordingly.
 
 ---
 
@@ -63,7 +65,7 @@ Skills are consulted by the supervisor when building the tool list for the LLM.
 - [`workers.md`](workers.md) — full per-worker documentation
 
 ### `kora_v2/autonomous/`
-- [`autonomous.md`](autonomous.md) — plan lifecycle, checkpoint format, budget enforcement, routing
+- [`autonomous.md`](autonomous.md) — the 12-node state machine, its pipeline wrapper, step function, budget, decisions, topic-overlap flow, and the legacy `autonomous_checkpoints` → `worker_tasks` migration
 
 ### `kora_v2/capabilities/`
 - [`capabilities.md`](capabilities.md) — capability abstraction, registry, all four packs
