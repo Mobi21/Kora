@@ -37,6 +37,12 @@ LOG_FILE = OUTPUT_DIR / "test_log.jsonl"
 LOCKFILE = PROJECT_ROOT / "data" / "kora.lock"
 TOKEN_FILE = PROJECT_ROOT / "data" / ".api_token"
 
+# Allowlist of table names that ``_q_lifecycle_table`` may interpolate
+# into its SQL. This exists as a defence-in-depth guard so future
+# maintainers cannot accidentally extend the f-string interpolation in
+# that helper to an attacker-controlled name.
+_ALLOWED_LIFECYCLE_TABLES = frozenset({"memories", "user_model_facts"})
+
 
 def _ensure_dirs() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -700,39 +706,56 @@ class HarnessServer:
             async with aiosqlite.connect(str(op_db)) as db:
                 db.row_factory = aiosqlite.Row
 
-                # Active + recent autonomous plans
-                cursor = await db.execute(
-                    """SELECT id, goal, status,
-                              COALESCE(request_count, 0) AS request_count,
-                              COALESCE(token_estimate, 0) AS token_estimate,
-                              COALESCE(cost_estimate, 0.0) AS cost_estimate,
-                              created_at,
-                              COALESCE(updated_at, completed_at) AS updated_at
-                       FROM autonomous_plans
-                       ORDER BY created_at DESC LIMIT 10"""
-                )
-                plans = [dict(r) for r in await cursor.fetchall()]
+                # Per-table try/except matches the new methods' contract —
+                # a missing deprecated table records ``{"error":
+                # "table_missing"}`` rather than aborting the snapshot.
 
-                # Items by status
-                cursor = await db.execute(
-                    "SELECT status, COUNT(*) as cnt FROM items GROUP BY status"
-                )
-                items_by_status = {r["status"]: r["cnt"] for r in await cursor.fetchall()}
+                # autonomous_plans
+                plans: list[dict[str, Any]] = []
+                plans_error: str | None = None
+                try:
+                    cursor = await db.execute(
+                        """SELECT id, goal, status,
+                                  COALESCE(request_count, 0) AS request_count,
+                                  COALESCE(token_estimate, 0) AS token_estimate,
+                                  COALESCE(cost_estimate, 0.0) AS cost_estimate,
+                                  created_at,
+                                  COALESCE(updated_at, completed_at) AS updated_at
+                           FROM autonomous_plans
+                           ORDER BY created_at DESC LIMIT 10"""
+                    )
+                    plans = [dict(r) for r in await cursor.fetchall()]
+                except Exception:
+                    plans_error = "table_missing"
 
-                # Total item count
-                cursor = await db.execute("SELECT COUNT(*) FROM items")
-                row = await cursor.fetchone()
-                total_items = row[0] if row else 0
+                # items
+                items_by_status: dict[str, int] = {}
+                total_items = 0
+                recent_items: list[dict[str, Any]] = []
+                items_error: str | None = None
+                try:
+                    cursor = await db.execute(
+                        "SELECT status, COUNT(*) as cnt FROM items GROUP BY status"
+                    )
+                    items_by_status = {
+                        r["status"]: r["cnt"] for r in await cursor.fetchall()
+                    }
 
-                # Recent items (last 10 created)
-                cursor = await db.execute(
-                    """SELECT id, title AS content, status, owner, spawned_from, created_at
-                       FROM items ORDER BY created_at DESC LIMIT 10"""
-                )
-                recent_items = [dict(r) for r in await cursor.fetchall()]
+                    cursor = await db.execute("SELECT COUNT(*) FROM items")
+                    row = await cursor.fetchone()
+                    total_items = row[0] if row else 0
 
-                # Checkpoint count
+                    cursor = await db.execute(
+                        """SELECT id, title AS content, status, owner, spawned_from, created_at
+                           FROM items ORDER BY created_at DESC LIMIT 10"""
+                    )
+                    recent_items = [dict(r) for r in await cursor.fetchall()]
+                except Exception:
+                    items_error = "table_missing"
+
+                # autonomous_checkpoints
                 checkpoint_count = 0
+                checkpoints_error: str | None = None
                 try:
                     cursor = await db.execute(
                         "SELECT COUNT(*) FROM autonomous_checkpoints"
@@ -740,7 +763,7 @@ class HarnessServer:
                     row = await cursor.fetchone()
                     checkpoint_count = row[0] if row else 0
                 except Exception:
-                    pass
+                    checkpoints_error = "table_missing"
 
                 # Active plans (not in terminal state)
                 active_plans = [
@@ -748,7 +771,7 @@ class HarnessServer:
                     if p.get("status") not in ("completed", "cancelled", "failed")
                 ]
 
-                return {
+                result: dict[str, Any] = {
                     "available": True,
                     "total_items": total_items,
                     "items_by_status": items_by_status,
@@ -757,8 +780,15 @@ class HarnessServer:
                     "active_plan_count": len(active_plans),
                     "checkpoint_count": checkpoint_count,
                 }
+                if plans_error or items_error or checkpoints_error:
+                    result["table_errors"] = {
+                        "autonomous_plans": plans_error,
+                        "items": items_error,
+                        "autonomous_checkpoints": checkpoints_error,
+                    }
+                return result
         except Exception as e:
-            return {"available": False, "error": str(e)}
+            return {"available": False, "error": f"connect_failed: {e}"}
 
     # ── Phase 7.5 / Phase 8 state queries ────────────────────────────────
 
@@ -797,6 +827,7 @@ class HarnessServer:
                 result["open_decisions"] = await self._q_open_decisions(db)
                 result["runtime_pipelines"] = await self._q_runtime_pipelines(db)
         except Exception as e:
+            result["available"] = False
             result["error"] = f"connect_failed: {e}"
 
         return result
@@ -1092,6 +1123,9 @@ class HarnessServer:
         except ImportError:
             return {"available": False, "error": "aiosqlite not installed"}
 
+        projection_ok = False
+        operational_ok = False
+
         # --- projection.db queries ---
         if proj_db.exists():
             try:
@@ -1105,8 +1139,9 @@ class HarnessServer:
                     )
                     result["entities"] = await self._q_entities(db)
                     result["entity_links"] = await self._q_entity_links(db)
+                projection_ok = True
             except Exception as e:
-                result["projection_error"] = str(e)
+                result["projection_error"] = f"connect_failed: {e}"
         else:
             for k in ("memories", "user_model_facts", "entities", "entity_links"):
                 result[k] = {"error": "db_missing", "db": "projection.db"}
@@ -1119,11 +1154,16 @@ class HarnessServer:
                     result["sessions"] = await self._q_session_transcripts(db)
                     result["signal_queue"] = await self._q_signal_queue(db)
                     result["dedup_rejected_pairs"] = await self._q_dedup_pairs(db)
+                operational_ok = True
             except Exception as e:
-                result["operational_error"] = str(e)
+                result["operational_error"] = f"connect_failed: {e}"
         else:
             for k in ("sessions", "signal_queue", "dedup_rejected_pairs"):
                 result[k] = {"error": "db_missing", "db": "operational.db"}
+
+        # ``available`` reflects whether *any* query actually succeeded —
+        # a present-but-unreadable DB file no longer counts as available.
+        result["available"] = projection_ok or operational_ok
 
         return result
 
@@ -1133,7 +1173,17 @@ class HarnessServer:
         table: str,
         with_status: bool = True,
     ) -> dict[str, Any]:
-        """Generic query for memories / user_model_facts soft-delete state."""
+        """Generic query for memories / user_model_facts soft-delete state.
+
+        ``table`` is interpolated into SQL via f-string, so it MUST be
+        checked against :data:`_ALLOWED_LIFECYCLE_TABLES`. Callers pass
+        literals today, but this guard keeps a future maintainer from
+        extending the helper with an attacker-controlled name.
+        """
+        if table not in _ALLOWED_LIFECYCLE_TABLES:
+            raise ValueError(
+                f"unsafe table name for lifecycle query: {table!r}"
+            )
         try:
             cur = await db.execute(f"SELECT COUNT(*) FROM {table}")
             row = await cur.fetchone()
@@ -1430,7 +1480,8 @@ class HarnessServer:
                 result["notifications"] = await self._q_notifications(db)
                 result["reminders"] = await self._q_reminders(db)
         except Exception as e:
-            result["error"] = str(e)
+            result["available"] = False
+            result["error"] = f"connect_failed: {e}"
 
         # Insights are not persisted to a table; ContextEngine emits
         # INSIGHT_AVAILABLE events. AT3 will wire event-stream tracking.
@@ -1443,7 +1494,8 @@ class HarnessServer:
         return result
 
     @staticmethod
-    async def _q_notifications(db: Any) -> dict[str, Any]:
+    async def _q_notifications(db: Any, limit: int = 20) -> dict[str, Any]:
+        """Summarise the notifications table with up to ``limit`` recent rows."""
         try:
             cur = await db.execute("SELECT COUNT(*) FROM notifications")
             row = await cur.fetchone()
@@ -1480,7 +1532,8 @@ class HarnessServer:
                 cur = await db.execute(
                     """SELECT id, priority, content, category, delivered_at,
                               acknowledged_at, delivery_tier, reason
-                       FROM notifications ORDER BY delivered_at DESC LIMIT 20"""
+                       FROM notifications ORDER BY delivered_at DESC LIMIT ?""",
+                    (limit,),
                 )
                 recent = [dict(r) for r in await cur.fetchall()]
             except Exception:
@@ -1488,7 +1541,8 @@ class HarnessServer:
                 try:
                     cur = await db.execute(
                         """SELECT id, priority, content, category, delivered_at
-                           FROM notifications ORDER BY delivered_at DESC LIMIT 20"""
+                           FROM notifications ORDER BY delivered_at DESC LIMIT ?""",
+                        (limit,),
                     )
                     recent = [dict(r) for r in await cur.fetchall()]
                 except Exception:
@@ -2317,10 +2371,7 @@ class HarnessServer:
         try:
             async with aiosqlite.connect(str(op_db)) as db:
                 db.row_factory = aiosqlite.Row
-                notif = await self._q_notifications(db)
-                # Trim recent to requested limit.
-                if isinstance(notif.get("recent"), list):
-                    notif["recent"] = notif["recent"][:safe_limit]
+                notif = await self._q_notifications(db, limit=safe_limit)
                 return {"available": True, **notif}
         except Exception as e:
             return {"available": False, "error": str(e)}

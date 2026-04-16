@@ -119,7 +119,8 @@ FILE_TRIGGERS = [
     "list what files we've created in this project so far",
 ]
 
-# Autonomous work trigger messages — should invoke start_autonomous
+# Long-background dispatch trigger messages — should invoke decompose_and_dispatch
+# with intent_duration='long' (start_autonomous was retired in Phase 7.5)
 AUTONOMOUS_TRIGGERS = [
     "ok can you keep researching this in the background while i take a break? dig into the top 3 tools and compare them",
     "hey work on this research while i'm away — compare the privacy features of the top options",

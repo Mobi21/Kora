@@ -595,6 +595,41 @@ def test_query_proactive_state_shape(
     assert ins["persisted"] is False
 
 
+def test_q_notifications_respects_limit(
+    tmp_path: Path, harness: HarnessServer,
+) -> None:
+    """``_q_notifications(db, limit=N)`` must not silently cap at 20.
+
+    Regression guard for Issue 4: the helper used a hardcoded ``LIMIT 20``
+    so callers asking for more (up to 100 via ``cmd_notifications``) only
+    ever saw the first 20 rows.
+    """
+    db_path = tmp_path / "operational.db"
+
+    async def _run() -> dict:
+        await _init_operational(db_path)
+        now = datetime.now(UTC)
+        async with aiosqlite.connect(str(db_path)) as db:
+            for i in range(50):
+                delivered = (now + timedelta(seconds=i)).isoformat()
+                await db.execute(
+                    "INSERT INTO notifications "
+                    "(id, priority, content, category, delivered_at, "
+                    " delivery_tier, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (f"n_{i:03d}", "medium", f"nudge {i}", "general",
+                     delivered, "templated", "delivered"),
+                )
+            await db.commit()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            return await harness._q_notifications(db, limit=50)
+
+    result = asyncio.run(_run())
+    assert result["total"] == 50
+    assert len(result["recent"]) == 50
+
+
 # ── test_snapshot_full_state ─────────────────────────────────────────────
 
 
