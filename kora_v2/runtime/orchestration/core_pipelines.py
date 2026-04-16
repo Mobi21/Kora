@@ -265,12 +265,46 @@ def build_core_pipelines() -> list[Pipeline]:
     step_map["post_session_memory:entities"] = entities_step
     step_map["post_session_memory:vault_handoff"] = vault_handoff_step
 
-    # 2. post_memory_vault — spec §4.3: sequence_complete(
-    #    "post_session_memory") ∨ interval(1800s, {DEEP_IDLE})
-    _add(
-        "post_memory_vault",
-        "Vault Organizer: reindex → structure → links → moc_sessions.",
-        [
+    # 2. post_memory_vault — Phase 8c: 4-stage pipeline with dependency
+    #    edges (reindex → structure → links → moc_sessions).
+    #    Replaces the single-stage stub from Slice 7.5b.
+    from kora_v2.agents.background.vault_organizer_handlers import (
+        links_step,
+        moc_sessions_step,
+        reindex_step,
+        structure_step,
+    )
+
+    post_memory_vault_pipeline = Pipeline(
+        name="post_memory_vault",
+        description="Vault Organizer: reindex → structure → links → moc_sessions.",
+        stages=[
+            PipelineStage(
+                name="reindex",
+                task_preset="bounded_background",
+                goal_template="Detect stale entries, re-embed, handle new/deleted files",
+                depends_on=[],
+            ),
+            PipelineStage(
+                name="structure",
+                task_preset="bounded_background",
+                goal_template="Enforce folder hierarchy, triage Inbox",
+                depends_on=["reindex"],
+            ),
+            PipelineStage(
+                name="links",
+                task_preset="bounded_background",
+                goal_template="Inject wikilinks, generate entity pages",
+                depends_on=["structure"],
+            ),
+            PipelineStage(
+                name="moc_sessions",
+                task_preset="bounded_background",
+                goal_template="Regenerate MOC pages, mirror session bridges",
+                depends_on=["links"],
+            ),
+        ],
+        triggers=[
             any_of(
                 "post_memory_vault",
                 sequence_complete(
@@ -284,9 +318,15 @@ def build_core_pipelines() -> list[Pipeline]:
                 ),
             )
         ],
-        "bounded_background",
-        _stub_step,
+        interruption_policy=InterruptionPolicy.PAUSE_ON_CONVERSATION,
+        failure_policy=FailurePolicy.FAIL_PIPELINE,
+        intent_duration="indefinite",
     )
+    pipelines.append(post_memory_vault_pipeline)
+    step_map["post_memory_vault:reindex"] = reindex_step
+    step_map["post_memory_vault:structure"] = structure_step
+    step_map["post_memory_vault:links"] = links_step
+    step_map["post_memory_vault:moc_sessions"] = moc_sessions_step
 
     # 3. weekly_adhd_profile — Phase 8b: real handler replaces stub.
     from kora_v2.agents.background.memory_steward_handlers import (

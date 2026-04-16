@@ -77,6 +77,8 @@ def test_other_pipelines_use_stub_step() -> None:
         # Phase 8b: these have real handlers now
         "post_session_memory",
         "weekly_adhd_profile",
+        # Phase 8c: post_memory_vault has 4 real stage handlers
+        "post_memory_vault",
     }
     for name in stub_names:
         assert fns[name] is _stub_step
@@ -90,7 +92,7 @@ def test_each_pipeline_has_at_least_one_trigger() -> None:
 
 def test_each_pipeline_has_single_stage() -> None:
     """All pipelines have a single stage EXCEPT post_session_memory
-    which has 5 stages (Phase 8b).
+    (5 stages, Phase 8b) and post_memory_vault (4 stages, Phase 8c).
     """
     pipelines = build_core_pipelines()
     for p in pipelines:
@@ -102,6 +104,14 @@ def test_each_pipeline_has_single_stage() -> None:
                 "dedup",
                 "entities",
                 "vault_handoff",
+            ]
+        elif p.name == "post_memory_vault":
+            assert len(p.stages) == 4
+            assert [s.name for s in p.stages] == [
+                "reindex",
+                "structure",
+                "links",
+                "moc_sessions",
             ]
         else:
             assert len(p.stages) == 1
