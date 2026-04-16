@@ -27,6 +27,12 @@ Usage:
     python3 -m tests.acceptance.automated insights [--limit N]
     python3 -m tests.acceptance.automated phase-history [--hours N]
     python3 -m tests.acceptance.automated vault-snapshot
+
+    # AT3 commands: idle-soak manifests, phase gates, benchmarks, event tail:
+    python3 -m tests.acceptance.automated soak-manifest <phase>
+    python3 -m tests.acceptance.automated phase-gate <phase_name>
+    python3 -m tests.acceptance.automated benchmarks
+    python3 -m tests.acceptance.automated event-tail [--seconds N]
 """
 
 from __future__ import annotations
@@ -103,7 +109,7 @@ async def _harness_send(request: dict[str, Any], timeout: float = 150.0) -> dict
         )
     except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
         return {"error": f"Cannot connect to harness server: {e}"}
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"error": "Timeout connecting to harness server"}
 
     try:
@@ -113,7 +119,7 @@ async def _harness_send(request: dict[str, Any], timeout: float = 150.0) -> dict
 
         raw = await asyncio.wait_for(reader.readline(), timeout=timeout)
         return json.loads(raw.decode())
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"error": f"Command timed out after {timeout}s"}
     except json.JSONDecodeError as e:
         return {"error": f"Bad response from harness: {e}"}
@@ -417,18 +423,18 @@ def cmd_start(fast: bool = False) -> None:
 
     # 6. Print plan info
     if fast:
-        from tests.acceptance.scenario.week_plan import FAST_PLAN, ACTIVE_ITEMS
+        from tests.acceptance.scenario.week_plan import ACTIVE_ITEMS, FAST_PLAN
         phase_count = sum(len(d["phases"]) for d in FAST_PLAN.values())
         print(f"\n  FAST MODE: {phase_count} phases, {len(ACTIVE_ITEMS)} active coverage items")
         print("  No idle phases. Estimated run time: ~10 minutes.")
     else:
-        from tests.acceptance.scenario.week_plan import WEEK_PLAN, ACTIVE_ITEMS, DEFERRED_ITEMS
+        from tests.acceptance.scenario.week_plan import ACTIVE_ITEMS, DEFERRED_ITEMS, WEEK_PLAN
         phase_count = sum(len(d["phases"]) for d in WEEK_PLAN.values())
         print(f"\n  FULL MODE: {phase_count} phases across 3 days")
         print(f"  Active coverage items: {len(ACTIVE_ITEMS)}")
         print(f"  Deferred coverage items: {len(DEFERRED_ITEMS)}")
 
-    print(f"\nAcceptance test environment ready.")
+    print("\nAcceptance test environment ready.")
     print(f"  Output dir: {OUTPUT_DIR}")
     print(f"  Session:    {SESSION_FILE}")
     print(f"  Monitor:    {MONITOR_FILE}")
@@ -525,15 +531,27 @@ def cmd_diff(snap1: str, snap2: str) -> None:
     print(result.get("diff", "(empty diff)"))
 
 
-def cmd_idle_wait(min_soak: int, timeout: int) -> None:
-    """Wait for idle quiescence while monitoring autonomous work."""
+def cmd_idle_wait(
+    min_soak: int, timeout: int, manifest: str | None = None,
+) -> None:
+    """Wait for idle quiescence while monitoring autonomous work.
+
+    If ``manifest`` is supplied, the harness evaluates the named
+    idle-soak manifest against a before/after full-state snapshot and
+    reports pass/fail per check.
+    """
     print(f"Idle wait: min_soak={min_soak}s timeout={timeout}s")
+    if manifest:
+        print(f"  (manifest: {manifest})")
     print("  (V2: monitoring health + autonomous runtime state)")
 
-    result = harness_cmd(
-        {"cmd": "idle-wait", "min_soak": min_soak, "timeout": timeout},
-        timeout=float(timeout + 30),
-    )
+    payload: dict[str, Any] = {
+        "cmd": "idle-wait", "min_soak": min_soak, "timeout": timeout,
+    }
+    if manifest:
+        payload["manifest"] = manifest
+
+    result = harness_cmd(payload, timeout=float(timeout + 30))
     if "error" in result:
         print(f"  Idle-wait error: {result['error']}")
         sys.exit(1)
@@ -550,6 +568,17 @@ def cmd_idle_wait(min_soak: int, timeout: int) -> None:
         print("  Note: hit timeout limit")
     elif result.get("quiescent"):
         print("  Daemon quiescent and healthy")
+
+    mres = result.get("manifest")
+    if mres:
+        if mres.get("error"):
+            print(f"  Manifest error: {mres['error']}")
+        else:
+            status = "PASS" if mres.get("passed") else "FAIL"
+            print(f"  Manifest [{mres.get('manifest_name')}] {status}")
+            print(f"    {mres.get('summary', '?')}")
+            if mres.get("missing"):
+                print("    missing: " + ", ".join(mres["missing"]))
 
 
 def cmd_advance(hours: float) -> None:
@@ -992,6 +1021,156 @@ def cmd_vault_snapshot() -> None:
         print(f"  (walk truncated at {result.get('files_walked')} files)")
 
 
+def cmd_soak_manifest(phase: str) -> None:
+    """Run the named soak manifest against the current snapshot.
+
+    Prints PASS/FAIL plus the per-check breakdown. For a meaningful
+    before/after comparison, prefer ``idle-wait --manifest <phase>`` —
+    this standalone command only captures the *current* state and
+    compares against an empty before-snapshot.
+    """
+    result = harness_cmd(
+        {"cmd": "soak-manifest", "phase": phase},
+        timeout=60.0,
+    )
+    if "error" in result and "result" not in result:
+        print(f"Soak manifest error: {result['error']}")
+        if result.get("available"):
+            print("  Available manifests: " + ", ".join(result["available"]))
+        sys.exit(1)
+
+    manifest = result.get("manifest") or {}
+    res = result.get("result") or {}
+    passed = res.get("passed", False)
+    status = "PASS" if passed else "FAIL"
+    print(f"Soak manifest [{phase}] {status}")
+    print(f"  {res.get('summary', '?')}")
+    print(
+        f"  min_soak={manifest.get('min_soak_seconds', '?')}s "
+        f"timeout={manifest.get('timeout_seconds', '?')}s"
+    )
+    checks = res.get("checks") or {}
+    if checks:
+        print("  Checks:")
+        for key, ok in sorted(checks.items()):
+            marker = "✓" if ok else "✗"
+            print(f"    [{marker}] {key}")
+    if res.get("missing"):
+        print("  Missing: " + ", ".join(res["missing"]))
+    if res.get("unexpected"):
+        print("  Unexpected: " + ", ".join(res["unexpected"]))
+
+
+def cmd_phase_gate(phase_name: str) -> None:
+    """Run the phase-gate check for a named phase."""
+    result = harness_cmd(
+        {"cmd": "phase-gate", "phase_name": phase_name},
+        timeout=60.0,
+    )
+    if "error" in result:
+        print(f"Phase gate error: {result['error']}")
+        known = result.get("known_phases") or []
+        if known:
+            print(f"  Known phases: {', '.join(known)}")
+        sys.exit(1)
+    res = result.get("result") or {}
+    checked = res.get("items_checked") or []
+    satisfied = res.get("items_satisfied") or []
+    missing = res.get("items_missing") or []
+    details = res.get("details") or {}
+    print(f"Phase gate [{phase_name}]:")
+    print(
+        f"  items_checked={len(checked)} "
+        f"satisfied={len(satisfied)} missing={len(missing)}"
+    )
+    if satisfied:
+        print("  Satisfied:")
+        for i in satisfied:
+            key = str(i)
+            print(f"    [x] {i}: {details.get(key) or details.get(i) or ''}")
+    if missing:
+        print("  Missing:")
+        for i in missing:
+            key = str(i)
+            print(f"    [ ] {i}: {details.get(key) or details.get(i) or ''}")
+
+
+def cmd_benchmarks() -> None:
+    """Collect and print the current benchmark summary."""
+    result = harness_cmd({"cmd": "benchmarks"}, timeout=60.0)
+    if "error" in result:
+        print(f"Benchmarks error: {result['error']}")
+        sys.exit(1)
+    bench = result.get("json") or {}
+    print("Benchmarks:")
+    print(f"  response_count: {bench.get('response_count', 0)}")
+    print(f"  latency_p50_ms: {bench.get('response_latency_p50_ms', 0)}")
+    print(f"  latency_p95_ms: {bench.get('response_latency_p95_ms', 0)}")
+    print(
+        f"  tokens: prompt={bench.get('total_prompt_tokens', 0)} "
+        f"completion={bench.get('total_completion_tokens', 0)} "
+        f"mean_per_response={bench.get('tokens_per_response_mean', 0)}"
+    )
+    print(
+        f"  remaining_budget_fraction: "
+        f"{bench.get('remaining_budget_fraction', 1.0)}"
+    )
+    pipes = bench.get("pipeline_fires_by_name") or {}
+    if pipes:
+        print("  pipelines:")
+        for name, count in sorted(pipes.items(), key=lambda x: -x[1]):
+            print(f"    {name}: {count}")
+    print(
+        f"  pipeline_success={bench.get('pipeline_success_count', 0)} "
+        f"fail={bench.get('pipeline_fail_count', 0)}"
+    )
+    notifs = bench.get("notifications_by_tier") or {}
+    if notifs:
+        tier_str = " ".join(f"{k}={v}" for k, v in sorted(notifs.items()))
+        print(f"  notifications_by_tier: {tier_str}")
+    print(
+        f"  memory deltas: created={bench.get('memories_created', 0)} "
+        f"consolidated={bench.get('memories_consolidated', 0)} "
+        f"dedup_merged={bench.get('memories_dedup_merged', 0)}"
+    )
+    print(
+        f"  vault: notes={bench.get('vault_notes_total', 0)} "
+        f"wikilinks={bench.get('vault_wikilinks_total', 0)} "
+        f"entities={bench.get('vault_entity_pages', 0)} "
+        f"mocs={bench.get('vault_moc_pages', 0)} "
+        f"working={bench.get('vault_working_docs_active', 0)}"
+    )
+    dwell = bench.get("phase_dwell_seconds") or {}
+    if dwell:
+        print("  phase dwell (s):")
+        for k, v in sorted(dwell.items()):
+            print(f"    {k}: {v}")
+
+
+def cmd_event_tail(seconds: int = 10) -> None:
+    """Subscribe to the daemon's event stream for N seconds and print events."""
+    # Harness tail lasts `seconds`, so give the command at least that much
+    # plus a small buffer on the socket read.
+    result = harness_cmd(
+        {"cmd": "event-tail", "seconds": seconds},
+        timeout=float(seconds + 30),
+    )
+    if "error" in result:
+        print(f"Event tail error: {result['error']}")
+        sys.exit(1)
+    events = result.get("events") or []
+    print(
+        f"Event tail: {result.get('seconds', seconds)}s — "
+        f"{result.get('event_count', len(events))} event(s) captured"
+    )
+    for ev in events:
+        ev_type = ev.get("type", "?")
+        content = (ev.get("content") or "")
+        if isinstance(content, str) and len(content) > 120:
+            content = content[:117] + "..."
+        print(f"  [{ev.get('ts', '?')}] {ev_type}: {content}")
+
+
 def cmd_monitor() -> None:
     """Print current monitor summary."""
     if MONITOR_FILE.exists():
@@ -1056,8 +1235,9 @@ def main() -> None:
         parser = _ap.ArgumentParser()
         parser.add_argument("--min-soak", type=int, default=15)
         parser.add_argument("--timeout", type=int, default=30)
+        parser.add_argument("--manifest", type=str, default=None)
         parsed = parser.parse_args(args[1:])
-        cmd_idle_wait(parsed.min_soak, parsed.timeout)
+        cmd_idle_wait(parsed.min_soak, parsed.timeout, manifest=parsed.manifest)
 
     elif cmd == "advance":
         if len(args) < 2:
@@ -1128,6 +1308,28 @@ def main() -> None:
 
     elif cmd == "vault-snapshot":
         cmd_vault_snapshot()
+
+    elif cmd == "soak-manifest":
+        if len(args) < 2:
+            print("Usage: automated.py soak-manifest <phase>")
+            sys.exit(1)
+        cmd_soak_manifest(args[1])
+
+    elif cmd == "phase-gate":
+        if len(args) < 2:
+            print("Usage: automated.py phase-gate <phase_name>")
+            sys.exit(1)
+        cmd_phase_gate(args[1])
+
+    elif cmd == "benchmarks":
+        cmd_benchmarks()
+
+    elif cmd == "event-tail":
+        import argparse as _ap
+        parser = _ap.ArgumentParser()
+        parser.add_argument("--seconds", type=int, default=10)
+        parsed = parser.parse_args(args[1:])
+        cmd_event_tail(parsed.seconds)
 
     else:
         print(f"Unknown command: {cmd}")

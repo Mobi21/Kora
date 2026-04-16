@@ -993,6 +993,54 @@ async def build_report(
         for w in gap_warnings:
             lines.append(f"- {w}")
 
+    # ── Benchmarks (AT3 placeholder — AT4 polishes the formatting) ───────
+    # Enumerate any ``*.benchmarks.json`` sidecars written alongside
+    # snapshots. Each sidecar is a :class:`BenchmarkSummary` JSON dump.
+    # The report currently surfaces the latest summary; trend analysis
+    # lives in ``data/acceptance/benchmarks.csv`` (central CSV written
+    # by ``HarnessServer.cmd_snapshot``).
+    bench_files = sorted(snapshots_dir.glob("*.benchmarks.json"))
+    if bench_files:
+        latest = bench_files[-1]
+        try:
+            bench = json.loads(latest.read_text())
+        except Exception:
+            bench = {}
+        lines.append(f"\n## Benchmarks (latest: {latest.stem})")
+        lines.append(
+            f"- responses: {bench.get('response_count', 0)} "
+            f"p50={bench.get('response_latency_p50_ms', 0)}ms "
+            f"p95={bench.get('response_latency_p95_ms', 0)}ms"
+        )
+        lines.append(
+            f"- tokens: prompt={bench.get('total_prompt_tokens', 0)} "
+            f"completion={bench.get('total_completion_tokens', 0)} "
+            f"mean_per_response={bench.get('tokens_per_response_mean', 0)}"
+        )
+        lines.append(
+            f"- remaining_budget_fraction: "
+            f"{bench.get('remaining_budget_fraction', 1.0)}"
+        )
+        lines.append(
+            f"- pipelines: success={bench.get('pipeline_success_count', 0)} "
+            f"fail={bench.get('pipeline_fail_count', 0)}"
+        )
+        lines.append(
+            f"- memory deltas: created={bench.get('memories_created', 0)} "
+            f"consolidated={bench.get('memories_consolidated', 0)} "
+            f"dedup_merged={bench.get('memories_dedup_merged', 0)}"
+        )
+        lines.append(
+            f"- vault: notes={bench.get('vault_notes_total', 0)} "
+            f"wikilinks={bench.get('vault_wikilinks_total', 0)} "
+            f"entity_pages={bench.get('vault_entity_pages', 0)} "
+            f"moc_pages={bench.get('vault_moc_pages', 0)}"
+        )
+        lines.append(
+            f"- central trend CSV: data/acceptance/benchmarks.csv"
+            f" ({len(bench_files)} sidecar(s) in snapshots/)"
+        )
+
     # ── Errors ────────────────────────────────────────────────────────────
     errors = session_state.get("errors", [])
     if errors:

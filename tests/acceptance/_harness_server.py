@@ -376,6 +376,13 @@ class HarnessServer:
                 "trace_id": meta.get("trace_id"),
                 "latency_ms": meta.get("latency_ms", 0),
                 "tool_call_count": meta.get("tool_call_count", 0),
+                # Capture token accounting when the daemon emits it. The
+                # current daemon only sends ``token_count`` (aggregate
+                # post-compaction budget); prompt_tokens / completion_tokens
+                # are forwarded if future envelopes add them.
+                "token_count": meta.get("token_count"),
+                "prompt_tokens": meta.get("prompt_tokens"),
+                "completion_tokens": meta.get("completion_tokens"),
                 "complete": True,
             })
             # Track compaction events
@@ -421,26 +428,59 @@ class HarnessServer:
         self._response_ready = asyncio.Event()
 
         try:
+            # Harness-measured latency (the daemon's response_complete
+            # envelope does not include latency_ms today, so time the round
+            # trip locally to get a real measurement).
+            send_monotonic = time.monotonic()
             await self._ws.send(json.dumps({"type": "chat", "content": message}))
             try:
                 await asyncio.wait_for(self._response_ready.wait(), timeout=timeout)
             except TimeoutError:
                 return {"error": f"Response timed out after {timeout}s"}
+            measured_latency_ms = int(
+                max(0.0, (time.monotonic() - send_monotonic) * 1000.0)
+            )
 
             tokens = self._response_data.get("tokens", [])
             response_text = "".join(tokens)
 
+            # Prefer daemon-reported latency_ms if it's present and
+            # positive; fall back to the locally-measured value.
+            daemon_latency = self._response_data.get("latency_ms", 0) or 0
+            try:
+                latency_ms = (
+                    int(daemon_latency) if int(daemon_latency) > 0
+                    else measured_latency_ms
+                )
+            except (TypeError, ValueError):
+                latency_ms = measured_latency_ms
+
+            # ``token_count`` is the total token budget for the turn as
+            # reported by the daemon in ``response_complete.metadata``.
+            # ``prompt_tokens`` / ``completion_tokens`` are not currently
+            # emitted by the daemon — persist whichever is available and
+            # leave the rest ``None``.
+            token_count = self._response_data.get("token_count")
+            prompt_tokens = self._response_data.get("prompt_tokens")
+            completion_tokens = self._response_data.get("completion_tokens")
+            compaction_tier = (
+                self._response_data.get("compaction_tier") or "none"
+            )
+
             result = {
                 "response": response_text,
                 "trace_id": self._response_data.get("trace_id"),
-                "latency_ms": self._response_data.get("latency_ms", 0),
+                "latency_ms": latency_ms,
                 "tool_call_count": self._response_data.get("tool_call_count", 0),
                 "tool_calls": self._response_data.get("tool_calls", []),
                 "session_id": self._kora_session_id,
                 "error": self._response_data.get("error"),
             }
 
-            # Record in conversation state
+            # Record in conversation state. Persist latency, token
+            # accounting, and compaction_tier here so the benchmarks
+            # collector can read them back from message state without
+            # having to re-derive them from the response pipeline.
             self._state["messages"].append({
                 "role": "user",
                 "content": message,
@@ -452,6 +492,18 @@ class HarnessServer:
                 "ts": datetime.now(UTC).isoformat(),
                 "trace_id": result["trace_id"],
                 "tool_calls": result["tool_calls"],
+                "latency_ms": latency_ms,
+                # token_count is the total-token budget for the turn
+                # (completion + prompt when both are known; daemon
+                # currently reports a single aggregated number).
+                "token_count": token_count,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "compaction_tier": compaction_tier,
+                # Explicit flag so the benchmarks collector can
+                # distinguish real assistant turns from synthetic
+                # compaction-event entries.
+                "is_response": True,
             })
             _save_session(self._state)
             _update_monitor(self._state)
@@ -541,8 +593,81 @@ class HarnessServer:
 
         path = SNAPSHOTS_DIR / f"{name}.json"
         path.write_text(json.dumps(snapshot, indent=2, default=str))
-        _log_event({"event": "snapshot", "name": name, "path": str(path)})
-        return {"path": str(path), "name": name}
+
+        # AT3: write a benchmarks JSON sidecar alongside the snapshot.
+        benchmarks_path: str | None = None
+        try:
+            bench_result = await self.cmd_benchmarks()
+            sidecar = SNAPSHOTS_DIR / f"{name}.benchmarks.json"
+            sidecar.write_text(
+                json.dumps(bench_result.get("json", {}), indent=2, default=str)
+            )
+            benchmarks_path = str(sidecar)
+            # Append to the central CSV for trending.
+            try:
+                self._append_benchmarks_csv(name, bench_result.get("csv_row", {}))
+            except Exception:
+                # CSV append is best-effort — never fails a snapshot.
+                pass
+        except Exception:
+            # Benchmarks are best-effort — never fail a snapshot on them.
+            pass
+
+        _log_event({
+            "event": "snapshot", "name": name, "path": str(path),
+            "benchmarks_path": benchmarks_path,
+        })
+        return {"path": str(path), "name": name, "benchmarks_path": benchmarks_path}
+
+    @staticmethod
+    def _append_benchmarks_csv(
+        snapshot_name: str, row: dict[str, Any],
+    ) -> None:
+        """Append one benchmark row to ``data/acceptance/benchmarks.csv``.
+
+        Creates the file + header if it doesn't yet exist. Rows are
+        keyed by the snapshot name and an ISO timestamp so trending
+        tools can sort / dedupe.
+
+        Uses an ``fcntl.LOCK_EX`` advisory file lock around the write
+        so concurrent snapshot callers cannot interleave their header
+        + row writes (which would produce doubled headers or partial
+        rows on the second writer).
+        """
+        import csv
+        import fcntl
+
+        from tests.acceptance.scenario.benchmarks import CSV_COLUMNS
+
+        out_dir = PROJECT_ROOT / "data" / "acceptance"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / "benchmarks.csv"
+
+        header = ("snapshot", "captured_at", *CSV_COLUMNS)
+        with open(csv_path, "a", newline="") as fh:
+            # Exclusive lock held for the whole header+row write so
+            # another process cannot observe an empty file, decide to
+            # also write a header, and produce a doubled one.
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                # Re-check for header *under the lock* — the file could
+                # have been created by a racing writer between the path
+                # existence check and our acquisition.
+                fh.seek(0, 2)  # seek to end
+                write_header = fh.tell() == 0
+                writer = csv.writer(fh)
+                if write_header:
+                    writer.writerow(header)
+                writer.writerow(
+                    [
+                        snapshot_name,
+                        datetime.now(UTC).isoformat(),
+                        *(row.get(col, "") for col in CSV_COLUMNS),
+                    ]
+                )
+                fh.flush()
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     async def cmd_diff(self, snap1: str, snap2: str) -> dict[str, Any]:
         """Human-readable diff between two snapshots."""
@@ -1885,11 +2010,22 @@ class HarnessServer:
             "proactive_state": await self._query_proactive_state(),
         }
 
-    async def cmd_idle_wait(self, min_soak: int = 60, timeout: int = 300) -> dict[str, Any]:
+    async def cmd_idle_wait(
+        self,
+        min_soak: int = 60,
+        timeout: int = 300,
+        *,
+        manifest: str | None = None,
+    ) -> dict[str, Any]:
         """Wait min_soak seconds while monitoring daemon health and autonomous work.
 
         Phase 6 is live: idle phases now track autonomous session progress,
         item creation, checkpoint writes, and budget state — not just health.
+
+        AT3: if ``manifest`` is provided, capture a before-snapshot of
+        the full state, run the wait, then evaluate the named manifest
+        against the before/after snapshots. Pass/fail plus per-check
+        detail is returned in the result under ``manifest``.
         """
         start = time.monotonic()
         deadline = start + timeout
@@ -1900,6 +2036,14 @@ class HarnessServer:
         initial_auto = await self._query_autonomous_state()
         initial_items = initial_auto.get("total_items", 0)
         initial_checkpoints = initial_auto.get("checkpoint_count", 0)
+
+        # AT3: capture the before-state for manifest evaluation (if asked).
+        before_state: dict[str, Any] | None = None
+        if manifest:
+            try:
+                before_state = await self._snapshot_full_state()
+            except Exception:
+                before_state = {}
 
         _update_monitor(
             self._state,
@@ -1953,7 +2097,7 @@ class HarnessServer:
             if elapsed >= min_soak:
                 current_auto = await self._query_autonomous_state()
                 _update_monitor(self._state, f"idle-wait: complete after {elapsed:.0f}s")
-                return {
+                result: dict[str, Any] = {
                     "elapsed": elapsed,
                     "polls": polls,
                     "errors": errors,
@@ -1962,10 +2106,15 @@ class HarnessServer:
                     "items_delta": current_auto.get("total_items", 0) - initial_items,
                     "checkpoints_delta": current_auto.get("checkpoint_count", 0) - initial_checkpoints,
                 }
+                if manifest:
+                    result["manifest"] = await self._eval_idle_manifest(
+                        manifest, before_state
+                    )
+                return result
 
         elapsed = time.monotonic() - start
         current_auto = await self._query_autonomous_state()
-        return {
+        result_timeout: dict[str, Any] = {
             "elapsed": elapsed,
             "polls": polls,
             "errors": errors,
@@ -1974,6 +2123,32 @@ class HarnessServer:
             "items_delta": current_auto.get("total_items", 0) - initial_items,
             "checkpoints_delta": current_auto.get("checkpoint_count", 0) - initial_checkpoints,
         }
+        if manifest:
+            result_timeout["manifest"] = await self._eval_idle_manifest(
+                manifest, before_state
+            )
+        return result_timeout
+
+    async def _eval_idle_manifest(
+        self, manifest_name: str, before_state: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Evaluate the named manifest against before/after full-state snapshots."""
+        from tests.acceptance.scenario.manifests import (
+            SOAK_MANIFESTS,
+            result_to_dict,
+            run_manifest,
+        )
+
+        m = SOAK_MANIFESTS.get(manifest_name)
+        if m is None:
+            return {
+                "error": f"Unknown soak manifest: {manifest_name}",
+                "available": sorted(SOAK_MANIFESTS.keys()),
+            }
+
+        after = await self._snapshot_full_state()
+        result = run_manifest(m, before_state or {}, after)
+        return result_to_dict(result)
 
     def _check_health(self) -> bool:
         """Synchronous health probe."""
@@ -2457,6 +2632,201 @@ class HarnessServer:
         """Print vault counts, folder hierarchy check, working-doc count."""
         return await self._query_vault_state()
 
+    # ── AT3 commands: manifests, phase gates, benchmarks, event tail ──────
+
+    async def cmd_soak_manifest(
+        self,
+        phase: str,
+        *,
+        before_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run the named soak manifest against the current state.
+
+        If ``before_state`` is omitted, only the present-day checks fire
+        (pipelines already present in the snapshot count as "satisfied",
+        since ``before`` is an empty snapshot). The harness's
+        ``cmd_idle_wait(--manifest)`` captures a proper before-snapshot
+        and passes it in.
+        """
+        from tests.acceptance.scenario.manifests import (
+            SOAK_MANIFESTS,
+            result_to_dict,
+            run_manifest,
+        )
+
+        manifest = SOAK_MANIFESTS.get(phase)
+        if manifest is None:
+            return {
+                "error": f"Unknown soak manifest: {phase}",
+                "available": sorted(SOAK_MANIFESTS.keys()),
+            }
+
+        before = before_state or {}
+        after = await self._snapshot_full_state()
+        result = run_manifest(manifest, before, after)
+        return {
+            "manifest": {
+                "phase_name": manifest.phase_name,
+                "min_soak_seconds": manifest.min_soak_seconds,
+                "timeout_seconds": manifest.timeout_seconds,
+                "expected_pipelines": list(manifest.expected_pipelines),
+                "expected_ledger_events": list(manifest.expected_ledger_events),
+                "expected_phase_transitions": list(
+                    manifest.expected_phase_transitions
+                ),
+            },
+            "result": result_to_dict(result),
+        }
+
+    async def cmd_phase_gate(
+        self,
+        phase_name: str,
+        coverage_items: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Run the phase-gate check for ``phase_name``.
+
+        If ``coverage_items`` is omitted, the gate is run against the
+        phase's declared ``coverage_items`` from WEEK_PLAN / FAST_PLAN
+        (with WEEK_PLAN taking precedence on name collision).
+        """
+        from tests.acceptance.scenario.gates import result_to_dict, run_phase_gate
+        from tests.acceptance.scenario.week_plan import FAST_PLAN, WEEK_PLAN
+
+        phase_found = coverage_items is not None
+        if coverage_items is None:
+            coverage_items = []
+            for plan in (WEEK_PLAN, FAST_PLAN):
+                for day in plan.values():
+                    for phase in day.get("phases", []):
+                        if phase.get("name") == phase_name:
+                            items = phase.get("coverage_items") or []
+                            coverage_items = [int(i) for i in items]
+                            phase_found = True
+                            break
+                    if phase_found:
+                        break
+                if phase_found:
+                    break
+
+            if not phase_found:
+                # Surface an explicit error rather than silently
+                # returning a "0 checked / 0 missing" passing result —
+                # that shape is indistinguishable from a real pass and
+                # would hide typos or stale phase names in callers.
+                known_phases: list[str] = []
+                for plan in (WEEK_PLAN, FAST_PLAN):
+                    for day in plan.values():
+                        for phase in day.get("phases", []):
+                            name = phase.get("name")
+                            if name and name not in known_phases:
+                                known_phases.append(name)
+                return {
+                    "error": f"phase_not_found: {phase_name}",
+                    "known_phases": sorted(known_phases),
+                }
+
+        state = await self._snapshot_full_state()
+        result = run_phase_gate(phase_name, coverage_items or [], state)
+        return {"result": result_to_dict(result)}
+
+    async def cmd_benchmarks(self) -> dict[str, Any]:
+        """Collect benchmarks from the current run.
+
+        Uses the harness's own message history for response-level
+        metadata and the live full-state snapshot for everything else.
+        """
+        from tests.acceptance.scenario.benchmarks import (
+            benchmarks_to_csv_row,
+            benchmarks_to_json,
+            collect_benchmarks,
+        )
+
+        # Pull per-turn metadata from session-state messages. The
+        # assistant-role entries now carry latency_ms, token_count,
+        # prompt_tokens, completion_tokens, and compaction_tier (see
+        # cmd_send). Flag each meta with ``role='assistant'`` so the
+        # benchmarks collector counts it in ``response_count``.
+        metas: list[dict[str, Any]] = []
+        for msg in self._state.get("messages", []):
+            if msg.get("role") != "assistant":
+                continue
+            metas.append({
+                "role": "assistant",
+                "is_response": True,
+                "latency_ms": msg.get("latency_ms", 0) or 0,
+                "token_count": msg.get("token_count"),
+                "prompt_tokens": msg.get("prompt_tokens"),
+                "completion_tokens": msg.get("completion_tokens"),
+                "compaction_tier": msg.get("compaction_tier") or "none",
+            })
+
+        # Rehydrate compaction tier counts from the persisted event list.
+        # These are *synthetic* entries — they contribute only to the
+        # compaction-tier histogram and must NOT be counted as responses
+        # (so no role / is_response flag).
+        for ev in self._compaction_events:
+            tier = ev.get("tier") or "none"
+            metas.append({
+                "token_count": ev.get("token_count"),
+                "compaction_tier": tier,
+            })
+
+        state = await self._snapshot_full_state()
+        summary = await collect_benchmarks(metas, state, None)
+        return {
+            "json": benchmarks_to_json(summary),
+            "csv_row": benchmarks_to_csv_row(summary),
+        }
+
+    async def cmd_event_tail(self, seconds: int = 10) -> dict[str, Any]:
+        """Subscribe to daemon WebSocket events for ``seconds`` and return them.
+
+        Uses the existing WebSocket connection — events that would
+        otherwise route through ``_handle_ws_event`` are tapped into a
+        local list for the duration. The tap is installed only for the
+        requested window and removed afterward so subsequent conversation
+        turns keep their response-assembly path intact.
+        """
+        if self._ws is None:
+            return {
+                "error": (
+                    "WebSocket not connected; tail requires a live daemon "
+                    "connection"
+                ),
+                "events": [],
+            }
+
+        captured: list[dict[str, Any]] = []
+        safe_seconds = max(1, min(int(seconds), 300))
+
+        original_handler = self._handle_ws_event
+
+        async def _tap(data: dict[str, Any]) -> None:
+            # Always mirror into the capture list first.
+            try:
+                captured.append({
+                    "type": data.get("type"),
+                    "content": data.get("content"),
+                    "metadata": data.get("metadata"),
+                    "ts": datetime.now(UTC).isoformat(),
+                })
+            except Exception:
+                pass
+            # Preserve original behaviour.
+            await original_handler(data)
+
+        self._handle_ws_event = _tap  # type: ignore[assignment]
+        try:
+            await asyncio.sleep(safe_seconds)
+        finally:
+            self._handle_ws_event = original_handler  # type: ignore[assignment]
+
+        return {
+            "seconds": safe_seconds,
+            "event_count": len(captured),
+            "events": captured,
+        }
+
     async def cmd_stop_server(self) -> dict[str, Any]:
         """Shut down the harness server."""
         self._running = False
@@ -2490,6 +2860,7 @@ class HarnessServer:
                 result = await self.cmd_idle_wait(
                     min_soak=request.get("min_soak", 60),
                     timeout=request.get("timeout", 300),
+                    manifest=request.get("manifest"),
                 )
             elif cmd == "advance":
                 result = await self.cmd_advance(float(request.get("hours", 0)))
@@ -2533,6 +2904,19 @@ class HarnessServer:
                 )
             elif cmd == "vault-snapshot":
                 result = await self.cmd_vault_snapshot()
+            elif cmd == "soak-manifest":
+                result = await self.cmd_soak_manifest(request["phase"])
+            elif cmd == "phase-gate":
+                items = request.get("coverage_items")
+                if items is not None:
+                    items = [int(i) for i in items]
+                result = await self.cmd_phase_gate(request["phase_name"], items)
+            elif cmd == "benchmarks":
+                result = await self.cmd_benchmarks()
+            elif cmd == "event-tail":
+                result = await self.cmd_event_tail(
+                    seconds=int(request.get("seconds", 10)),
+                )
             elif cmd == "stop":
                 result = await self.cmd_stop_server()
             elif cmd == "ping":
