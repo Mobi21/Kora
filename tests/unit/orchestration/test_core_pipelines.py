@@ -74,6 +74,9 @@ def test_other_pipelines_use_stub_step() -> None:
         "session_bridge_pruning",
         "skill_refinement",
         "user_autonomous_task",
+        # Phase 8b: these have real handlers now
+        "post_session_memory",
+        "weekly_adhd_profile",
     }
     for name in stub_names:
         assert fns[name] is _stub_step
@@ -86,10 +89,23 @@ def test_each_pipeline_has_at_least_one_trigger() -> None:
 
 
 def test_each_pipeline_has_single_stage() -> None:
+    """All pipelines have a single stage EXCEPT post_session_memory
+    which has 5 stages (Phase 8b).
+    """
     pipelines = build_core_pipelines()
     for p in pipelines:
-        assert len(p.stages) == 1
-        assert p.stages[0].name == "run"
+        if p.name == "post_session_memory":
+            assert len(p.stages) == 5
+            assert [s.name for s in p.stages] == [
+                "extract",
+                "consolidate",
+                "dedup",
+                "entities",
+                "vault_handoff",
+            ]
+        else:
+            assert len(p.stages) == 1
+            assert p.stages[0].name == "run"
 
 
 async def test_register_core_pipelines_populates_engine(tmp_path: Path) -> None:
@@ -104,6 +120,49 @@ async def test_register_core_pipelines_populates_engine(tmp_path: Path) -> None:
     names = {p.name for p in engine.pipelines.all()}
     for expected in EXPECTED_PIPELINE_NAMES:
         assert expected in names
+
+
+def test_post_session_memory_has_real_step_functions() -> None:
+    """Phase 8b: post_session_memory stages are wired to real handlers."""
+    from kora_v2.agents.background.memory_steward_handlers import (
+        consolidate_step,
+        dedup_step,
+        entities_step,
+        extract_step,
+        vault_handoff_step,
+    )
+
+    build_core_pipelines()
+    fns = core_step_fns()
+    assert fns["post_session_memory:extract"] is extract_step
+    assert fns["post_session_memory:consolidate"] is consolidate_step
+    assert fns["post_session_memory:dedup"] is dedup_step
+    assert fns["post_session_memory:entities"] is entities_step
+    assert fns["post_session_memory:vault_handoff"] is vault_handoff_step
+
+
+def test_weekly_adhd_profile_has_real_step_function() -> None:
+    """Phase 8b: weekly_adhd_profile uses the real ADHD handler."""
+    from kora_v2.agents.background.memory_steward_handlers import (
+        adhd_profile_refine_step,
+    )
+
+    build_core_pipelines()
+    fns = core_step_fns()
+    assert fns["weekly_adhd_profile"] is adhd_profile_refine_step
+
+
+def test_post_session_memory_stage_dependencies() -> None:
+    """Phase 8b: stages have correct dependency edges."""
+    pipelines = build_core_pipelines()
+    by_name = {p.name: p for p in pipelines}
+    psm = by_name["post_session_memory"]
+    stage_deps = {s.name: s.depends_on for s in psm.stages}
+    assert stage_deps["extract"] == []
+    assert stage_deps["consolidate"] == ["extract"]
+    assert stage_deps["dedup"] == ["consolidate"]
+    assert stage_deps["entities"] == ["dedup"]
+    assert stage_deps["vault_handoff"] == ["entities"]
 
 
 def test_post_memory_vault_uses_sequence_complete_trigger() -> None:

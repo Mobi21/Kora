@@ -207,14 +207,63 @@ def build_core_pipelines() -> list[Pipeline]:
         )
         step_map[name] = step_fn
 
-    # 1. post_session_memory
-    _add(
-        "post_session_memory",
-        "Memory Steward: extract → consolidate → dedup → entities.",
-        [event("post_session_memory", event_type="SESSION_END")],
-        "bounded_background",
-        _stub_step,
+    # 1. post_session_memory — Phase 8b: 5-stage pipeline with dependency
+    #    edges (extract → consolidate → dedup → entities → vault_handoff).
+    #    Replaces the single-stage stub from Slice 7.5b.
+    from kora_v2.agents.background.memory_steward_handlers import (
+        consolidate_step,
+        dedup_step,
+        entities_step,
+        extract_step,
+        vault_handoff_step,
     )
+
+    post_session_memory_pipeline = Pipeline(
+        name="post_session_memory",
+        description="Memory Steward: extract → consolidate → dedup → entities → vault_handoff.",
+        stages=[
+            PipelineStage(
+                name="extract",
+                task_preset="bounded_background",
+                goal_template="Extract facts from session transcripts and signals",
+                depends_on=[],
+            ),
+            PipelineStage(
+                name="consolidate",
+                task_preset="bounded_background",
+                goal_template="Consolidate semantically related notes",
+                depends_on=["extract"],
+            ),
+            PipelineStage(
+                name="dedup",
+                task_preset="bounded_background",
+                goal_template="Deduplicate near-identical notes",
+                depends_on=["consolidate"],
+            ),
+            PipelineStage(
+                name="entities",
+                task_preset="bounded_background",
+                goal_template="Resolve fuzzy entity matches",
+                depends_on=["dedup"],
+            ),
+            PipelineStage(
+                name="vault_handoff",
+                task_preset="bounded_background",
+                goal_template="Signal memory pipeline completion",
+                depends_on=["entities"],
+            ),
+        ],
+        triggers=[event("post_session_memory", event_type="SESSION_END")],
+        interruption_policy=InterruptionPolicy.PAUSE_ON_CONVERSATION,
+        failure_policy=FailurePolicy.FAIL_PIPELINE,
+        intent_duration="indefinite",
+    )
+    pipelines.append(post_session_memory_pipeline)
+    step_map["post_session_memory:extract"] = extract_step
+    step_map["post_session_memory:consolidate"] = consolidate_step
+    step_map["post_session_memory:dedup"] = dedup_step
+    step_map["post_session_memory:entities"] = entities_step
+    step_map["post_session_memory:vault_handoff"] = vault_handoff_step
 
     # 2. post_memory_vault — spec §4.3: sequence_complete(
     #    "post_session_memory") ∨ interval(1800s, {DEEP_IDLE})
@@ -239,13 +288,17 @@ def build_core_pipelines() -> list[Pipeline]:
         _stub_step,
     )
 
-    # 3. weekly_adhd_profile
+    # 3. weekly_adhd_profile — Phase 8b: real handler replaces stub.
+    from kora_v2.agents.background.memory_steward_handlers import (
+        adhd_profile_refine_step,
+    )
+
     _add(
         "weekly_adhd_profile",
         "ADHD profile refinement (weekly).",
         [time_of_day("weekly_adhd_profile", at=dtime(2, 0))],
         "bounded_background",
-        _stub_step,
+        adhd_profile_refine_step,
     )
 
     # 4. user_autonomous_task — real step function from pipeline_factory.

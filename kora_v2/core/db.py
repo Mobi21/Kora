@@ -449,6 +449,15 @@ CREATE TABLE IF NOT EXISTS session_transcripts (
     emotional_trajectory TEXT,        -- from session bridge
     processed_at TEXT                 -- NULL until extraction stage consumes it
 );
+
+-- Phase 8b: Dedup rejection pairs — persists LLM "distinct" verdicts so the
+-- same pair is not re-evaluated every session.
+CREATE TABLE IF NOT EXISTS dedup_rejected_pairs (
+    id_a TEXT NOT NULL,
+    id_b TEXT NOT NULL,
+    rejected_at TEXT NOT NULL,
+    PRIMARY KEY (id_a, id_b)
+);
 """
 
 _TURN_TRACE_MIGRATIONS: tuple[tuple[str, str], ...] = (

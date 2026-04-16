@@ -53,7 +53,8 @@ class TestInitOperationalDb:
             count = (await cursor.fetchone())[0]
         # Phase 5 added calendar_entries, finance_log, energy_log -> 27.
         # Phase 8a added signal_queue, session_transcripts -> 29.
-        assert count == 29
+        # Phase 8b added dedup_rejected_pairs -> 30.
+        assert count == 30
 
     async def test_sessions_table_schema(self, tmp_path):
         """Verify column names for sessions table."""

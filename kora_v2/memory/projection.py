@@ -701,6 +701,7 @@ class ProjectionDB:
     async def deduplicate(
         self,
         threshold: float = 0.92,
+        excluded_pairs: set[tuple[str, str]] | None = None,
     ) -> list[DuplicatePair]:
         """Find near-duplicate active notes using embedding similarity.
 
@@ -708,6 +709,9 @@ class ProjectionDB:
 
         Args:
             threshold: Minimum cosine similarity to consider records duplicates.
+            excluded_pairs: Set of ``(id_a, id_b)`` tuples (sorted) that have
+                previously been rejected as distinct by the LLM. These pairs
+                are skipped so they are not re-evaluated every session.
 
         Returns:
             List of DuplicatePair with similarity scores.
@@ -717,7 +721,7 @@ class ProjectionDB:
             return []
 
         pairs: list[DuplicatePair] = []
-        seen_pairs: set[tuple[str, str]] = set()
+        seen_pairs: set[tuple[str, str]] = set(excluded_pairs or set())
 
         for table, vec_table in [
             ("memories", "memories_vec"),
