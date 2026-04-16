@@ -37,6 +37,21 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from kora_v2.agents.background.proactive_handlers import (
+    anticipatory_prep_step,
+    article_digest_step,
+    commitment_tracking_step,
+    connection_making_step,
+    contextual_engagement_step,
+    continuity_check_step,
+    draft_on_observation_step,
+    follow_through_draft_step,
+    proactive_pattern_scan_step,
+    proactive_research_step,
+    stuck_detection_step,
+    wake_up_preparation_step,
+    weekly_triage_step,
+)
 from kora_v2.runtime.orchestration.pipeline import (
     FailurePolicy,
     InterruptionPolicy,
@@ -207,21 +222,104 @@ def build_core_pipelines() -> list[Pipeline]:
         )
         step_map[name] = step_fn
 
-    # 1. post_session_memory
-    _add(
-        "post_session_memory",
-        "Memory Steward: extract → consolidate → dedup → entities.",
-        [event("post_session_memory", event_type="SESSION_END")],
-        "bounded_background",
-        _stub_step,
+    # 1. post_session_memory — Phase 8b: 5-stage pipeline with dependency
+    #    edges (extract → consolidate → dedup → entities → vault_handoff).
+    #    Replaces the single-stage stub from Slice 7.5b.
+    from kora_v2.agents.background.memory_steward_handlers import (
+        consolidate_step,
+        dedup_step,
+        entities_step,
+        extract_step,
+        vault_handoff_step,
     )
 
-    # 2. post_memory_vault — spec §4.3: sequence_complete(
-    #    "post_session_memory") ∨ interval(1800s, {DEEP_IDLE})
-    _add(
-        "post_memory_vault",
-        "Vault Organizer: reindex → structure → links → moc_sessions.",
-        [
+    post_session_memory_pipeline = Pipeline(
+        name="post_session_memory",
+        description="Memory Steward: extract → consolidate → dedup → entities → vault_handoff.",
+        stages=[
+            PipelineStage(
+                name="extract",
+                task_preset="bounded_background",
+                goal_template="Extract facts from session transcripts and signals",
+                depends_on=[],
+            ),
+            PipelineStage(
+                name="consolidate",
+                task_preset="bounded_background",
+                goal_template="Consolidate semantically related notes",
+                depends_on=["extract"],
+            ),
+            PipelineStage(
+                name="dedup",
+                task_preset="bounded_background",
+                goal_template="Deduplicate near-identical notes",
+                depends_on=["consolidate"],
+            ),
+            PipelineStage(
+                name="entities",
+                task_preset="bounded_background",
+                goal_template="Resolve fuzzy entity matches",
+                depends_on=["dedup"],
+            ),
+            PipelineStage(
+                name="vault_handoff",
+                task_preset="bounded_background",
+                goal_template="Signal memory pipeline completion",
+                depends_on=["entities"],
+            ),
+        ],
+        triggers=[event("post_session_memory", event_type="SESSION_END")],
+        interruption_policy=InterruptionPolicy.PAUSE_ON_CONVERSATION,
+        failure_policy=FailurePolicy.FAIL_PIPELINE,
+        intent_duration="indefinite",
+    )
+    pipelines.append(post_session_memory_pipeline)
+    step_map["post_session_memory:extract"] = extract_step
+    step_map["post_session_memory:consolidate"] = consolidate_step
+    step_map["post_session_memory:dedup"] = dedup_step
+    step_map["post_session_memory:entities"] = entities_step
+    step_map["post_session_memory:vault_handoff"] = vault_handoff_step
+
+    # 2. post_memory_vault — Phase 8c: 4-stage pipeline with dependency
+    #    edges (reindex → structure → links → moc_sessions).
+    #    Replaces the single-stage stub from Slice 7.5b.
+    from kora_v2.agents.background.vault_organizer_handlers import (
+        links_step,
+        moc_sessions_step,
+        reindex_step,
+        structure_step,
+    )
+
+    post_memory_vault_pipeline = Pipeline(
+        name="post_memory_vault",
+        description="Vault Organizer: reindex → structure → links → moc_sessions.",
+        stages=[
+            PipelineStage(
+                name="reindex",
+                task_preset="bounded_background",
+                goal_template="Detect stale entries, re-embed, handle new/deleted files",
+                depends_on=[],
+            ),
+            PipelineStage(
+                name="structure",
+                task_preset="bounded_background",
+                goal_template="Enforce folder hierarchy, triage Inbox",
+                depends_on=["reindex"],
+            ),
+            PipelineStage(
+                name="links",
+                task_preset="bounded_background",
+                goal_template="Inject wikilinks, generate entity pages",
+                depends_on=["structure"],
+            ),
+            PipelineStage(
+                name="moc_sessions",
+                task_preset="bounded_background",
+                goal_template="Regenerate MOC pages, mirror session bridges",
+                depends_on=["links"],
+            ),
+        ],
+        triggers=[
             any_of(
                 "post_memory_vault",
                 sequence_complete(
@@ -235,17 +333,27 @@ def build_core_pipelines() -> list[Pipeline]:
                 ),
             )
         ],
-        "bounded_background",
-        _stub_step,
+        interruption_policy=InterruptionPolicy.PAUSE_ON_CONVERSATION,
+        failure_policy=FailurePolicy.FAIL_PIPELINE,
+        intent_duration="indefinite",
+    )
+    pipelines.append(post_memory_vault_pipeline)
+    step_map["post_memory_vault:reindex"] = reindex_step
+    step_map["post_memory_vault:structure"] = structure_step
+    step_map["post_memory_vault:links"] = links_step
+    step_map["post_memory_vault:moc_sessions"] = moc_sessions_step
+
+    # 3. weekly_adhd_profile — Phase 8b: real handler replaces stub.
+    from kora_v2.agents.background.memory_steward_handlers import (
+        adhd_profile_refine_step,
     )
 
-    # 3. weekly_adhd_profile
     _add(
         "weekly_adhd_profile",
         "ADHD profile refinement (weekly).",
         [time_of_day("weekly_adhd_profile", at=dtime(2, 0))],
         "bounded_background",
-        _stub_step,
+        adhd_profile_refine_step,
     )
 
     # 4. user_autonomous_task — real step function from pipeline_factory.
@@ -282,25 +390,25 @@ def build_core_pipelines() -> list[Pipeline]:
         _stub_step,
     )
 
-    # 6. wake_up_preparation
+    # 6. wake_up_preparation — Phase 8e: real handler replaces stub.
     _add(
         "wake_up_preparation",
         "Morning briefing preparation (user.wake_time - 45m).",
         [time_of_day("wake_up_preparation", at=dtime(6, 15))],
         "bounded_background",
-        _stub_step,
+        wake_up_preparation_step,
     )
 
-    # 7. continuity_check
+    # 7. continuity_check — Phase 8e: real handler replaces stub.
     _add(
         "continuity_check",
         "Meeting reminders, medication windows, routine nudges.",
         [interval("continuity_check", every=timedelta(seconds=300))],
         "bounded_background",
-        _stub_step,
+        continuity_check_step,
     )
 
-    # 8. proactive_pattern_scan
+    # 8. proactive_pattern_scan — Phase 8e: real handler replaces stub.
     _add(
         "proactive_pattern_scan",
         "ProactiveAgent Area A — pattern-based noticing.",
@@ -320,10 +428,10 @@ def build_core_pipelines() -> list[Pipeline]:
             )
         ],
         "bounded_background",
-        _stub_step,
+        proactive_pattern_scan_step,
     )
 
-    # 9. anticipatory_prep
+    # 9. anticipatory_prep — Phase 8e: real handler replaces stub.
     _add(
         "anticipatory_prep",
         "ProactiveAgent Area B — prep for upcoming events.",
@@ -339,21 +447,21 @@ def build_core_pipelines() -> list[Pipeline]:
             )
         ],
         "long_background",
-        _stub_step,
+        anticipatory_prep_step,
         intent_duration="long",
     )
 
-    # 10. proactive_research
+    # 10. proactive_research — Phase 8e: real handler replaces stub.
     _add(
         "proactive_research",
         "ProactiveAgent Area C — deep-dive research.",
         [user_action("proactive_research", action_name="dispatch_research")],
         "long_background",
-        _stub_step,
+        proactive_research_step,
         intent_duration="long",
     )
 
-    # 11. article_digest
+    # 11. article_digest — Phase 8e: real handler replaces stub.
     _add(
         "article_digest",
         "ProactiveAgent Area C — article summarization.",
@@ -365,11 +473,11 @@ def build_core_pipelines() -> list[Pipeline]:
             )
         ],
         "long_background",
-        _stub_step,
+        article_digest_step,
         intent_duration="long",
     )
 
-    # 12. follow_through_draft
+    # 12. follow_through_draft — Phase 8e: real handler replaces stub.
     _add(
         "follow_through_draft",
         "ProactiveAgent Area C — draft on observed need.",
@@ -379,10 +487,10 @@ def build_core_pipelines() -> list[Pipeline]:
             )
         ],
         "bounded_background",
-        _stub_step,
+        follow_through_draft_step,
     )
 
-    # 13. contextual_engagement
+    # 13. contextual_engagement — Phase 8e: real handler replaces stub.
     _add(
         "contextual_engagement",
         "ProactiveAgent Area D — context-driven engagement.",
@@ -405,19 +513,19 @@ def build_core_pipelines() -> list[Pipeline]:
             )
         ],
         "bounded_background",
-        _stub_step,
+        contextual_engagement_step,
     )
 
-    # 14. commitment_tracking
+    # 14. commitment_tracking — Phase 8e: real handler replaces stub.
     _add(
         "commitment_tracking",
         "ProactiveAgent Area E — scan transcripts for commitments.",
         [time_of_day("commitment_tracking", at=dtime(1, 0))],
         "bounded_background",
-        _stub_step,
+        commitment_tracking_step,
     )
 
-    # 15. stuck_detection
+    # 15. stuck_detection — Phase 8e: real handler replaces stub.
     _add(
         "stuck_detection",
         "ProactiveAgent Area E — detect stuck work.",
@@ -429,34 +537,34 @@ def build_core_pipelines() -> list[Pipeline]:
             )
         ],
         "bounded_background",
-        _stub_step,
+        stuck_detection_step,
     )
 
-    # 16. weekly_triage
+    # 16. weekly_triage — Phase 8e: real handler replaces stub.
     _add(
         "weekly_triage",
         "ProactiveAgent Area E — weekly review.",
         [time_of_day("weekly_triage", at=dtime(9, 0))],
         "bounded_background",
-        _stub_step,
+        weekly_triage_step,
     )
 
-    # 17. draft_on_observation
+    # 17. draft_on_observation — Phase 8e: real handler replaces stub.
     _add(
         "draft_on_observation",
         "ProactiveAgent Area E — draft assist on stated need.",
         [event("draft_on_observation", event_type="USER_STATED_NEED")],
         "bounded_background",
-        _stub_step,
+        draft_on_observation_step,
     )
 
-    # 18. connection_making
+    # 18. connection_making — Phase 8e: real handler replaces stub.
     _add(
         "connection_making",
         "ProactiveAgent Area E — vault cross-references.",
         [time_of_day("connection_making", at=dtime(3, 0))],
         "bounded_background",
-        _stub_step,
+        connection_making_step,
     )
 
     # 19. session_bridge_pruning (REAL — replaces BackgroundWorker job)

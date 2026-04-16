@@ -74,6 +74,25 @@ def test_other_pipelines_use_stub_step() -> None:
         "session_bridge_pruning",
         "skill_refinement",
         "user_autonomous_task",
+        # Phase 8b: these have real handlers now
+        "post_session_memory",
+        "weekly_adhd_profile",
+        # Phase 8c: post_memory_vault has 4 real stage handlers
+        "post_memory_vault",
+        # Phase 8e: 13 proactive/infrastructure pipelines have real handlers
+        "wake_up_preparation",
+        "continuity_check",
+        "proactive_pattern_scan",
+        "anticipatory_prep",
+        "proactive_research",
+        "article_digest",
+        "follow_through_draft",
+        "contextual_engagement",
+        "commitment_tracking",
+        "stuck_detection",
+        "weekly_triage",
+        "draft_on_observation",
+        "connection_making",
     }
     for name in stub_names:
         assert fns[name] is _stub_step
@@ -86,10 +105,31 @@ def test_each_pipeline_has_at_least_one_trigger() -> None:
 
 
 def test_each_pipeline_has_single_stage() -> None:
+    """All pipelines have a single stage EXCEPT post_session_memory
+    (5 stages, Phase 8b) and post_memory_vault (4 stages, Phase 8c).
+    """
     pipelines = build_core_pipelines()
     for p in pipelines:
-        assert len(p.stages) == 1
-        assert p.stages[0].name == "run"
+        if p.name == "post_session_memory":
+            assert len(p.stages) == 5
+            assert [s.name for s in p.stages] == [
+                "extract",
+                "consolidate",
+                "dedup",
+                "entities",
+                "vault_handoff",
+            ]
+        elif p.name == "post_memory_vault":
+            assert len(p.stages) == 4
+            assert [s.name for s in p.stages] == [
+                "reindex",
+                "structure",
+                "links",
+                "moc_sessions",
+            ]
+        else:
+            assert len(p.stages) == 1
+            assert p.stages[0].name == "run"
 
 
 async def test_register_core_pipelines_populates_engine(tmp_path: Path) -> None:
@@ -104,6 +144,85 @@ async def test_register_core_pipelines_populates_engine(tmp_path: Path) -> None:
     names = {p.name for p in engine.pipelines.all()}
     for expected in EXPECTED_PIPELINE_NAMES:
         assert expected in names
+
+
+def test_post_session_memory_has_real_step_functions() -> None:
+    """Phase 8b: post_session_memory stages are wired to real handlers."""
+    from kora_v2.agents.background.memory_steward_handlers import (
+        consolidate_step,
+        dedup_step,
+        entities_step,
+        extract_step,
+        vault_handoff_step,
+    )
+
+    build_core_pipelines()
+    fns = core_step_fns()
+    assert fns["post_session_memory:extract"] is extract_step
+    assert fns["post_session_memory:consolidate"] is consolidate_step
+    assert fns["post_session_memory:dedup"] is dedup_step
+    assert fns["post_session_memory:entities"] is entities_step
+    assert fns["post_session_memory:vault_handoff"] is vault_handoff_step
+
+
+def test_weekly_adhd_profile_has_real_step_function() -> None:
+    """Phase 8b: weekly_adhd_profile uses the real ADHD handler."""
+    from kora_v2.agents.background.memory_steward_handlers import (
+        adhd_profile_refine_step,
+    )
+
+    build_core_pipelines()
+    fns = core_step_fns()
+    assert fns["weekly_adhd_profile"] is adhd_profile_refine_step
+
+
+def test_post_session_memory_stage_dependencies() -> None:
+    """Phase 8b: stages have correct dependency edges."""
+    pipelines = build_core_pipelines()
+    by_name = {p.name: p for p in pipelines}
+    psm = by_name["post_session_memory"]
+    stage_deps = {s.name: s.depends_on for s in psm.stages}
+    assert stage_deps["extract"] == []
+    assert stage_deps["consolidate"] == ["extract"]
+    assert stage_deps["dedup"] == ["consolidate"]
+    assert stage_deps["entities"] == ["dedup"]
+    assert stage_deps["vault_handoff"] == ["entities"]
+
+
+def test_phase_8e_pipelines_have_real_step_functions() -> None:
+    """Phase 8e: the 13 proactive/infrastructure pipelines are wired to
+    the real handlers in ``proactive_handlers``."""
+    from kora_v2.agents.background.proactive_handlers import (
+        anticipatory_prep_step,
+        article_digest_step,
+        commitment_tracking_step,
+        connection_making_step,
+        contextual_engagement_step,
+        continuity_check_step,
+        draft_on_observation_step,
+        follow_through_draft_step,
+        proactive_pattern_scan_step,
+        proactive_research_step,
+        stuck_detection_step,
+        wake_up_preparation_step,
+        weekly_triage_step,
+    )
+
+    build_core_pipelines()
+    fns = core_step_fns()
+    assert fns["wake_up_preparation"] is wake_up_preparation_step
+    assert fns["continuity_check"] is continuity_check_step
+    assert fns["proactive_pattern_scan"] is proactive_pattern_scan_step
+    assert fns["anticipatory_prep"] is anticipatory_prep_step
+    assert fns["proactive_research"] is proactive_research_step
+    assert fns["article_digest"] is article_digest_step
+    assert fns["follow_through_draft"] is follow_through_draft_step
+    assert fns["contextual_engagement"] is contextual_engagement_step
+    assert fns["commitment_tracking"] is commitment_tracking_step
+    assert fns["stuck_detection"] is stuck_detection_step
+    assert fns["weekly_triage"] is weekly_triage_step
+    assert fns["draft_on_observation"] is draft_on_observation_step
+    assert fns["connection_making"] is connection_making_step
 
 
 def test_post_memory_vault_uses_sequence_complete_trigger() -> None:

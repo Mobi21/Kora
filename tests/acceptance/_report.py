@@ -18,6 +18,39 @@ from typing import Any
 _PROJECT_ROOT = Path(__file__).parents[2].resolve()
 
 
+# ── Tool buckets ──────────────────────────────────────────────────────────────
+# Single source of truth for the report and the harness ``tool-usage-summary``
+# command. ``tests/unit/acceptance/test_tool_buckets.py`` enforces both
+# call sites use the same dict.
+#
+# ``orchestration_tools`` replaces the retired ``start_autonomous`` /
+# ``auto_tools`` bucket. The 7 supervisor orchestration tools come from
+# ``SUPERVISOR_TOOLS`` in ``kora_v2/graph/dispatch.py`` (Phase 7.5b).
+TOOL_BUCKETS: dict[str, set[str]] = {
+    "life_tools": {
+        "log_medication", "log_meal", "create_reminder",
+        "query_reminders", "query_medications", "query_meals",
+        "query_focus_blocks", "quick_note",
+        "start_focus_block", "end_focus_block",
+    },
+    "filesystem_tools": {
+        "read_file", "write_file", "list_directory",
+        "create_directory", "file_exists",
+    },
+    "mcp_tools": {"search_web", "fetch_url"},
+    "orchestration_tools": {
+        "decompose_and_dispatch",
+        "get_running_tasks",
+        "get_task_progress",
+        "get_working_doc",
+        "cancel_task",
+        "modify_task",
+        "record_decision",
+    },
+    "memory_tools": {"recall"},
+}
+
+
 def _normalize_tool_name(tc: Any) -> str:
     """Strip auth wrapper / bracket markers to get the real tool name.
 
@@ -131,7 +164,20 @@ def _auto_mark_coverage(
     ):
         auto[11] = "x"
 
-    # Item 12 (newly ACTIVE): BackgroundWorker has registered items
+    # Item 8 (un-deferred in AT1): decompose_and_dispatch creates a
+    # pipeline_instance with sub-tasks. Tool-call evidence is the AT1
+    # signal; AT3 will add a real query against pipeline_instances /
+    # worker_tasks for the multi-stage check.
+    if tool_counts.get("decompose_and_dispatch", 0) >= 1:
+        auto[8] = "x"
+
+    # Item 12 (un-deferred in AT1): real background pipelines fire during
+    # DEEP_IDLE. The legacy BackgroundWorker count was dropped along
+    # with the worker itself (Phase 7.5); the equivalent post-7.5 signal
+    # is "any orchestration core pipeline has logged a row in
+    # work_ledger". Until AT3 wires that query, we accept the legacy
+    # status field as a fallback if the harness still sets it, and
+    # otherwise leave the item for operator marking.
     if latest_status and latest_status.get("background_worker_items", 0) >= 1:
         auto[12] = "x"
 
@@ -152,11 +198,16 @@ def _auto_mark_coverage(
         elif has_approved or has_denied:
             auto[17] = "~"
 
-    # Item 21: autonomous execution
-    if auto_state.get("available") and (
-        auto_state.get("plans")
+    # Item 21: long-running autonomous execution via decompose_and_dispatch.
+    # AT3 will replace this with an evidence query against
+    # pipeline_instances WHERE intent_duration='long'. For now we accept
+    # any decompose_and_dispatch tool call as best-effort signal; the
+    # legacy auto_state-derived counters have been removed (the
+    # autonomous_plans / autonomous_checkpoints tables were retired in
+    # Phase 7.5 along with start_autonomous).
+    if (
+        tool_counts.get("decompose_and_dispatch", 0) >= 1
         or auto_state.get("total_items", 0) > 0
-        or auto_state.get("checkpoint_count", 0) > 0
     ):
         auto[21] = "x"
 
@@ -173,7 +224,7 @@ def _auto_mark_coverage(
         if total_records > 0:
             auto[23] = "x"
 
-    # Item 24: capability pack surface — either a real call OR a pack
+    # Item 100: capability pack surface — either a real call OR a pack
     # that reports unconfigured/degraded with a remediation hint.
     any_cap_calls = bool(
         tool_usage.get("capability_workspace")
@@ -181,28 +232,35 @@ def _auto_mark_coverage(
         or tool_usage.get("capability_vault")
     )
     if any_cap_calls:
-        auto[24] = "x"
+        auto[100] = "x"
     elif cap_health:
         for pack_name in ("workspace", "browser", "vault", "doctor"):
             info = cap_health.get(pack_name, {})
             if info.get("status") in (
                 "unconfigured", "degraded", "unhealthy", "unimplemented"
             ) and info.get("remediation"):
-                auto[24] = "x"
+                auto[100] = "x"
                 break
 
-    # Item 25: disclosed-failure path — the assistant acknowledged a
+    # Item 101: disclosed-failure path — the assistant acknowledged a
     # tool failure plainly rather than silent fallback.
     if _msg_mentions(
         "unavailable", "failed", "permission denied", "can't pull",
         "couldn't", "not available",
     ):
-        auto[25] = "x"
+        auto[101] = "x"
 
-    # Item 26: policy matrix — 4 capability packs visible + policy
+    # Item 102: policy matrix — 4 capability packs visible + policy
     # grants section has data.
     if len(cap_health) >= 4:
-        auto[26] = "x"
+        auto[102] = "x"
+
+    # Items 24-67 (Phase 7.5 + Phase 8 orchestration / memory / vault /
+    # context / proactive coverage) all need real evidence queries
+    # against orchestration tables (pipeline_instances, worker_tasks,
+    # work_ledger, system_state_log, runtime_pipelines, open_decisions).
+    # AT3 wires those queries; for AT1 they are intentionally left for
+    # operator marking via coverage.md.
 
     return auto
 
@@ -299,17 +357,18 @@ def _extract_tool_usage(messages: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             tool_counts[name] = tool_counts.get(name, 0) + 1
 
-    life_tools = {
-        "log_medication", "log_meal", "create_reminder",
-        "query_reminders", "query_medications", "query_meals",
-        "query_focus_blocks", "quick_note",
-        "start_focus_block", "end_focus_block",
-    }
-    fs_tools = {"read_file", "write_file", "list_directory", "create_directory", "file_exists"}
+    # Buckets must mirror tests/acceptance/_harness_server.py:cmd_tool_usage_summary.
+    # Test test_buckets_consistent enforces alignment; update both when adding tools.
+    #
+    # ``orchestration_tools`` replaces the retired ``auto_tools`` /
+    # ``start_autonomous`` bucket. The 7 supervisor orchestration tools
+    # below come from kora_v2/graph/dispatch.py SUPERVISOR_TOOLS (Phase 7.5b).
+    life_tools = TOOL_BUCKETS["life_tools"]
+    fs_tools = TOOL_BUCKETS["filesystem_tools"]
     # Legacy MCP tool names — kept for backward-compat; capability tools go in their own buckets
-    mcp_tools = {"search_web", "fetch_url"}
-    auto_tools = {"start_autonomous"}
-    memory_tools = {"recall"}
+    mcp_tools = TOOL_BUCKETS["mcp_tools"]
+    orchestration_tools = TOOL_BUCKETS["orchestration_tools"]
+    memory_tools = TOOL_BUCKETS["memory_tools"]
 
     # Capability-pack buckets: any tool name starting with the pack prefix.
     capability_workspace = sorted(
@@ -329,8 +388,13 @@ def _extract_tool_usage(messages: list[dict[str, Any]]) -> dict[str, Any]:
         "life_management": sorted(t for t in tool_counts if t in life_tools),
         "filesystem": sorted(t for t in tool_counts if t in fs_tools),
         "mcp": sorted(t for t in tool_counts if t in mcp_tools),
-        "autonomous": sorted(t for t in tool_counts if t in auto_tools),
+        "orchestration": sorted(t for t in tool_counts if t in orchestration_tools),
         "memory": sorted(t for t in tool_counts if t in memory_tools),
+        # AT3 placeholder: pipelines fire from triggers, not tool calls, so
+        # they need a separate bucketing path (likely a query against the
+        # pipeline_instances table). Empty list keeps the report shape
+        # stable until AT3 wires it up.
+        "pipelines": [],
         # Phase 9 capability-pack buckets
         "capability_workspace": capability_workspace,
         "capability_browser": capability_browser,
@@ -549,6 +613,209 @@ async def _query_autonomous_state() -> dict[str, Any]:
         return {"available": False}
 
 
+def _render_benchmarks_dashboard(snapshots_dir: Path) -> list[str]:
+    """Render the AT4 Benchmarks dashboard from sidecar JSON files.
+
+    Reads ``<snapshot>.benchmarks.json`` sidecars under ``snapshots_dir``
+    (mtime-sorted), renders the latest as a multi-table markdown
+    dashboard, and appends a trend mini-table if more than one sidecar
+    is present. Returns an empty list when no sidecar exists so the
+    caller can append unconditionally.
+    """
+    if not snapshots_dir.exists():
+        return []
+    bench_files = sorted(
+        snapshots_dir.glob("*.benchmarks.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not bench_files:
+        return []
+
+    latest_path = bench_files[-1]
+    try:
+        bench = json.loads(latest_path.read_text())
+    except Exception:
+        return []
+    if not isinstance(bench, dict):
+        return []
+
+    out: list[str] = []
+    out.append(f"\n## Benchmarks (latest: {latest_path.stem})")
+
+    # ── Latency ──
+    out.append("\n### Latency")
+    out.append("| Metric | Value |")
+    out.append("| ------ | ----- |")
+    out.append(f"| Responses | {int(bench.get('response_count', 0) or 0)} |")
+    out.append(
+        f"| p50 latency | {bench.get('response_latency_p50_ms', 0)} ms |"
+    )
+    out.append(
+        f"| p95 latency | {bench.get('response_latency_p95_ms', 0)} ms |"
+    )
+
+    # ── Token usage ──
+    prompt = int(bench.get("total_prompt_tokens", 0) or 0)
+    completion = int(bench.get("total_completion_tokens", 0) or 0)
+    mean_resp = bench.get("tokens_per_response_mean", 0)
+    out.append("\n### Token Usage")
+    out.append("| Prompt | Completion | Mean / response |")
+    out.append("| ------ | ---------- | --------------- |")
+    out.append(f"| {prompt} | {completion} | {mean_resp} |")
+
+    # ── Request budget (5h sliding window) ──
+    by_class = bench.get("requests_by_class") or {}
+    if isinstance(by_class, dict) and by_class:
+        out.append("\n### Request Budget (5h sliding window)")
+        out.append("| Class | Count | Remaining fraction |")
+        out.append("| ----- | ----- | ------------------ |")
+        remaining = bench.get("remaining_budget_fraction", 1.0)
+        for cls, count in sorted(by_class.items()):
+            out.append(f"| {cls} | {int(count or 0)} | {remaining} |")
+
+    # ── Compaction ──
+    tier_counts = bench.get("compaction_tier_counts") or {}
+    if isinstance(tier_counts, dict) and tier_counts:
+        out.append("\n### Compaction")
+        out.append("| Tier | Count |")
+        out.append("| ---- | ----- |")
+        for tier, count in sorted(tier_counts.items()):
+            out.append(f"| {tier} | {int(count or 0)} |")
+
+    # ── Pipelines ──
+    fires_by_name = bench.get("pipeline_fires_by_name") or {}
+    fires_by_trigger = bench.get("pipeline_fires_by_trigger_type") or {}
+    if isinstance(fires_by_name, dict) and fires_by_name:
+        out.append("\n### Pipelines")
+        out.append("| Name | Fires |")
+        out.append("| ---- | ----- |")
+        for name, count in sorted(
+            fires_by_name.items(), key=lambda kv: -int(kv[1] or 0)
+        ):
+            out.append(f"| {name} | {int(count or 0)} |")
+    success = int(bench.get("pipeline_success_count", 0) or 0)
+    fail = int(bench.get("pipeline_fail_count", 0) or 0)
+    if isinstance(fires_by_trigger, dict) and fires_by_trigger:
+        out.append("\n**By trigger type**")
+        out.append("| Trigger | Fires |")
+        out.append("| ------- | ----- |")
+        for trig, count in sorted(fires_by_trigger.items()):
+            out.append(f"| {trig} | {int(count or 0)} |")
+    if success or fail or fires_by_name:
+        out.append(f"\n_Pipeline outcomes: success={success}, fail={fail}_")
+
+    # ── Notifications ──
+    notif_tier = bench.get("notifications_by_tier") or {}
+    notif_reason = bench.get("notifications_by_reason") or {}
+    if (isinstance(notif_tier, dict) and notif_tier) or (
+        isinstance(notif_reason, dict) and notif_reason
+    ):
+        out.append("\n### Notifications")
+        if isinstance(notif_tier, dict) and notif_tier:
+            out.append("| Tier | Count |")
+            out.append("| ---- | ----- |")
+            for tier, count in sorted(notif_tier.items()):
+                out.append(f"| {tier} | {int(count or 0)} |")
+        if isinstance(notif_reason, dict) and notif_reason:
+            out.append("\n**By reason**")
+            out.append("| Reason | Count |")
+            out.append("| ------ | ----- |")
+            for reason, count in sorted(notif_reason.items()):
+                out.append(f"| {reason} | {int(count or 0)} |")
+
+    # ── Memory lifecycle ──
+    out.append("\n### Memory Lifecycle")
+    out.append(
+        "| Memories created | Consolidated | Dedup-merged | "
+        "Entities created | Entities merged |"
+    )
+    out.append(
+        "| ---------------- | ------------ | ------------ | "
+        "---------------- | --------------- |"
+    )
+    out.append(
+        f"| {int(bench.get('memories_created', 0) or 0)} "
+        f"| {int(bench.get('memories_consolidated', 0) or 0)} "
+        f"| {int(bench.get('memories_dedup_merged', 0) or 0)} "
+        f"| {int(bench.get('entities_created', 0) or 0)} "
+        f"| {int(bench.get('entities_merged', 0) or 0)} |"
+    )
+
+    # ── Vault ──
+    out.append("\n### Vault")
+    out.append(
+        "| Notes | Wikilinks | Entity pages | MOC pages | "
+        "Active working docs |"
+    )
+    out.append(
+        "| ----- | --------- | ------------ | --------- | "
+        "------------------- |"
+    )
+    out.append(
+        f"| {int(bench.get('vault_notes_total', 0) or 0)} "
+        f"| {int(bench.get('vault_wikilinks_total', 0) or 0)} "
+        f"| {int(bench.get('vault_entity_pages', 0) or 0)} "
+        f"| {int(bench.get('vault_moc_pages', 0) or 0)} "
+        f"| {int(bench.get('vault_working_docs_active', 0) or 0)} |"
+    )
+
+    # ── Phase dwell time ──
+    dwell = bench.get("phase_dwell_seconds") or {}
+    if isinstance(dwell, dict) and dwell:
+        out.append("\n### Phase Dwell Time")
+        out.append("| SystemStatePhase | Seconds |")
+        out.append("| ---------------- | ------- |")
+        for phase, secs in sorted(dwell.items()):
+            try:
+                secs_f = float(secs)
+            except (TypeError, ValueError):
+                secs_f = 0.0
+            out.append(f"| {phase} | {secs_f} |")
+
+    # ── Trend across snapshots ──
+    if len(bench_files) >= 2:
+        trend_rows: list[dict[str, Any]] = []
+        for path in bench_files:
+            try:
+                row = json.loads(path.read_text())
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            trend_rows.append({
+                "snapshot": path.stem.replace(".benchmarks", ""),
+                "p50": row.get("response_latency_p50_ms", 0),
+                "p95": row.get("response_latency_p95_ms", 0),
+                "remaining": row.get("remaining_budget_fraction", 1.0),
+                "memories": int(row.get("vault_notes_total", 0) or 0),
+                "working_docs": int(
+                    row.get("vault_working_docs_active", 0) or 0
+                ),
+            })
+        if trend_rows:
+            out.append("\n### Trend across snapshots")
+            out.append(
+                "| Snapshot | p50 ms | p95 ms | Budget remaining "
+                "| Vault notes | Working docs |"
+            )
+            out.append(
+                "| -------- | ------ | ------ | ---------------- "
+                "| ----------- | ------------ |"
+            )
+            for r in trend_rows:
+                out.append(
+                    f"| {r['snapshot']} | {r['p50']} | {r['p95']} "
+                    f"| {r['remaining']} | {r['memories']} "
+                    f"| {r['working_docs']} |"
+                )
+            out.append(
+                f"\n_Trend store: `data/acceptance/benchmarks.csv` "
+                f"({len(bench_files)} sidecar(s) in snapshots/)_"
+            )
+
+    return out
+
+
 async def build_report(
     session_state: dict[str, Any],
     snapshots_dir: Path,
@@ -658,10 +925,18 @@ async def build_report(
     else:
         lines.append("- MCP (web): (no tools called)")
 
-    if tool_usage["autonomous"]:
-        lines.append(f"- Autonomous: {', '.join(tool_usage['autonomous'])}")
+    if tool_usage["orchestration"]:
+        lines.append(
+            f"- Orchestration: {', '.join(tool_usage['orchestration'])}"
+        )
     else:
-        lines.append("- Autonomous: (no tools called)")
+        lines.append("- Orchestration: (no tools called)")
+
+    # AT3 will populate the pipelines bucket from pipeline_instances / work_ledger.
+    lines.append(
+        "- Pipelines: (AT3 will fill this in; pipelines fire from triggers, "
+        "not tool calls)"
+    )
 
     if tool_usage["capability_workspace"]:
         lines.append(f"- Capability (workspace): {', '.join(tool_usage['capability_workspace'])}")
@@ -789,12 +1064,12 @@ async def build_report(
                     f"- [{u.get('update_type', '?')}] "
                     f"{(u.get('summary') or '')[:140]}"
                 )
-    elif tool_usage["autonomous"] or total_items_auto > 0:
+    elif tool_usage["orchestration"] or total_items_auto > 0:
         lines.append("\n## Autonomous Execution")
         lines.append(
-            "start_autonomous was called but no plan rows were found — "
-            "the harness may have wiped autonomous_plans between "
-            f"restarts (total items in DB: {total_items_auto}, "
+            "decompose_and_dispatch fired but no plan rows were found — "
+            "AT3 will wire an evidence query against pipeline_instances / "
+            f"worker_tasks (total items in legacy DB: {total_items_auto}, "
             f"checkpoints: {auto_state.get('checkpoint_count', 0)})."
         )
         if items_by_status:
@@ -804,7 +1079,7 @@ async def build_report(
             lines.append(f"Items by status: {status_summary}")
     else:
         lines.append("\n## Autonomous Execution")
-        lines.append("No autonomous work initiated during this test run.")
+        lines.append("No long-background dispatch observed during this test run.")
         lines.append("Coverage item 21 is NOT satisfied.")
 
     # ── Compaction ────────────────────────────────────────────────────────
@@ -843,8 +1118,12 @@ async def build_report(
                 msg_count = snap.get("conversation", {}).get("message_count", "?")
                 health_status = _snapshot_health_status(snap)
                 # Include autonomous state in snapshot summary
-                auto_state = snap.get("autonomous_state", {})
-                auto_items = auto_state.get("total_items", 0) if auto_state.get("available") else "-"
+                snap_auto_state = snap.get("autonomous_state", {})
+                auto_items = (
+                    snap_auto_state.get("total_items", 0)
+                    if snap_auto_state.get("available")
+                    else "-"
+                )
                 lines.append(
                     f"- **{snap_path.stem}** @ {ts}: "
                     f"{msg_count} msgs | health={health_status} | items={auto_items}"
@@ -891,16 +1170,20 @@ async def build_report(
         gap_warnings.append("No filesystem tools used (item 22)")
     if not tool_usage["mcp"]:
         gap_warnings.append("No MCP/web tools used (item 9)")
-    if not tool_usage["autonomous"]:
-        gap_warnings.append("No autonomous work started (item 21)")
-    # Phase 9 capability-pack gap check (item 24)
+    if not tool_usage["orchestration"]:
+        gap_warnings.append(
+            "No orchestration tools used "
+            "(items 8, 21, 25-31, 43 — decompose_and_dispatch / "
+            "get_task_progress / cancel_task / record_decision)"
+        )
+    # Phase 9 capability-pack gap check (item 100)
     any_cap_calls = (
         tool_usage["capability_workspace"]
         or tool_usage["capability_browser"]
         or tool_usage["capability_vault"]
     )
     if not any_cap_calls:
-        # Check if at least one pack is UNCONFIGURED/DEGRADED (still satisfies item 24)
+        # Check if at least one pack is UNCONFIGURED/DEGRADED (still satisfies item 100)
         cap_gap = True
         for pack_name in ("workspace", "browser", "vault"):
             info = cap_health.get(pack_name, {})
@@ -909,13 +1192,21 @@ async def build_report(
                 break
         if cap_gap:
             gap_warnings.append(
-                "No capability-pack tool calls and no degraded/unconfigured packs (item 24)"
+                "No capability-pack tool calls and no degraded/unconfigured packs (item 100)"
             )
 
     if gap_warnings:
         lines.append(f"\n## Coverage Gap Warnings ({len(gap_warnings)})")
         for w in gap_warnings:
             lines.append(f"- {w}")
+
+    # ── Benchmarks dashboard (AT4) ──────────────────────────────────────
+    # Render the latest ``<snapshot>.benchmarks.json`` sidecar as a real
+    # markdown dashboard with per-category tables. When more than one
+    # sidecar exists, append a "Trend across snapshots" mini-table so
+    # the operator can see how key metrics evolved across the run. If
+    # no sidecar exists, the entire section is omitted gracefully.
+    lines.extend(_render_benchmarks_dashboard(snapshots_dir))
 
     # ── Errors ────────────────────────────────────────────────────────────
     errors = session_state.get("errors", [])

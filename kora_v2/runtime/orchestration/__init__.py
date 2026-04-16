@@ -71,6 +71,18 @@ from kora_v2.runtime.orchestration.registry import (
     WorkerTaskRegistry,
     init_orchestration_schema,
 )
+from kora_v2.runtime.orchestration.scope_validation import (
+    REJECTION_REASON_CYCLE,
+    REJECTION_REASON_NO_RECURSION,
+    REJECTION_REASON_REQUIRES_USER_APPROVAL,
+    REJECTION_REASON_UNKNOWN_DEPENDENCY,
+    REJECTION_REASONS,
+    ScopeValidationError,
+    SubTaskSpec,
+    validate_dependency_graph,
+    validate_subtask_specs,
+    validate_tool_scope,
+)
 from kora_v2.runtime.orchestration.system_state import (
     ACTIVE_IDLE_SECONDS,
     LIGHT_IDLE_SECONDS,
@@ -229,4 +241,15 @@ __all__ = [
     "ensure_profile_defaults",
     "DEFAULT_PROFILE_FRONTMATTER",
     "BootstrapResult",
+    # Sub-task scope validation (Phase 8f, spec §4a)
+    "ScopeValidationError",
+    "SubTaskSpec",
+    "validate_tool_scope",
+    "validate_dependency_graph",
+    "validate_subtask_specs",
+    "REJECTION_REASONS",
+    "REJECTION_REASON_REQUIRES_USER_APPROVAL",
+    "REJECTION_REASON_NO_RECURSION",
+    "REJECTION_REASON_CYCLE",
+    "REJECTION_REASON_UNKNOWN_DEPENDENCY",
 ]

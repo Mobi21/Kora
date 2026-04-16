@@ -18,14 +18,20 @@ Directory structure:
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
 import yaml
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from kora_v2.memory.projection import ProjectionDB
 
 logger = structlog.get_logger()
 
@@ -381,6 +387,266 @@ class FilesystemMemoryStore:
         file_path.unlink()
         logger.debug("note_deleted", note_id=note_id, path=str(file_path))
         return True
+
+    # ── Frontmatter & body updates ──────────────────────────────────
+
+    async def update_frontmatter(
+        self,
+        note_id: str,
+        updates: dict,
+    ) -> NoteMetadata | None:
+        """Parse existing YAML frontmatter, merge in updates, rewrite note preserving body.
+
+        Uses atomic write (temp file + rename) for crash safety.
+
+        Args:
+            note_id: ID of the note to update.
+            updates: Dict of frontmatter keys to set/update.
+
+        Returns:
+            Updated NoteMetadata, or None if the note was not found.
+        """
+        file_path = self._find_note_file(note_id)
+        if file_path is None:
+            logger.debug("note_not_found_for_frontmatter_update", note_id=note_id)
+            return None
+
+        text = file_path.read_text(encoding="utf-8")
+        meta_dict, body = _parse_frontmatter(text)
+
+        # Merge updates into existing frontmatter
+        meta_dict.update(updates)
+        meta_dict["updated_at"] = _now_iso()
+
+        # Atomic write: write to temp file, then rename
+        new_content = _render_note(meta_dict, body)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(file_path.parent), suffix=".md.tmp"
+        )
+        try:
+            os.write(fd, new_content.encode("utf-8"))
+            os.close(fd)
+            os.replace(tmp_path, str(file_path))
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+        logger.debug("frontmatter_updated", note_id=note_id, keys=list(updates.keys()))
+
+        return NoteMetadata(
+            id=meta_dict.get("id", note_id),
+            memory_type=meta_dict.get("memory_type", "episodic"),
+            importance=meta_dict.get("importance", 0.5),
+            entities=meta_dict.get("entities", []),
+            tags=meta_dict.get("tags", []),
+            created_at=meta_dict.get("created_at", ""),
+            updated_at=meta_dict["updated_at"],
+            source_path=str(file_path),
+        )
+
+    async def soft_delete_note(
+        self,
+        note_id: str,
+        reason: str,
+        successor_id: str | None,
+        *,
+        projection_db: ProjectionDB | None = None,
+    ) -> bool:
+        """Mark a note as soft-deleted in both filesystem frontmatter and projection DB.
+
+        Updates the note's frontmatter with ``status: soft_deleted``,
+        ``deleted_at``, and ``consolidated_into`` fields. Also calls
+        ``projection_db.soft_delete()`` if a projection DB is provided.
+
+        Args:
+            note_id: ID of the note to soft-delete.
+            reason: Reason for deletion (e.g. ``consolidated``, ``duplicate``).
+            successor_id: Optional ID of the replacement note.
+            projection_db: Optional ProjectionDB instance for atomic DB update.
+
+        Returns:
+            True if the note was found and soft-deleted, False otherwise.
+        """
+        file_path = self._find_note_file(note_id)
+        if file_path is None:
+            logger.debug("note_not_found_for_soft_delete", note_id=note_id)
+            return False
+
+        now = _now_iso()
+        status = "merged" if reason in ("consolidated", "duplicate", "merged") else "soft_deleted"
+
+        fm_updates: dict = {
+            "status": status,
+            "deleted_at": now,
+        }
+        if successor_id:
+            fm_updates["consolidated_into"] = successor_id
+
+        # Update projection DB first (rollback-capable) then filesystem
+        if projection_db is not None:
+            # Determine which table the record is in
+            for table in ("memories", "user_model_facts"):
+                record = await projection_db.get_memory_by_id(
+                    note_id, include_soft_deleted=True
+                ) if table == "memories" else await projection_db.get_fact_by_id(
+                    note_id, include_soft_deleted=True
+                )
+                if record is not None:
+                    await projection_db.soft_delete(
+                        table=table,
+                        record_id=note_id,
+                        successor_id=successor_id,
+                        reason=reason,
+                    )
+                    break
+
+        # Update filesystem frontmatter (best-effort after DB commit)
+        await self.update_frontmatter(note_id, fm_updates)
+
+        logger.debug(
+            "note_soft_deleted",
+            note_id=note_id,
+            reason=reason,
+            successor=successor_id,
+        )
+        return True
+
+    async def update_body(
+        self,
+        note_id: str,
+        new_body: str,
+    ) -> NoteMetadata | None:
+        """Rewrite a note's body content, preserving frontmatter.
+
+        Atomic write via temp file + rename.
+
+        Args:
+            note_id: ID of the note to update.
+            new_body: New body text to replace the existing body.
+
+        Returns:
+            Updated NoteMetadata, or None if the note was not found.
+        """
+        file_path = self._find_note_file(note_id)
+        if file_path is None:
+            logger.debug("note_not_found_for_body_update", note_id=note_id)
+            return None
+
+        text = file_path.read_text(encoding="utf-8")
+        meta_dict, _old_body = _parse_frontmatter(text)
+        meta_dict["updated_at"] = _now_iso()
+
+        new_content = _render_note(meta_dict, new_body)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(file_path.parent), suffix=".md.tmp"
+        )
+        try:
+            os.write(fd, new_content.encode("utf-8"))
+            os.close(fd)
+            os.replace(tmp_path, str(file_path))
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+        logger.debug("body_updated", note_id=note_id, path=str(file_path))
+
+        return NoteMetadata(
+            id=meta_dict.get("id", note_id),
+            memory_type=meta_dict.get("memory_type", "episodic"),
+            importance=meta_dict.get("importance", 0.5),
+            entities=meta_dict.get("entities", []),
+            tags=meta_dict.get("tags", []),
+            created_at=meta_dict.get("created_at", ""),
+            updated_at=meta_dict["updated_at"],
+            source_path=str(file_path),
+        )
+
+    async def move_note(
+        self,
+        note_id: str,
+        new_path: Path,
+        *,
+        projection_db: ProjectionDB | None = None,
+    ) -> NoteMetadata | None:
+        """Move a note file to a new location and update projection DB.
+
+        Args:
+            note_id: ID of the note to move.
+            new_path: Destination path for the note file.
+            projection_db: Optional ProjectionDB to update ``source_path``.
+
+        Returns:
+            Updated NoteMetadata, or None if the note was not found.
+        """
+        file_path = self._find_note_file(note_id)
+        if file_path is None:
+            logger.debug("note_not_found_for_move", note_id=note_id)
+            return None
+
+        # Ensure destination directory exists
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Read content and update source_path in metadata
+        text = file_path.read_text(encoding="utf-8")
+        meta_dict, body = _parse_frontmatter(text)
+
+        # Atomic move: write to temp file in destination dir, then os.replace
+        new_content = _render_note(meta_dict, body)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(new_path.parent), suffix=".md.tmp"
+        )
+        try:
+            os.write(fd, new_content.encode("utf-8"))
+            os.close(fd)
+            os.replace(tmp_path, str(new_path))
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+        if file_path != new_path:
+            file_path.unlink()
+
+        # Update projection DB source_path
+        if projection_db is not None:
+            for table in ("memories", "user_model_facts"):
+                try:
+                    await projection_db._db.execute(
+                        f"UPDATE {table} SET source_path = ? WHERE id = ?",  # noqa: S608
+                        (str(new_path), note_id),
+                    )
+                    await projection_db._db.commit()
+                except Exception:
+                    pass
+
+        logger.debug(
+            "note_moved", note_id=note_id,
+            from_path=str(file_path), to_path=str(new_path),
+        )
+
+        return NoteMetadata(
+            id=meta_dict.get("id", note_id),
+            memory_type=meta_dict.get("memory_type", "episodic"),
+            importance=meta_dict.get("importance", 0.5),
+            entities=meta_dict.get("entities", []),
+            tags=meta_dict.get("tags", []),
+            created_at=meta_dict.get("created_at", ""),
+            updated_at=meta_dict.get("updated_at", ""),
+            source_path=str(new_path),
+        )
 
     # ── Private helpers ──────────────────────────────────────────────
 

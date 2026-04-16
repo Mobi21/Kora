@@ -11,7 +11,7 @@ full-fidelity frontmatter roundtrip so scalar fields like
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -280,13 +280,10 @@ class SessionManager:
         """Run the session end pipeline. Returns bridge note."""
         session_id = self.active_session.session_id if self.active_session else "unknown"
 
-        # Step 1: Run signal scanner on conversation messages
+        # Step 1: Run signal scanner on conversation messages and persist to signal_queue
         scanner = getattr(self.container, "signal_scanner", None)
         if scanner and hasattr(scanner, "scan"):
-            try:
-                await scanner.scan(messages)
-            except Exception:
-                log.warning("signal_scanner_failed_at_session_end", exc_info=True)
+            await self._scan_and_persist_signals(scanner, messages, session_id)
 
         # Step 2: Save emotional state + session end record
         settings = getattr(self.container, 'settings', None)
@@ -315,7 +312,7 @@ class SessionManager:
         # Phase 5: deterministic working_on extraction from last N turns
         working_on = await self._build_working_on(session_id, messages)
 
-        # Phase 5: map self-reported energy from session → bridge scalar
+        # Phase 5: map self-reported energy from session -> bridge scalar
         energy_at_end: Any = None
         if self.active_session and self.active_session.energy_estimate:
             level = getattr(self.active_session.energy_estimate, "level", None)
@@ -331,15 +328,23 @@ class SessionManager:
             energy_at_end=energy_at_end,
         )
 
-        # Step 4: Emit SESSION_END event
+        # Step 4: Persist structured transcript to session_transcripts (Phase 8a)
+        await self._persist_session_transcript(
+            session_id=session_id,
+            messages=messages,
+            emotional_trajectory=bridge.emotional_trajectory,
+        )
+
+        # Step 5: Save bridge note to filesystem (before SESSION_END event)
+        await self._save_bridge(bridge)
+
+        # Step 6: Emit SESSION_END event (after bridge save)
         emitter = getattr(self.container, 'event_emitter', None)
         if emitter:
             await emitter.emit(
                 EventType.SESSION_END,
                 session_id=session_id,
             )
-        # Save bridge note to filesystem
-        await self._save_bridge(bridge)
 
         # Clear active session
         self.active_session = None
@@ -586,6 +591,171 @@ class SessionManager:
                 session_id=bridge.session_id,
                 exc_info=True,
             )
+
+    async def _scan_and_persist_signals(
+        self,
+        scanner: Any,
+        messages: list[dict],
+        session_id: str,
+    ) -> None:
+        """Iterate conversation messages, scan each user turn, persist results to signal_queue.
+
+        Args:
+            scanner: A SignalScanner instance.
+            messages: The conversation messages list.
+            session_id: Current session ID.
+        """
+        settings = getattr(self.container, "settings", None)
+        if not settings or not hasattr(settings, "data_dir"):
+            return
+
+        db_path = settings.data_dir / "operational.db"
+        signal_rows: list[tuple] = []
+
+        # Pair user messages with their following assistant response
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "type", "")
+            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+
+            if role not in ("user", "human") or not isinstance(content, str) or not content.strip():
+                continue
+
+            # Find the next assistant response
+            assistant_response = ""
+            for j in range(i + 1, len(messages)):
+                next_msg = messages[j]
+                next_role = next_msg.get("role", "") if isinstance(next_msg, dict) else getattr(next_msg, "type", "")
+                next_content = next_msg.get("content", "") if isinstance(next_msg, dict) else getattr(next_msg, "content", "")
+                if next_role in ("assistant", "ai") and isinstance(next_content, str):
+                    assistant_response = next_content
+                    break
+
+            try:
+                result = scanner.scan(content, assistant_response)
+                if result.has_signal:
+                    signal_rows.append((
+                        uuid.uuid4().hex[:16],
+                        session_id,
+                        content,
+                        assistant_response or None,
+                        json.dumps(result.signal_types),
+                        result.priority,
+                        "pending",
+                        datetime.now(UTC).isoformat(timespec="seconds"),
+                    ))
+            except Exception:
+                log.warning("signal_scan_failed_for_message", exc_info=True)
+
+        if not signal_rows:
+            return
+
+        try:
+            import aiosqlite
+
+            async with aiosqlite.connect(str(db_path)) as db:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO signal_queue "
+                    "(id, session_id, message_text, assistant_response, "
+                    " signal_types, priority, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    signal_rows,
+                )
+                await db.commit()
+            log.debug("signals_persisted", count=len(signal_rows), session_id=session_id)
+        except Exception:
+            log.warning("signal_queue_persist_failed", exc_info=True)
+
+    async def _persist_session_transcript(
+        self,
+        session_id: str,
+        messages: list[dict],
+        emotional_trajectory: str,
+    ) -> None:
+        """Persist a structured transcript to session_transcripts table.
+
+        Builds the transcript from the messages list (already available
+        in end_session), NOT from LangGraph checkpoint internals.
+
+        Args:
+            session_id: Current session ID.
+            messages: The conversation messages list.
+            emotional_trajectory: Emotional trajectory string from the session bridge.
+        """
+        settings = getattr(self.container, "settings", None)
+        if not settings or not hasattr(settings, "data_dir"):
+            return
+
+        db_path = settings.data_dir / "operational.db"
+        now = datetime.now(UTC)
+
+        # Compute per-message interpolated timestamps between started_at and ended_at
+        started_at = self.active_session.started_at if self.active_session else now
+        ended_at = now
+        msg_count = len(messages)
+        total_seconds = (ended_at - started_at).total_seconds()
+
+        def _interpolated_ts(index: int) -> str:
+            if msg_count <= 1:
+                return started_at.isoformat(timespec="seconds")
+            frac = index / (msg_count - 1)
+            ts = started_at + timedelta(seconds=frac * total_seconds)
+            return ts.isoformat(timespec="seconds")
+
+        # Build structured message list
+        structured_messages: list[dict] = []
+        tool_calls_list: list[dict] = []
+
+        for msg_idx, msg in enumerate(messages):
+            role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "type", "")
+            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+
+            structured_messages.append({
+                "role": role,
+                "content": content if isinstance(content, str) else str(content),
+                "timestamp": _interpolated_ts(msg_idx),
+            })
+
+            # Extract tool calls if present
+            tc_data = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
+            if tc_data:
+                for tc in tc_data:
+                    name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                    args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+                    if name:
+                        tool_calls_list.append({"name": name, "args": args})
+
+        now_iso = now.isoformat(timespec="seconds")
+        created_at = now_iso
+        if self.active_session:
+            created_at = self.active_session.started_at.isoformat(timespec="seconds")
+
+        try:
+            import aiosqlite
+
+            async with aiosqlite.connect(str(db_path)) as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO session_transcripts "
+                    "(session_id, created_at, ended_at, message_count, "
+                    " messages, tool_calls, emotional_trajectory, processed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                    (
+                        session_id,
+                        created_at,
+                        now_iso,
+                        len(structured_messages),
+                        json.dumps(structured_messages),
+                        json.dumps(tool_calls_list) if tool_calls_list else None,
+                        emotional_trajectory,
+                    ),
+                )
+                await db.commit()
+            log.debug(
+                "session_transcript_persisted",
+                session_id=session_id,
+                message_count=len(structured_messages),
+            )
+        except Exception:
+            log.warning("session_transcript_persist_failed", exc_info=True)
 
     async def _build_working_on(
         self, session_id: str, messages: list[dict]

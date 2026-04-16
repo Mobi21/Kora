@@ -66,6 +66,7 @@ class EventType(Enum):
     TASK_FAILED = auto()
     PIPELINE_COMPLETE = auto()
     INSIGHT_AVAILABLE = auto()
+    DAY_CONTEXT_UPDATED = auto()
     SYSTEM_STATE_CHANGED = auto()
     RATE_LIMIT_APPROACHING = auto()
     OPEN_DECISION_POSED = auto()

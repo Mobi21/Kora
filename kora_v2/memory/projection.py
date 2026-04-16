@@ -12,18 +12,91 @@ go through this module to keep indexes consistent.
 
 from __future__ import annotations
 
+import os
 import struct
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
 import structlog
+from pydantic import BaseModel, Field
 
 from kora_v2.core.migrations import MigrationRunner
 
 log = structlog.get_logger(__name__)
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+
+# ------------------------------------------------------------------
+# Pydantic models for new ProjectionDB methods
+# ------------------------------------------------------------------
+
+
+class MemoryRecord(BaseModel):
+    """A memory or user model fact record from the projection DB."""
+
+    id: str
+    content: str
+    summary: str | None = None
+    memory_type: str = "episodic"
+    importance: float = 0.5
+    source_path: str = ""
+    source_table: str = "memories"
+    created_at: str = ""
+    updated_at: str = ""
+    entities: str | None = None
+    tags: str | None = None
+
+
+class MergeCandidateGroup(BaseModel):
+    """A group of semantically similar memories that may be consolidated."""
+
+    records: list[MemoryRecord]
+    avg_similarity: float = Field(
+        default=0.0, description="Average pairwise cosine similarity"
+    )
+
+
+class DuplicatePair(BaseModel):
+    """A pair of near-duplicate records."""
+
+    record_a: MemoryRecord
+    record_b: MemoryRecord
+    similarity: float = Field(
+        default=0.0, description="Combined similarity score"
+    )
+
+
+class EntityRecord(BaseModel):
+    """An entity with its link counts and date range."""
+
+    id: str
+    name: str
+    canonical_name: str
+    entity_type: str
+    active_link_count: int = 0
+    first_mention: str | None = None
+    last_mention: str | None = None
+
+
+class EntityRelationship(BaseModel):
+    """Two entities that co-occur in the same active memories."""
+
+    entity_id: str
+    entity_name: str
+    co_occurrence_count: int = 0
+
+
+class StaleEntry(BaseModel):
+    """A projection DB entry whose filesystem note has been modified."""
+
+    record_id: str
+    source_path: str
+    source_table: str
+    db_updated_at: str
+    fs_mtime: str
 
 
 def serialize_float32(vec: list[float]) -> bytes:
@@ -313,29 +386,61 @@ class ProjectionDB:
     # Reads
     # ------------------------------------------------------------------
 
-    async def get_memory_by_id(self, memory_id: str) -> dict | None:
+    async def get_memory_by_id(
+        self,
+        memory_id: str,
+        *,
+        include_soft_deleted: bool = False,
+    ) -> dict | None:
         """Fetch a single memory by its ID.
+
+        Args:
+            memory_id: The memory ID to look up.
+            include_soft_deleted: If True, return the record even if
+                its status is not ``active``.
 
         Returns:
             Dict with all memory columns, or None if not found.
         """
-        cursor = await self._db.execute(
-            "SELECT * FROM memories WHERE id = ?", (memory_id,)
-        )
+        if include_soft_deleted:
+            cursor = await self._db.execute(
+                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT * FROM memories WHERE id = ? AND status = 'active'",
+                (memory_id,),
+            )
         row = await cursor.fetchone()
         if row is None:
             return None
         return dict(row)
 
-    async def get_fact_by_id(self, fact_id: str) -> dict | None:
+    async def get_fact_by_id(
+        self,
+        fact_id: str,
+        *,
+        include_soft_deleted: bool = False,
+    ) -> dict | None:
         """Fetch a single user model fact by its ID.
+
+        Args:
+            fact_id: The fact ID to look up.
+            include_soft_deleted: If True, return the record even if
+                its status is not ``active``.
 
         Returns:
             Dict with all fact columns, or None if not found.
         """
-        cursor = await self._db.execute(
-            "SELECT * FROM user_model_facts WHERE id = ?", (fact_id,)
-        )
+        if include_soft_deleted:
+            cursor = await self._db.execute(
+                "SELECT * FROM user_model_facts WHERE id = ?", (fact_id,)
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT * FROM user_model_facts WHERE id = ? AND status = 'active'",
+                (fact_id,),
+            )
         row = await cursor.fetchone()
         if row is None:
             return None
@@ -401,6 +506,649 @@ class ProjectionDB:
             (entity_id, memory_id, fact_id, relationship),
         )
         await self._db.commit()
+
+    # ------------------------------------------------------------------
+    # Soft-delete
+    # ------------------------------------------------------------------
+
+    async def soft_delete(
+        self,
+        table: str,
+        record_id: str,
+        successor_id: str | None,
+        reason: str,
+    ) -> None:
+        """Mark a projection DB row as soft-deleted.
+
+        Sets ``status = 'soft_deleted'``, ``deleted_at`` to now, and
+        ``consolidated_into`` to *successor_id* if provided. Runs in
+        an atomic transaction.
+
+        Args:
+            table: Either ``memories`` or ``user_model_facts``.
+            record_id: ID of the record to soft-delete.
+            successor_id: Optional ID of the record that replaces this one.
+            reason: Reason for soft-deletion (e.g. ``consolidated``, ``duplicate``).
+        """
+        if table not in ("memories", "user_model_facts"):
+            raise ValueError(f"Invalid table for soft_delete: {table!r}")
+
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+
+        # Determine the new status based on reason
+        status = "merged" if reason in ("consolidated", "duplicate", "merged") else "soft_deleted"
+
+        await self._db.execute(
+            f"UPDATE {table} SET status = ?, consolidated_into = ?, "  # noqa: S608
+            f"deleted_at = ? WHERE id = ?",
+            (status, successor_id, now, record_id),
+        )
+        await self._db.commit()
+        log.debug(
+            "record_soft_deleted",
+            table=table,
+            id=record_id,
+            successor=successor_id,
+            reason=reason,
+        )
+
+    # ------------------------------------------------------------------
+    # Consolidation & deduplication
+    # ------------------------------------------------------------------
+
+    async def consolidate(
+        self,
+        threshold: float = 0.82,
+    ) -> list[MergeCandidateGroup]:
+        """Find semantically similar active memories using embedding cosine similarity.
+
+        Queries both ``memories`` and ``user_model_facts`` tables, filtered
+        to ``status = 'active'``. Returns groups of merge candidates whose
+        pairwise cosine similarity exceeds *threshold*.
+
+        Args:
+            threshold: Minimum cosine similarity to consider records related.
+
+        Returns:
+            List of MergeCandidateGroup with records and avg similarity.
+        """
+        if not self._vector_available:
+            log.warning("consolidate_skipped_no_vector")
+            return []
+
+        groups: list[MergeCandidateGroup] = []
+
+        for table, vec_table in [
+            ("memories", "memories_vec"),
+            ("user_model_facts", "user_model_vec"),
+        ]:
+            # Get all active records with their embeddings
+            cursor = await self._db.execute(
+                f"SELECT m.id, m.rowid FROM {table} m "  # noqa: S608
+                f"WHERE m.status = 'active'"
+            )
+            rows = await cursor.fetchall()
+            if len(rows) < 2:
+                continue
+
+            # For each record, find similar records using vector search
+            seen_pairs: set[tuple[str, str]] = set()
+            pair_groups: dict[str, list[str]] = {}
+
+            for row in rows:
+                record_id = row[0]
+                rowid = row[1]
+
+                # Get this record's embedding
+                emb_cursor = await self._db.execute(
+                    f"SELECT embedding FROM {vec_table} WHERE rowid = ?",  # noqa: S608
+                    (rowid,),
+                )
+                emb_row = await emb_cursor.fetchone()
+                if emb_row is None:
+                    continue
+
+                # Search for similar vectors
+                query_bytes = emb_row[0]
+                sim_cursor = await self._db.execute(
+                    f"SELECT v.rowid, v.distance FROM {vec_table} v "  # noqa: S608
+                    f"WHERE v.embedding MATCH ? AND k = 10 "
+                    f"ORDER BY v.distance",
+                    (query_bytes,),
+                )
+                sim_rows = await sim_cursor.fetchall()
+
+                for sim_row in sim_rows:
+                    sim_rowid = sim_row[0]
+                    distance = sim_row[1]
+                    similarity = 1.0 - distance
+
+                    if similarity < threshold:
+                        continue
+                    if sim_rowid == rowid:
+                        continue
+
+                    # Get the ID of the similar record
+                    id_cursor = await self._db.execute(
+                        f"SELECT id FROM {table} WHERE rowid = ? AND status = 'active'",  # noqa: S608
+                        (sim_rowid,),
+                    )
+                    id_row = await id_cursor.fetchone()
+                    if id_row is None:
+                        continue
+
+                    other_id = id_row[0]
+                    pair_key = tuple(sorted([record_id, other_id]))
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+
+                    # Group connected records
+                    group_key = record_id
+                    for k, members in pair_groups.items():
+                        if record_id in members or other_id in members:
+                            group_key = k
+                            break
+
+                    if group_key not in pair_groups:
+                        pair_groups[group_key] = [record_id]
+                    if other_id not in pair_groups[group_key]:
+                        pair_groups[group_key].append(other_id)
+                    if record_id not in pair_groups[group_key]:
+                        pair_groups[group_key].append(record_id)
+
+            # Build MergeCandidateGroups from the grouped IDs
+            for _key, member_ids in pair_groups.items():
+                if len(member_ids) < 2:
+                    continue
+
+                records: list[MemoryRecord] = []
+                for mid in member_ids:
+                    rec_cursor = await self._db.execute(
+                        f"SELECT * FROM {table} WHERE id = ? AND status = 'active'",  # noqa: S608
+                        (mid,),
+                    )
+                    rec_row = await rec_cursor.fetchone()
+                    if rec_row is None:
+                        continue
+                    rd = dict(rec_row)
+                    records.append(
+                        MemoryRecord(
+                            id=rd.get("id", ""),
+                            content=rd.get("content", ""),
+                            summary=rd.get("summary"),
+                            memory_type=rd.get("memory_type", "episodic"),
+                            importance=rd.get("importance", rd.get("confidence", 0.5)),
+                            source_path=rd.get("source_path", ""),
+                            source_table=table,
+                            created_at=rd.get("created_at", ""),
+                            updated_at=rd.get("updated_at", ""),
+                            entities=rd.get("entities"),
+                            tags=rd.get("tags"),
+                        )
+                    )
+
+                if len(records) >= 2:
+                    groups.append(
+                        MergeCandidateGroup(
+                            records=records,
+                            avg_similarity=threshold,
+                        )
+                    )
+
+        return groups
+
+    async def deduplicate(
+        self,
+        threshold: float = 0.92,
+        excluded_pairs: set[tuple[str, str]] | None = None,
+    ) -> list[DuplicatePair]:
+        """Find near-duplicate active notes using embedding similarity.
+
+        Higher threshold than consolidation -- these are true duplicates.
+
+        Args:
+            threshold: Minimum cosine similarity to consider records duplicates.
+            excluded_pairs: Set of ``(id_a, id_b)`` tuples (sorted) that have
+                previously been rejected as distinct by the LLM. These pairs
+                are skipped so they are not re-evaluated every session.
+
+        Returns:
+            List of DuplicatePair with similarity scores.
+        """
+        if not self._vector_available:
+            log.warning("deduplicate_skipped_no_vector")
+            return []
+
+        pairs: list[DuplicatePair] = []
+        seen_pairs: set[tuple[str, str]] = set(excluded_pairs or set())
+
+        for table, vec_table in [
+            ("memories", "memories_vec"),
+            ("user_model_facts", "user_model_vec"),
+        ]:
+            cursor = await self._db.execute(
+                f"SELECT m.id, m.rowid FROM {table} m "  # noqa: S608
+                f"WHERE m.status = 'active'"
+            )
+            rows = await cursor.fetchall()
+            if len(rows) < 2:
+                continue
+
+            for row in rows:
+                record_id = row[0]
+                rowid = row[1]
+
+                emb_cursor = await self._db.execute(
+                    f"SELECT embedding FROM {vec_table} WHERE rowid = ?",  # noqa: S608
+                    (rowid,),
+                )
+                emb_row = await emb_cursor.fetchone()
+                if emb_row is None:
+                    continue
+
+                query_bytes = emb_row[0]
+                sim_cursor = await self._db.execute(
+                    f"SELECT v.rowid, v.distance FROM {vec_table} v "  # noqa: S608
+                    f"WHERE v.embedding MATCH ? AND k = 5 "
+                    f"ORDER BY v.distance",
+                    (query_bytes,),
+                )
+                sim_rows = await sim_cursor.fetchall()
+
+                for sim_row in sim_rows:
+                    sim_rowid = sim_row[0]
+                    distance = sim_row[1]
+                    similarity = 1.0 - distance
+
+                    if similarity < threshold or sim_rowid == rowid:
+                        continue
+
+                    id_cursor = await self._db.execute(
+                        f"SELECT * FROM {table} WHERE rowid = ? AND status = 'active'",  # noqa: S608
+                        (sim_rowid,),
+                    )
+                    id_row = await id_cursor.fetchone()
+                    if id_row is None:
+                        continue
+
+                    other_id = id_row[0]
+                    pair_key = tuple(sorted([record_id, other_id]))
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+
+                    # Build both records
+                    rec_a_cursor = await self._db.execute(
+                        f"SELECT * FROM {table} WHERE id = ? AND status = 'active'",  # noqa: S608
+                        (record_id,),
+                    )
+                    rec_a_row = await rec_a_cursor.fetchone()
+                    if rec_a_row is None:
+                        continue
+
+                    rd_a = dict(rec_a_row)
+                    rd_b = dict(id_row)
+
+                    pairs.append(
+                        DuplicatePair(
+                            record_a=MemoryRecord(
+                                id=rd_a.get("id", ""),
+                                content=rd_a.get("content", ""),
+                                summary=rd_a.get("summary"),
+                                memory_type=rd_a.get("memory_type", "episodic"),
+                                importance=rd_a.get("importance", rd_a.get("confidence", 0.5)),
+                                source_path=rd_a.get("source_path", ""),
+                                source_table=table,
+                                created_at=rd_a.get("created_at", ""),
+                                updated_at=rd_a.get("updated_at", ""),
+                            ),
+                            record_b=MemoryRecord(
+                                id=rd_b.get("id", ""),
+                                content=rd_b.get("content", ""),
+                                summary=rd_b.get("summary"),
+                                memory_type=rd_b.get("memory_type", "episodic"),
+                                importance=rd_b.get("importance", rd_b.get("confidence", 0.5)),
+                                source_path=rd_b.get("source_path", ""),
+                                source_table=table,
+                                created_at=rd_b.get("created_at", ""),
+                                updated_at=rd_b.get("updated_at", ""),
+                            ),
+                            similarity=similarity,
+                        )
+                    )
+
+        return pairs
+
+    # ------------------------------------------------------------------
+    # Entity queries
+    # ------------------------------------------------------------------
+
+    async def get_memories_by_entity(
+        self,
+        entity_name: str,
+    ) -> list[MemoryRecord]:
+        """Return all active memories/facts linked to an entity.
+
+        Joins through the ``entities`` table using canonical name matching.
+        Filters ``status = 'active'``.
+
+        Args:
+            entity_name: Display or canonical name of the entity.
+
+        Returns:
+            List of MemoryRecord linked to the entity.
+        """
+        canonical = entity_name.strip().lower()
+        results: list[MemoryRecord] = []
+
+        # Memories linked via entity_links
+        cursor = await self._db.execute(
+            "SELECT m.* FROM memories m "
+            "INNER JOIN entity_links el ON el.memory_id = m.id "
+            "INNER JOIN entities e ON e.id = el.entity_id "
+            "WHERE e.canonical_name = ? AND m.status = 'active'",
+            (canonical,),
+        )
+        for row in await cursor.fetchall():
+            rd = dict(row)
+            results.append(
+                MemoryRecord(
+                    id=rd.get("id", ""),
+                    content=rd.get("content", ""),
+                    summary=rd.get("summary"),
+                    memory_type=rd.get("memory_type", "episodic"),
+                    importance=rd.get("importance", 0.5),
+                    source_path=rd.get("source_path", ""),
+                    source_table="memories",
+                    created_at=rd.get("created_at", ""),
+                    updated_at=rd.get("updated_at", ""),
+                    entities=rd.get("entities"),
+                    tags=rd.get("tags"),
+                )
+            )
+
+        # User model facts linked via entity_links
+        cursor = await self._db.execute(
+            "SELECT f.* FROM user_model_facts f "
+            "INNER JOIN entity_links el ON el.user_model_fact_id = f.id "
+            "INNER JOIN entities e ON e.id = el.entity_id "
+            "WHERE e.canonical_name = ? AND f.status = 'active'",
+            (canonical,),
+        )
+        for row in await cursor.fetchall():
+            rd = dict(row)
+            results.append(
+                MemoryRecord(
+                    id=rd.get("id", ""),
+                    content=rd.get("content", ""),
+                    summary=None,
+                    memory_type="user_model",
+                    importance=rd.get("confidence", 0.5),
+                    source_path=rd.get("source_path", ""),
+                    source_table="user_model_facts",
+                    created_at=rd.get("created_at", ""),
+                    updated_at=rd.get("updated_at", ""),
+                )
+            )
+
+        return results
+
+    async def get_entities_by_type(
+        self,
+        entity_type: str,
+    ) -> list[EntityRecord]:
+        """Return all entities of a given type with active link counts.
+
+        Args:
+            entity_type: Type classification (e.g. ``person``, ``place``).
+
+        Returns:
+            List of EntityRecord with link counts and date ranges.
+        """
+        cursor = await self._db.execute(
+            "SELECT e.id, e.name, e.canonical_name, e.entity_type, "
+            "  (SELECT COUNT(*) FROM entity_links el "
+            "   LEFT JOIN memories m ON m.id = el.memory_id "
+            "   LEFT JOIN user_model_facts f ON f.id = el.user_model_fact_id "
+            "   WHERE el.entity_id = e.id "
+            "     AND (m.status = 'active' OR f.status = 'active')"
+            "  ) AS active_link_count, "
+            "  (SELECT MIN(COALESCE(m2.created_at, f2.created_at)) "
+            "   FROM entity_links el2 "
+            "   LEFT JOIN memories m2 ON m2.id = el2.memory_id AND m2.status = 'active' "
+            "   LEFT JOIN user_model_facts f2 ON f2.id = el2.user_model_fact_id AND f2.status = 'active' "
+            "   WHERE el2.entity_id = e.id"
+            "  ) AS first_mention, "
+            "  (SELECT MAX(COALESCE(m3.created_at, f3.created_at)) "
+            "   FROM entity_links el3 "
+            "   LEFT JOIN memories m3 ON m3.id = el3.memory_id AND m3.status = 'active' "
+            "   LEFT JOIN user_model_facts f3 ON f3.id = el3.user_model_fact_id AND f3.status = 'active' "
+            "   WHERE el3.entity_id = e.id"
+            "  ) AS last_mention "
+            "FROM entities e WHERE e.entity_type = ?",
+            (entity_type,),
+        )
+        rows = await cursor.fetchall()
+        results: list[EntityRecord] = []
+        for row in rows:
+            rd = dict(row)
+            results.append(
+                EntityRecord(
+                    id=rd.get("id", ""),
+                    name=rd.get("name", ""),
+                    canonical_name=rd.get("canonical_name", ""),
+                    entity_type=rd.get("entity_type", ""),
+                    active_link_count=rd.get("active_link_count", 0),
+                    first_mention=rd.get("first_mention"),
+                    last_mention=rd.get("last_mention"),
+                )
+            )
+        return results
+
+    async def get_entity_relationships(
+        self,
+        entity_id: str,
+    ) -> list[EntityRelationship]:
+        """Return entities that co-occur in the same active memories.
+
+        Builds the relationship graph by finding entities that share
+        active memory or fact links with the given entity.
+
+        Args:
+            entity_id: ID of the entity to find relationships for.
+
+        Returns:
+            List of EntityRelationship with co-occurrence counts.
+        """
+        # Find all active memory IDs linked to this entity
+        cursor = await self._db.execute(
+            "SELECT el.memory_id, el.user_model_fact_id FROM entity_links el "
+            "WHERE el.entity_id = ?",
+            (entity_id,),
+        )
+        link_rows = await cursor.fetchall()
+
+        active_memory_ids: list[str] = []
+        active_fact_ids: list[str] = []
+
+        for lr in link_rows:
+            rd = dict(lr)
+            mid = rd.get("memory_id")
+            fid = rd.get("user_model_fact_id")
+            if mid:
+                # Check if active
+                check = await self._db.execute(
+                    "SELECT 1 FROM memories WHERE id = ? AND status = 'active'",
+                    (mid,),
+                )
+                if await check.fetchone():
+                    active_memory_ids.append(mid)
+            if fid:
+                check = await self._db.execute(
+                    "SELECT 1 FROM user_model_facts WHERE id = ? AND status = 'active'",
+                    (fid,),
+                )
+                if await check.fetchone():
+                    active_fact_ids.append(fid)
+
+        if not active_memory_ids and not active_fact_ids:
+            return []
+
+        # Find other entities linked to the same active records
+        co_occurrences: dict[str, int] = {}
+        entity_names: dict[str, str] = {}
+
+        for mid in active_memory_ids:
+            cursor = await self._db.execute(
+                "SELECT el.entity_id, e.name FROM entity_links el "
+                "INNER JOIN entities e ON e.id = el.entity_id "
+                "WHERE el.memory_id = ? AND el.entity_id != ?",
+                (mid, entity_id),
+            )
+            for row in await cursor.fetchall():
+                rd = dict(row)
+                eid = rd["entity_id"]
+                co_occurrences[eid] = co_occurrences.get(eid, 0) + 1
+                entity_names[eid] = rd["name"]
+
+        for fid in active_fact_ids:
+            cursor = await self._db.execute(
+                "SELECT el.entity_id, e.name FROM entity_links el "
+                "INNER JOIN entities e ON e.id = el.entity_id "
+                "WHERE el.user_model_fact_id = ? AND el.entity_id != ?",
+                (fid, entity_id),
+            )
+            for row in await cursor.fetchall():
+                rd = dict(row)
+                eid = rd["entity_id"]
+                co_occurrences[eid] = co_occurrences.get(eid, 0) + 1
+                entity_names[eid] = rd["name"]
+
+        return [
+            EntityRelationship(
+                entity_id=eid,
+                entity_name=entity_names[eid],
+                co_occurrence_count=count,
+            )
+            for eid, count in sorted(
+                co_occurrences.items(), key=lambda x: x[1], reverse=True
+            )
+        ]
+
+    async def merge_entities(
+        self,
+        source_id: str,
+        target_id: str,
+    ) -> None:
+        """Merge source entity into target.
+
+        Re-links all ``entity_links`` from source to target, then deletes
+        the source entity record.
+
+        Args:
+            source_id: Entity to merge away (will be deleted).
+            target_id: Entity to merge into (preserved).
+        """
+        await self._db.execute(
+            "UPDATE entity_links SET entity_id = ? WHERE entity_id = ?",
+            (target_id, source_id),
+        )
+        await self._db.execute(
+            "DELETE FROM entities WHERE id = ?", (source_id,)
+        )
+        await self._db.commit()
+        log.debug("entities_merged", source=source_id, target=target_id)
+
+    # ------------------------------------------------------------------
+    # Stale entry detection
+    # ------------------------------------------------------------------
+
+    async def detect_stale_entries(self) -> list[StaleEntry]:
+        """Compare projection DB updated_at against filesystem note mtime.
+
+        Uses ``os.stat()`` as a fast filter, then returns entries whose
+        filesystem modification time is newer than the indexed timestamp.
+
+        Returns:
+            List of StaleEntry needing re-indexing.
+        """
+        stale: list[StaleEntry] = []
+
+        for table in ("memories", "user_model_facts"):
+            cursor = await self._db.execute(
+                f"SELECT id, source_path, updated_at FROM {table} "  # noqa: S608
+                f"WHERE status = 'active'"
+            )
+            rows = await cursor.fetchall()
+
+            for row in rows:
+                rd = dict(row)
+                record_id = rd["id"]
+                source_path = rd.get("source_path", "")
+                db_updated_at = rd.get("updated_at", "")
+
+                if not source_path:
+                    continue
+
+                try:
+                    stat = os.stat(source_path)
+                    fs_mtime = datetime.fromtimestamp(
+                        stat.st_mtime, tz=UTC
+                    ).isoformat(timespec="seconds")
+                except OSError:
+                    # File doesn't exist -- might be stale
+                    stale.append(
+                        StaleEntry(
+                            record_id=record_id,
+                            source_path=source_path,
+                            source_table=table,
+                            db_updated_at=db_updated_at,
+                            fs_mtime="missing",
+                        )
+                    )
+                    continue
+
+                # Compare timestamps: if FS is newer than DB, it's stale
+                if not db_updated_at:
+                    stale.append(
+                        StaleEntry(
+                            record_id=record_id,
+                            source_path=source_path,
+                            source_table=table,
+                            db_updated_at=db_updated_at,
+                            fs_mtime=fs_mtime,
+                        )
+                    )
+                    continue
+
+                try:
+                    db_dt = datetime.fromisoformat(db_updated_at)
+                    if db_dt.tzinfo is None:
+                        db_dt = db_dt.replace(tzinfo=UTC)
+                    fs_dt = datetime.fromisoformat(fs_mtime)
+                    if fs_dt > db_dt:
+                        stale.append(
+                            StaleEntry(
+                                record_id=record_id,
+                                source_path=source_path,
+                                source_table=table,
+                                db_updated_at=db_updated_at,
+                                fs_mtime=fs_mtime,
+                            )
+                        )
+                except ValueError:
+                    stale.append(
+                        StaleEntry(
+                            record_id=record_id,
+                            source_path=source_path,
+                            source_table=table,
+                            db_updated_at=db_updated_at,
+                            fs_mtime=fs_mtime,
+                        )
+                    )
+
+        return stale
 
     # ------------------------------------------------------------------
     # Lifecycle

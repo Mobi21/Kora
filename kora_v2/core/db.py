@@ -318,6 +318,8 @@ CREATE TABLE IF NOT EXISTS reminders (
     created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status, remind_at);
+-- Note: idx_reminders_due is created post-migration (see init_operational_db)
+-- because the due_at column is added by _REMINDERS_MIGRATIONS.
 
 -- Life management: medication log ---------------------------------------------
 CREATE TABLE IF NOT EXISTS medication_log (
@@ -423,6 +425,41 @@ CREATE INDEX IF NOT EXISTS idx_energy_log_logged
 
 -- Autonomous plan budget columns: request_count, token_estimate, cost_estimate
 -- Added as ALTER TABLE below since autonomous_plans was created without them.
+
+-- Phase 8a: Signal extraction queue ----------------------------------------
+CREATE TABLE IF NOT EXISTS signal_queue (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    message_text TEXT NOT NULL,
+    assistant_response TEXT,
+    signal_types TEXT NOT NULL,      -- JSON array of SignalType values
+    priority INTEGER NOT NULL,       -- 1=highest
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    processed_at TEXT,
+    error_message TEXT
+);
+
+-- Phase 8a: Session transcripts for Memory Steward consumption -------------
+CREATE TABLE IF NOT EXISTS session_transcripts (
+    session_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    message_count INTEGER NOT NULL,
+    messages TEXT NOT NULL,           -- JSON array of {role, content, timestamp}
+    tool_calls TEXT,                  -- JSON array of tool invocations
+    emotional_trajectory TEXT,        -- from session bridge
+    processed_at TEXT                 -- NULL until extraction stage consumes it
+);
+
+-- Phase 8b: Dedup rejection pairs — persists LLM "distinct" verdicts so the
+-- same pair is not re-evaluated every session.
+CREATE TABLE IF NOT EXISTS dedup_rejected_pairs (
+    id_a TEXT NOT NULL,
+    id_b TEXT NOT NULL,
+    rejected_at TEXT NOT NULL,
+    PRIMARY KEY (id_a, id_b)
+);
 """
 
 _TURN_TRACE_MIGRATIONS: tuple[tuple[str, str], ...] = (
@@ -493,6 +530,16 @@ _FOCUS_BLOCK_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ),
 )
 
+# Phase 8e: reminders table extensions for ReminderStore.
+_REMINDERS_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("due_at", "ALTER TABLE reminders ADD COLUMN due_at TEXT"),
+    ("repeat_rule", "ALTER TABLE reminders ADD COLUMN repeat_rule TEXT"),
+    ("source", "ALTER TABLE reminders ADD COLUMN source TEXT NOT NULL DEFAULT 'user'"),
+    ("delivered_at", "ALTER TABLE reminders ADD COLUMN delivered_at TEXT"),
+    ("dismissed_at", "ALTER TABLE reminders ADD COLUMN dismissed_at TEXT"),
+    ("metadata", "ALTER TABLE reminders ADD COLUMN metadata TEXT"),
+)
+
 
 async def _ensure_columns(
     db: aiosqlite.Connection,
@@ -528,6 +575,13 @@ async def init_operational_db(db_path: Path) -> None:
         await _ensure_columns(db, "autonomous_plans", _AUTONOMOUS_PLAN_MIGRATIONS)
         await _ensure_columns(db, "items", _ITEMS_MIGRATIONS)
         await _ensure_columns(db, "focus_blocks", _FOCUS_BLOCK_MIGRATIONS)
+        await _ensure_columns(db, "reminders", _REMINDERS_MIGRATIONS)
+        # Phase 8e: idx_reminders_due references due_at, which is added by the
+        # migration above — must be created AFTER the migration runs.
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reminders_due "
+            "ON reminders(status, due_at)"
+        )
         # Phase 9 Task 4: index on capability-scoped columns (idempotent via IF NOT EXISTS)
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_permission_grants_capability "

@@ -271,11 +271,42 @@ SUPERVISOR_TOOLS: list[dict[str, Any]] = [
                 },
                 "stages": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "tool_scope": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": (
+                                            "Optional tool allow-list for this "
+                                            "stage. Must not include any "
+                                            "ASK_FIRST tool or "
+                                            "decompose_and_dispatch (sub-tasks "
+                                            "cannot recurse)."
+                                        ),
+                                    },
+                                    "depends_on": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": (
+                                            "Optional list of earlier stage "
+                                            "names this one depends on. Default "
+                                            "is the previous stage in order."
+                                        ),
+                                    },
+                                },
+                                "required": ["name"],
+                            },
+                        ],
+                    },
                     "description": (
-                        "Ordered stage names. Each stage becomes a "
-                        "bounded_background PipelineStage with a default "
-                        "goal template."
+                        "Ordered stage names (or stage objects with optional "
+                        "tool_scope/depends_on). Each stage becomes a "
+                        "PipelineStage with a default goal template."
                     ),
                 },
                 "in_turn": {
@@ -1107,6 +1138,11 @@ async def _orch_decompose_and_dispatch(
         Pipeline,
         PipelineStage,
     )
+    from kora_v2.runtime.orchestration.scope_validation import (
+        ScopeValidationError,
+        SubTaskSpec,
+        validate_subtask_specs,
+    )
 
     goal = str(tool_args.get("goal", "")).strip()
     pipeline_name = str(tool_args.get("pipeline_name", "")).strip()
@@ -1121,21 +1157,84 @@ async def _orch_decompose_and_dispatch(
         )
 
     preset = "in_turn" if in_turn else "bounded_background"
-    stages: list[PipelineStage] = []
+
+    # Normalise the stage list — entries may be plain strings (legacy
+    # shape) or {name, tool_scope, depends_on} objects (Phase 8f).
+    normalized: list[dict[str, Any]] = []
     prev_name: str | None = None
-    for stage_name in stages_in:
-        name = str(stage_name).strip()
+    for entry in stages_in:
+        if isinstance(entry, str):
+            name = entry.strip()
+            tool_scope: list[str] = []
+            depends_on = [prev_name] if prev_name else []
+        elif isinstance(entry, dict):
+            name = str(entry.get("name", "")).strip()
+            raw_scope = entry.get("tool_scope") or []
+            tool_scope = [
+                str(t).strip() for t in raw_scope if str(t).strip()
+            ]
+            raw_deps = entry.get("depends_on")
+            if raw_deps is None:
+                depends_on = [prev_name] if prev_name else []
+            else:
+                depends_on = [
+                    str(d).strip() for d in raw_deps if str(d).strip()
+                ]
+        else:
+            continue
         if not name:
             continue
-        stages.append(
-            PipelineStage(
-                name=name,
-                task_preset=preset,  # type: ignore[arg-type]
-                goal_template=f"{goal} — {name}",
-                depends_on=[prev_name] if prev_name else [],
-            )
+        normalized.append(
+            {
+                "name": name,
+                "tool_scope": tool_scope,
+                "depends_on": depends_on,
+            }
         )
         prev_name = name
+
+    # Phase 8f spec §4a — reject ASK_FIRST tools, recursive
+    # decompose_and_dispatch, and cycles before the pipeline ever
+    # reaches the registry. The supervisor LLM sees a structured
+    # rejection it can recover from instead of a generic exception.
+    sub_specs = [
+        SubTaskSpec(
+            task_id=item["name"],
+            description=f"{goal} — {item['name']}",
+            required_tools=item["tool_scope"],
+            depends_on=item["depends_on"],
+        )
+        for item in normalized
+    ]
+    try:
+        validate_subtask_specs(sub_specs)
+    except ScopeValidationError as exc:
+        log.info(
+            "decompose_and_dispatch_rejected",
+            reason=exc.reason,
+            field=exc.offending_field,
+        )
+        return json.dumps(
+            {
+                "status": "error",
+                "error_category": "validation",
+                "rejection_reason": exc.reason,
+                "offending_field": exc.offending_field,
+                "message": exc.message,
+            }
+        )
+
+    stages: list[PipelineStage] = []
+    for item in normalized:
+        stages.append(
+            PipelineStage(
+                name=item["name"],
+                task_preset=preset,  # type: ignore[arg-type]
+                goal_template=f"{goal} — {item['name']}",
+                depends_on=list(item["depends_on"]),
+                tool_scope=list(item["tool_scope"]),
+            )
+        )
 
     pipeline = Pipeline(
         name=pipeline_name,

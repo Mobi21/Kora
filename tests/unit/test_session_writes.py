@@ -153,6 +153,14 @@ class TestEndSessionWrites:
     @pytest.mark.asyncio
     async def test_signal_scanner_called(self, tmp_path, db_path):
         container = _make_container(tmp_path, with_scanner=True)
+        # Phase 8a: scanner.scan is now called per-message with
+        # (user_message, assistant_response) instead of (messages_list).
+        # Use a regular MagicMock since scan() is synchronous.
+        from kora_v2.memory.signal_scanner import ScanResult
+
+        container.signal_scanner.scan = MagicMock(
+            return_value=ScanResult(priority=5, signal_types=[]),
+        )
         mgr = SessionManager(container)
         await mgr.init_session()
 
@@ -164,12 +172,12 @@ class TestEndSessionWrites:
 
         await mgr.end_session(messages, emotional_state)
 
-        container.signal_scanner.scan.assert_awaited_once_with(messages)
+        container.signal_scanner.scan.assert_called_once_with("test", "")
 
     @pytest.mark.asyncio
     async def test_scanner_failure_does_not_block(self, tmp_path, db_path):
         container = _make_container(tmp_path, with_scanner=True)
-        container.signal_scanner.scan = AsyncMock(side_effect=RuntimeError("scanner broke"))
+        container.signal_scanner.scan = MagicMock(side_effect=RuntimeError("scanner broke"))
         mgr = SessionManager(container)
         await mgr.init_session()
 
