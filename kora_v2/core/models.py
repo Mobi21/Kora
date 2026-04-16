@@ -443,14 +443,28 @@ class LifeContext(BaseModel):
     items_summary: dict[str, Any] = Field(default_factory=dict)
 
     insights: list[str] = Field(default_factory=list)
+    """Legacy free-form insight strings produced by
+    ``ContextEngine.generate_insights`` (4 simple if/else rules).
+
+    Kept as ``list[str]`` for backward compatibility with planning prompts
+    that consume free-form text. The Phase 8d structured API is
+    ``ContextEngine.get_insights()``, which returns ``list[Insight]`` with
+    confidence, domain, and evidence — used by the ProactiveAgent
+    ``proactive_pattern_scan`` pipeline. The two APIs coexist: this field
+    is *not* migrated to ``list[Insight]`` so existing callers keep working.
+    """
 
 
 class Insight(BaseModel):
     """Structured cross-domain insight produced by ContextEngine.
 
-    Phase 8d upgrade: replaces the plain-string insights on LifeContext
-    with typed objects carrying confidence, domain, and evidence.
-    Used by the ProactiveAgent ``proactive_pattern_scan`` pipeline.
+    Phase 8d structured-insight model. Returned by
+    ``ContextEngine.get_insights(window_days, min_confidence)`` (the
+    structured API used by the ProactiveAgent
+    ``proactive_pattern_scan`` pipeline) — *not* stored on
+    ``LifeContext.insights``, which intentionally remains the legacy
+    ``list[str]`` for backward compatibility (see
+    ``LifeContext.insights`` docstring).
     """
 
     type: str  # energy_calendar_mismatch, medication_focus, routine_trend, etc.
