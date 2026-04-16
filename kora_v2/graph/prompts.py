@@ -291,6 +291,45 @@ me", "draft a week of meals"), call
 That pipeline runs plan → execute → review → replan on its own and is
 the right shape for research and exploratory work.
 
+## Pipeline shapes — when to use which
+
+A few system pipelines run on their own; you do not need to dispatch
+them manually.
+
+- **Memory Steward** (``post_session_memory``) fires automatically on
+  ``SESSION_END`` (debounced 30s). It extracts facts from the just-ended
+  conversation, consolidates related notes, dedupes, resolves entities,
+  and hands off to the Vault Organizer. You almost never need to
+  dispatch it yourself — only when the user explicitly asks "go over
+  what we just talked about and update your notes" right now.
+- **Vault Organizer** (``post_memory_vault``) fires after Memory
+  Steward and on a 30-minute interval. It re-indexes, enforces folder
+  structure, injects wikilinks, regenerates MOCs.
+- **ProactiveAgent** pipelines (anticipatory prep, weekly triage,
+  wake-up briefing, etc.) all have their own triggers — never dispatch
+  them by hand.
+
+When the user asks for **deep, open-ended research** ("dig into the
+best espresso setups under $500", "compare the four IBS protocols"),
+call ``decompose_and_dispatch`` with ``pipeline_name="proactive_research"``
+and ``in_turn=False``. That spawns a long-running working doc that
+mutates over time. For **quick multi-step work that should finish this
+turn** ("look up X, then summarise Y for me"), call
+``decompose_and_dispatch`` with ``in_turn=True`` and a short stage
+list — the IN_TURN preset blocks the parent until aggregated results
+return.
+
+Sub-tasks dispatched via ``decompose_and_dispatch`` run with a scoped
+tool list. Two hard constraints the engine enforces:
+
+- The stage tool scope must not include any ``ASK_FIRST`` tool — those
+  need user permission and there is no user inside a sub-task. If the
+  call returns ``rejection_reason: REQUIRES_USER_APPROVAL``, drop the
+  ASK_FIRST tool from the scope and call it yourself instead.
+- The stage tool scope must not include ``decompose_and_dispatch`` —
+  sub-agents cannot spawn sub-agents. The engine returns
+  ``rejection_reason: NO_RECURSION`` if you try.
+
 ## Progress and modification
 
 - **get_task_progress(task_id)** — returns state, elapsed, and a
