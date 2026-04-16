@@ -1,19 +1,27 @@
-"""Phase 6B: Guided Routines.
+"""Phase 6B: Guided Routines + Phase 8e extensions.
 
 Routines are specialized autonomous plan types that run through the same
 Phase 6A runtime graph with mode='routine'. They provide step-by-step
 guidance with partial completion tracking and energy-adapted variants.
+
+Phase 8e additions:
+- ``RoutineNudge`` model and ``get_routine_nudges()`` for the
+  ``continuity_check`` pipeline.
+- ``register_routine_pipeline()`` to create runtime pipelines from routines.
 """
 from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
 import structlog
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from kora_v2.core.models import DayContext
 
 log = structlog.get_logger(__name__)
 
@@ -437,3 +445,129 @@ class RoutineManager:
             completion_pct=round(completion_pct, 1),
             message=message,
         )
+
+
+# ── Phase 8e: Routine Nudges ────────────────────────────────────────────
+
+
+class RoutineNudge(BaseModel):
+    """A nudge for a routine that is scheduled but not yet started."""
+
+    routine_id: str
+    routine_name: str
+    message: str
+    urgency: str  # "low", "medium", "high"
+
+
+async def get_routine_nudges(
+    db_path: Path,
+    day_context: DayContext,
+) -> list[RoutineNudge]:
+    """Check which routines are scheduled but not started today.
+
+    Compares the routine_status on the day_context against the full
+    routine list. If a routine has no session today and there are
+    remaining hours in the day, produce a nudge.
+
+    Returns a list of ``RoutineNudge`` objects.
+    """
+    nudges: list[RoutineNudge] = []
+
+    try:
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM routines ORDER BY name"
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        if not rows:
+            return []
+
+        routines = [_routine_from_row(r) for r in rows]
+        done_or_active = set(day_context.routine_status.by_routine.keys())
+
+        for routine in routines:
+            if routine.id in done_or_active or routine.name in done_or_active:
+                continue
+
+            # Check tags for scheduled-today markers
+            urgency = "low"
+            if "morning" in routine.tags:
+                urgency = "medium"
+            elif "medication" in routine.tags:
+                urgency = "high"
+
+            nudges.append(
+                RoutineNudge(
+                    routine_id=routine.id,
+                    routine_name=routine.name,
+                    message=(
+                        f"Your '{routine.name}' routine hasn't been started "
+                        f"today. Ready when you are."
+                    ),
+                    urgency=urgency,
+                )
+            )
+
+    except Exception:
+        log.exception("get_routine_nudges_error")
+
+    return nudges
+
+
+async def register_routine_pipeline(
+    routine: Routine,
+    engine: Any,
+) -> None:
+    """Register a runtime pipeline for a routine's schedule.
+
+    Creates a single-stage pipeline triggered at a fixed time derived
+    from the routine's tags (morning=07:00, evening=20:00) or a
+    generic daily trigger. The engine persists the pipeline so it
+    survives daemon restarts.
+    """
+    from datetime import time as dtime
+
+    from kora_v2.runtime.orchestration.pipeline import (
+        FailurePolicy,
+        InterruptionPolicy,
+        Pipeline,
+        PipelineStage,
+    )
+    from kora_v2.runtime.orchestration.triggers import time_of_day
+
+    # Determine trigger time from routine tags
+    trigger_time = dtime(8, 0)  # default morning
+    if "evening" in routine.tags:
+        trigger_time = dtime(20, 0)
+    elif "afternoon" in routine.tags:
+        trigger_time = dtime(14, 0)
+    elif "night" in routine.tags:
+        trigger_time = dtime(21, 0)
+
+    pipeline_name = f"routine_{routine.id}"
+
+    pipeline = Pipeline(
+        name=pipeline_name,
+        description=f"Guided routine: {routine.name}",
+        stages=[
+            PipelineStage(
+                name="run",
+                task_preset="bounded_background",
+                goal_template=f"Run routine: {routine.name}",
+            )
+        ],
+        triggers=[time_of_day(pipeline_name, at=trigger_time)],
+        interruption_policy=InterruptionPolicy.PAUSE_ON_CONVERSATION,
+        failure_policy=FailurePolicy.FAIL_PIPELINE,
+        intent_duration="indefinite",
+    )
+
+    await engine.register_runtime_pipeline(pipeline)
+    log.info(
+        "routine_pipeline_registered",
+        routine_id=routine.id,
+        pipeline_name=pipeline_name,
+        trigger_time=trigger_time.isoformat(),
+    )

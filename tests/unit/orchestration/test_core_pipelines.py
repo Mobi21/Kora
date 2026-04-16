@@ -79,6 +79,20 @@ def test_other_pipelines_use_stub_step() -> None:
         "weekly_adhd_profile",
         # Phase 8c: post_memory_vault has 4 real stage handlers
         "post_memory_vault",
+        # Phase 8e: 13 proactive/infrastructure pipelines have real handlers
+        "wake_up_preparation",
+        "continuity_check",
+        "proactive_pattern_scan",
+        "anticipatory_prep",
+        "proactive_research",
+        "article_digest",
+        "follow_through_draft",
+        "contextual_engagement",
+        "commitment_tracking",
+        "stuck_detection",
+        "weekly_triage",
+        "draft_on_observation",
+        "connection_making",
     }
     for name in stub_names:
         assert fns[name] is _stub_step
@@ -173,6 +187,42 @@ def test_post_session_memory_stage_dependencies() -> None:
     assert stage_deps["dedup"] == ["consolidate"]
     assert stage_deps["entities"] == ["dedup"]
     assert stage_deps["vault_handoff"] == ["entities"]
+
+
+def test_phase_8e_pipelines_have_real_step_functions() -> None:
+    """Phase 8e: the 13 proactive/infrastructure pipelines are wired to
+    the real handlers in ``proactive_handlers``."""
+    from kora_v2.agents.background.proactive_handlers import (
+        anticipatory_prep_step,
+        article_digest_step,
+        commitment_tracking_step,
+        connection_making_step,
+        contextual_engagement_step,
+        continuity_check_step,
+        draft_on_observation_step,
+        follow_through_draft_step,
+        proactive_pattern_scan_step,
+        proactive_research_step,
+        stuck_detection_step,
+        wake_up_preparation_step,
+        weekly_triage_step,
+    )
+
+    build_core_pipelines()
+    fns = core_step_fns()
+    assert fns["wake_up_preparation"] is wake_up_preparation_step
+    assert fns["continuity_check"] is continuity_check_step
+    assert fns["proactive_pattern_scan"] is proactive_pattern_scan_step
+    assert fns["anticipatory_prep"] is anticipatory_prep_step
+    assert fns["proactive_research"] is proactive_research_step
+    assert fns["article_digest"] is article_digest_step
+    assert fns["follow_through_draft"] is follow_through_draft_step
+    assert fns["contextual_engagement"] is contextual_engagement_step
+    assert fns["commitment_tracking"] is commitment_tracking_step
+    assert fns["stuck_detection"] is stuck_detection_step
+    assert fns["weekly_triage"] is weekly_triage_step
+    assert fns["draft_on_observation"] is draft_on_observation_step
+    assert fns["connection_making"] is connection_making_step
 
 
 def test_post_memory_vault_uses_sequence_complete_trigger() -> None:
