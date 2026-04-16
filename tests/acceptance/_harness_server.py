@@ -131,15 +131,65 @@ def _rest_get(path: str, port: int, host: str, token: str) -> dict[str, Any] | N
 
 # ── Test data cleanup ────────────────────────────────────────────────────────
 
-async def _clean_stale_autonomous_data(db_path: Path) -> None:
-    """Wipe stale autonomous data from previous test runs.
+# Tables that must be cleared between acceptance test runs.
+#
+# Two layers:
+#   1. Legacy autonomous tables (Phase ≤ 7): autonomous_plans,
+#      autonomous_checkpoints, items, autonomous_updates,
+#      item_state_history, item_artifact_links, item_deps.
+#   2. Phase 7.5 + Phase 8 tables: 8 orchestration tables, the
+#      Phase 8a session_transcripts + signal_queue, the Phase 8b
+#      dedup_rejected_pairs, plus notifications and reminders.
+#
+# Order matters where foreign keys are involved (children before
+# parents). worker_tasks → pipeline_instances; work_ledger references
+# both but with no FK enforcement so order is loose. We use TRUNCATE-
+# style ``DELETE FROM`` (SQLite has no TRUNCATE) and tolerate missing
+# tables so the harness boots cleanly against an older DB.
+_LEGACY_AUTONOMOUS_TABLES: tuple[str, ...] = (
+    "item_state_history",
+    "item_artifact_links",
+    "item_deps",
+    "items",
+    "autonomous_updates",
+    "autonomous_checkpoints",
+    "autonomous_plans",
+)
 
-    The previous implementation only wiped ``autonomous_plans`` and
-    ``autonomous_checkpoints``, which left orphan rows in ``items``,
-    ``autonomous_updates``, and ``item_state_history``. That caused the
-    2026-04-11 acceptance report to say "no plans in DB" while the
-    items table still showed work from a previous run — confusingly
-    mixing old and new state. Always clean the full set atomically.
+_ORCHESTRATION_TABLES: tuple[str, ...] = (
+    "work_ledger",
+    "worker_tasks",
+    "pipeline_instances",
+    "trigger_state",
+    "system_state_log",
+    "request_limiter_log",
+    "open_decisions",
+    "runtime_pipelines",
+)
+
+_PROACTIVE_TABLES: tuple[str, ...] = (
+    "notifications",
+    "reminders",
+    "session_transcripts",
+    "signal_queue",
+    "dedup_rejected_pairs",
+)
+
+
+async def _clean_stale_test_data(db_path: Path) -> None:
+    """Wipe stale data from previous test runs (Phase ≤ 7 + Phase 8).
+
+    Phase ≤ 7 tables (autonomous_*, items, etc.) plus Phase 7.5
+    orchestration (8 tables), Phase 8 memory lifecycle adjuncts
+    (signal_queue, session_transcripts, dedup_rejected_pairs), and
+    proactive surfaces (notifications, reminders).
+
+    The previous ``_clean_stale_autonomous_data`` only wiped the legacy
+    autonomous tables, which left a post-Phase 8 system in mixed state
+    between runs. Always clean the full set atomically.
+
+    Each DELETE is wrapped so a missing table doesn't abort the rest —
+    the cleanup runs at startup against whatever DB shape exists.
     """
     if not db_path.exists():
         return
@@ -149,15 +199,11 @@ async def _clean_stale_autonomous_data(db_path: Path) -> None:
         return
     try:
         async with aiosqlite.connect(str(db_path)) as db:
-            # Order matters for FK-respecting deletes: children first.
+            # Children first, then parents, then proactive tables.
             for table in (
-                "item_state_history",
-                "item_artifact_links",
-                "item_deps",
-                "items",
-                "autonomous_updates",
-                "autonomous_checkpoints",
-                "autonomous_plans",
+                *_LEGACY_AUTONOMOUS_TABLES,
+                *_ORCHESTRATION_TABLES,
+                *_PROACTIVE_TABLES,
             ):
                 try:
                     await db.execute(f"DELETE FROM {table}")
@@ -166,6 +212,10 @@ async def _clean_stale_autonomous_data(db_path: Path) -> None:
             await db.commit()
     except Exception:
         pass  # DB may be locked or corrupted — not fatal for test startup
+
+
+# Backward-compat alias — one slice of grace before removal.
+_clean_stale_autonomous_data = _clean_stale_test_data
 
 
 # ── Harness server ───────────────────────────────────────────────────────────
@@ -476,8 +526,12 @@ class HarnessServer:
         else:
             snapshot["error"] = "Daemon not reachable for state capture"
 
-        # Always capture autonomous runtime state directly from DB
-        snapshot["autonomous_state"] = await self._query_autonomous_state()
+        # Capture full state across all post-Phase 8 dimensions.
+        # ``autonomous_state`` stays at the top level for backward compat
+        # with the existing report builder; the new dimensions live next
+        # to it as documented in AT2.
+        full = await self._snapshot_full_state()
+        snapshot.update(full)
 
         path = SNAPSHOTS_DIR / f"{name}.json"
         path.write_text(json.dumps(snapshot, indent=2, default=str))
@@ -543,29 +597,42 @@ class HarnessServer:
         if pg1 != pg2:
             lines.append(f"Permission grants: {pg1} → {pg2} (Δ{pg2 - pg1:+d})")
 
-        # Autonomous runtime state
+        # ── Phase 7.5 / Phase 8 state diffs ────────────────────────────
+        self._diff_orchestration(s1, s2, lines)
+        self._diff_memory_lifecycle(s1, s2, lines)
+        self._diff_vault(s1, s2, lines)
+        self._diff_proactive(s1, s2, lines)
+
+        # ── Legacy autonomous tables (deprecated) ──────────────────────
         a1 = s1.get("autonomous_state") or {}
         a2 = s2.get("autonomous_state") or {}
         if a1.get("available") or a2.get("available"):
+            legacy_lines: list[str] = []
             items1 = a1.get("total_items", 0)
             items2 = a2.get("total_items", 0)
             if items1 != items2:
-                lines.append(f"Items (tasks): {items1} → {items2} (Δ{items2 - items1:+d})")
+                legacy_lines.append(
+                    f"Items (tasks): {items1} → {items2} (Δ{items2 - items1:+d})"
+                )
 
             chk1 = a1.get("checkpoint_count", 0)
             chk2 = a2.get("checkpoint_count", 0)
             if chk1 != chk2:
-                lines.append(f"Autonomous checkpoints: {chk1} → {chk2} (Δ{chk2 - chk1:+d})")
+                legacy_lines.append(
+                    f"Autonomous checkpoints: {chk1} → {chk2} (Δ{chk2 - chk1:+d})"
+                )
 
             plans1 = len(a1.get("autonomous_plans", []))
             plans2 = len(a2.get("autonomous_plans", []))
             if plans1 != plans2:
-                lines.append(f"Autonomous plans total: {plans1} → {plans2}")
+                legacy_lines.append(f"Autonomous plans total: {plans1} → {plans2}")
 
             active1 = a1.get("active_plan_count", 0)
             active2 = a2.get("active_plan_count", 0)
             if active1 != active2:
-                lines.append(f"Active autonomous plans: {active1} → {active2}")
+                legacy_lines.append(
+                    f"Active autonomous plans: {active1} → {active2}"
+                )
 
             # Status breakdown change
             st1 = a1.get("items_by_status", {})
@@ -574,7 +641,9 @@ class HarnessServer:
             for status in sorted(all_statuses):
                 c1, c2 = st1.get(status, 0), st2.get(status, 0)
                 if c1 != c2:
-                    lines.append(f"  items[{status}]: {c1} → {c2} (Δ{c2 - c1:+d})")
+                    legacy_lines.append(
+                        f"  items[{status}]: {c1} → {c2} (Δ{c2 - c1:+d})"
+                    )
 
             # New items created since snap1
             new_items = [
@@ -584,13 +653,18 @@ class HarnessServer:
                 )
             ]
             if new_items:
-                lines.append("")
-                lines.append(f"## New autonomous items ({len(new_items)}):")
+                legacy_lines.append("")
+                legacy_lines.append(f"  New autonomous items ({len(new_items)}):")
                 for it in new_items[:5]:
                     content = (it.get("content") or "")[:120]
                     status = it.get("status", "?")
                     owner = it.get("owner", "?")
-                    lines.append(f"  [{status}/{owner}] {content}")
+                    legacy_lines.append(f"    [{status}/{owner}] {content}")
+
+            if legacy_lines:
+                lines.append("")
+                lines.append("## Legacy autonomous tables (deprecated)")
+                lines.extend(legacy_lines)
 
         # New messages since snap1
         if delta > 0:
@@ -609,7 +683,13 @@ class HarnessServer:
         return {"diff": diff_text, "path": str(diff_path)}
 
     async def _query_autonomous_state(self) -> dict[str, Any]:
-        """Query live autonomous runtime state directly from operational.db."""
+        """Query live autonomous runtime state directly from operational.db.
+
+        DEPRECATED — kept for backward compat with the legacy snapshot
+        format and existing report code. Phase 7.5+ callers should use
+        :meth:`_query_orchestration_state` for the orchestration tables
+        and :meth:`_snapshot_full_state` for everything else.
+        """
         op_db = PROJECT_ROOT / "data" / "operational.db"
         if not op_db.exists():
             return {"available": False}
@@ -679,6 +759,1077 @@ class HarnessServer:
                 }
         except Exception as e:
             return {"available": False, "error": str(e)}
+
+    # ── Phase 7.5 / Phase 8 state queries ────────────────────────────────
+
+    async def _query_orchestration_state(
+        self,
+        db_path: Path | None = None,
+    ) -> dict[str, Any]:
+        """Query the 8 orchestration tables (Phase 7.5).
+
+        Returns a dict shaped per the AT2 contract. Each table query is
+        wrapped so a missing table records ``{"error": "table_missing"}``
+        in its slot rather than aborting the whole snapshot — older DB
+        states (pre-orchestration migrations) must still snapshot OK.
+        """
+        op_db = db_path or (PROJECT_ROOT / "data" / "operational.db")
+        if not op_db.exists():
+            return {"available": False, "error": "db_missing", "path": str(op_db)}
+
+        try:
+            import aiosqlite
+        except ImportError:
+            return {"available": False, "error": "aiosqlite not installed"}
+
+        result: dict[str, Any] = {"available": True}
+
+        try:
+            async with aiosqlite.connect(str(op_db)) as db:
+                db.row_factory = aiosqlite.Row
+
+                result["pipeline_instances"] = await self._q_pipeline_instances(db)
+                result["worker_tasks"] = await self._q_worker_tasks(db)
+                result["work_ledger"] = await self._q_work_ledger(db)
+                result["trigger_state"] = await self._q_trigger_state(db)
+                result["system_state_log"] = await self._q_system_state_log(db)
+                result["request_limiter"] = await self._q_request_limiter(db)
+                result["open_decisions"] = await self._q_open_decisions(db)
+                result["runtime_pipelines"] = await self._q_runtime_pipelines(db)
+        except Exception as e:
+            result["error"] = f"connect_failed: {e}"
+
+        return result
+
+    @staticmethod
+    async def _q_pipeline_instances(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM pipeline_instances")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            cur = await db.execute(
+                "SELECT state, COUNT(*) AS cnt FROM pipeline_instances GROUP BY state"
+            )
+            by_state = {r["state"]: r["cnt"] for r in await cur.fetchall()}
+
+            cur = await db.execute(
+                "SELECT pipeline_name, COUNT(*) AS cnt FROM pipeline_instances "
+                "GROUP BY pipeline_name"
+            )
+            by_name = {r["pipeline_name"]: r["cnt"] for r in await cur.fetchall()}
+
+            cur = await db.execute(
+                """SELECT id, pipeline_name, state, started_at, completed_at,
+                          updated_at, completion_reason
+                   FROM pipeline_instances
+                   ORDER BY started_at DESC LIMIT 20"""
+            )
+            recent: list[dict[str, Any]] = []
+            for r in await cur.fetchall():
+                row_dict = dict(r)
+                # Best-effort duration_s computation (ISO timestamps).
+                duration_s: float | None = None
+                started = row_dict.get("started_at")
+                completed = row_dict.get("completed_at")
+                if started and completed:
+                    try:
+                        s = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+                        e = datetime.fromisoformat(str(completed).replace("Z", "+00:00"))
+                        duration_s = (e - s).total_seconds()
+                    except Exception:
+                        pass
+                row_dict["duration_s"] = duration_s
+                recent.append(row_dict)
+
+            return {
+                "total": total,
+                "by_state": by_state,
+                "by_name": by_name,
+                "recent": recent,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "pipeline_instances"}
+
+    @staticmethod
+    async def _q_worker_tasks(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM worker_tasks")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            cur = await db.execute(
+                "SELECT state, COUNT(*) AS cnt FROM worker_tasks GROUP BY state"
+            )
+            by_lifecycle = {r["state"]: r["cnt"] for r in await cur.fetchall()}
+
+            active_states = {"pending", "running", "checkpointing", "paused_for_conversation"}
+            active_count = sum(by_lifecycle.get(s, 0) for s in active_states)
+
+            return {
+                "total": total,
+                "by_lifecycle": by_lifecycle,
+                "active_count": active_count,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "worker_tasks"}
+
+    @staticmethod
+    async def _q_work_ledger(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM work_ledger")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            cur = await db.execute(
+                "SELECT event_type, COUNT(*) AS cnt FROM work_ledger GROUP BY event_type"
+            )
+            by_event_type = {r["event_type"]: r["cnt"] for r in await cur.fetchall()}
+
+            cur = await db.execute(
+                """SELECT timestamp, event_type, pipeline_instance_id,
+                          worker_task_id, trigger_name, reason
+                   FROM work_ledger
+                   ORDER BY id DESC LIMIT 30"""
+            )
+            recent = [dict(r) for r in await cur.fetchall()]
+
+            return {
+                "total": total,
+                "by_event_type": by_event_type,
+                "recent": recent,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "work_ledger"}
+
+    @staticmethod
+    async def _q_trigger_state(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM trigger_state")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            cur = await db.execute(
+                """SELECT trigger_id, pipeline_name, last_fired_at, last_fire_reason,
+                          next_eligible_at
+                   FROM trigger_state
+                   ORDER BY last_fired_at DESC LIMIT 20"""
+            )
+            last_fires = []
+            for r in await cur.fetchall():
+                d = dict(r)
+                last_fires.append({
+                    "trigger_name": d.get("trigger_id"),
+                    "pipeline_name": d.get("pipeline_name"),
+                    "last_fired_at": d.get("last_fired_at"),
+                    "last_fire_reason": d.get("last_fire_reason"),
+                    "next_eligible_at": d.get("next_eligible_at"),
+                })
+
+            return {
+                "total_triggers_tracked": total,
+                "last_fires": last_fires,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "trigger_state"}
+
+    @staticmethod
+    async def _q_system_state_log(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM system_state_log")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            cur = await db.execute(
+                "SELECT new_phase, COUNT(*) AS cnt FROM system_state_log "
+                "GROUP BY new_phase"
+            )
+            by_phase = {r["new_phase"]: r["cnt"] for r in await cur.fetchall()}
+
+            cur = await db.execute(
+                """SELECT previous_phase, new_phase, transitioned_at, reason
+                   FROM system_state_log
+                   ORDER BY id DESC LIMIT 20"""
+            )
+            recent_transitions = []
+            current_phase: str | None = None
+            rows = await cur.fetchall()
+            for r in rows:
+                d = dict(r)
+                recent_transitions.append({
+                    "from_phase": d.get("previous_phase"),
+                    "to_phase": d.get("new_phase"),
+                    "at": d.get("transitioned_at"),
+                    "reason": d.get("reason"),
+                })
+            if rows:
+                current_phase = dict(rows[0]).get("new_phase")
+
+            return {
+                "transitions_total": total,
+                "by_phase": by_phase,
+                "current_phase": current_phase,
+                "recent_transitions": recent_transitions,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "system_state_log"}
+
+    @staticmethod
+    async def _q_request_limiter(db: Any) -> dict[str, Any]:
+        # Window: 5 hours = 18000 seconds (per AT2 spec).
+        window_seconds = 18000
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM request_limiter_log")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            cur = await db.execute(
+                "SELECT class, COUNT(*) AS cnt FROM request_limiter_log GROUP BY class"
+            )
+            by_class = {r["class"]: r["cnt"] for r in await cur.fetchall()}
+
+            # Approximate budget remaining over the trailing window.
+            # The "capacity" is unknowable without the limiter config; we
+            # report total-in-window so callers can compute their own.
+            in_window = 0
+            try:
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM request_limiter_log "
+                    "WHERE timestamp >= datetime('now', ?)",
+                    (f"-{window_seconds} seconds",),
+                )
+                row = await cur.fetchone()
+                in_window = row[0] if row else 0
+            except Exception:
+                pass
+
+            return {
+                "total_requests_logged": total,
+                "by_class": by_class,
+                "window_seconds": window_seconds,
+                "in_window": in_window,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "request_limiter_log"}
+
+    @staticmethod
+    async def _q_open_decisions(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM open_decisions")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            cur = await db.execute(
+                "SELECT status, COUNT(*) AS cnt FROM open_decisions GROUP BY status"
+            )
+            by_status = {r["status"]: r["cnt"] for r in await cur.fetchall()}
+
+            cur = await db.execute(
+                """SELECT id, topic, posed_at, posed_in_session, status,
+                          resolved_at, resolution
+                   FROM open_decisions
+                   ORDER BY posed_at DESC LIMIT 20"""
+            )
+            recent = [dict(r) for r in await cur.fetchall()]
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "recent": recent,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "open_decisions"}
+
+    @staticmethod
+    async def _q_runtime_pipelines(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM runtime_pipelines")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            cur = await db.execute(
+                "SELECT name, enabled FROM runtime_pipelines LIMIT 50"
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+            names = [r["name"] for r in rows]
+            by_enabled = {"enabled": 0, "disabled": 0}
+            for r in rows:
+                if r.get("enabled"):
+                    by_enabled["enabled"] += 1
+                else:
+                    by_enabled["disabled"] += 1
+
+            return {
+                "total": total,
+                "by_type": by_enabled,
+                "names": names,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "runtime_pipelines"}
+
+    async def _query_memory_lifecycle_state(
+        self,
+        projection_db_path: Path | None = None,
+        operational_db_path: Path | None = None,
+    ) -> dict[str, Any]:
+        """Query memory lifecycle (Phase 8): soft-delete, dedup, entities.
+
+        Pulls from ``projection.db`` (memories, user_model_facts,
+        entities, entity_links) and ``operational.db`` (signal_queue,
+        session_transcripts, dedup_rejected_pairs).
+        """
+        proj_db = projection_db_path or (PROJECT_ROOT / "data" / "projection.db")
+        op_db = operational_db_path or (PROJECT_ROOT / "data" / "operational.db")
+
+        result: dict[str, Any] = {
+            "available": proj_db.exists() or op_db.exists(),
+            "projection_db_path": str(proj_db),
+            "operational_db_path": str(op_db),
+        }
+
+        try:
+            import aiosqlite
+        except ImportError:
+            return {"available": False, "error": "aiosqlite not installed"}
+
+        # --- projection.db queries ---
+        if proj_db.exists():
+            try:
+                async with aiosqlite.connect(str(proj_db)) as db:
+                    db.row_factory = aiosqlite.Row
+                    result["memories"] = await self._q_lifecycle_table(
+                        db, "memories", with_status=True,
+                    )
+                    result["user_model_facts"] = await self._q_lifecycle_table(
+                        db, "user_model_facts", with_status=True,
+                    )
+                    result["entities"] = await self._q_entities(db)
+                    result["entity_links"] = await self._q_entity_links(db)
+            except Exception as e:
+                result["projection_error"] = str(e)
+        else:
+            for k in ("memories", "user_model_facts", "entities", "entity_links"):
+                result[k] = {"error": "db_missing", "db": "projection.db"}
+
+        # --- operational.db queries ---
+        if op_db.exists():
+            try:
+                async with aiosqlite.connect(str(op_db)) as db:
+                    db.row_factory = aiosqlite.Row
+                    result["sessions"] = await self._q_session_transcripts(db)
+                    result["signal_queue"] = await self._q_signal_queue(db)
+                    result["dedup_rejected_pairs"] = await self._q_dedup_pairs(db)
+            except Exception as e:
+                result["operational_error"] = str(e)
+        else:
+            for k in ("sessions", "signal_queue", "dedup_rejected_pairs"):
+                result[k] = {"error": "db_missing", "db": "operational.db"}
+
+        return result
+
+    @staticmethod
+    async def _q_lifecycle_table(
+        db: Any,
+        table: str,
+        with_status: bool = True,
+    ) -> dict[str, Any]:
+        """Generic query for memories / user_model_facts soft-delete state."""
+        try:
+            cur = await db.execute(f"SELECT COUNT(*) FROM {table}")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            by_status: dict[str, int] = {}
+            with_consolidated_into = 0
+            with_merged_from = 0
+            recent_active: list[dict[str, Any]] = []
+
+            if with_status:
+                try:
+                    cur = await db.execute(
+                        f"SELECT status, COUNT(*) AS cnt FROM {table} GROUP BY status"
+                    )
+                    by_status = {r["status"]: r["cnt"] for r in await cur.fetchall()}
+                except Exception:
+                    by_status = {"_error": "status_column_missing"}  # type: ignore[dict-item]
+
+                try:
+                    cur = await db.execute(
+                        f"SELECT COUNT(*) FROM {table} "
+                        "WHERE consolidated_into IS NOT NULL"
+                    )
+                    row = await cur.fetchone()
+                    with_consolidated_into = row[0] if row else 0
+                except Exception:
+                    pass
+
+                try:
+                    cur = await db.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE merged_from IS NOT NULL"
+                    )
+                    row = await cur.fetchone()
+                    with_merged_from = row[0] if row else 0
+                except Exception:
+                    pass
+
+                try:
+                    cur = await db.execute(
+                        f"SELECT id, created_at FROM {table} "
+                        "WHERE status = 'active' "
+                        "ORDER BY created_at DESC LIMIT 10"
+                    )
+                    recent_active = [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    pass
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "with_consolidated_into": with_consolidated_into,
+                "with_merged_from": with_merged_from,
+                "recent_active": recent_active,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": table}
+
+    @staticmethod
+    async def _q_entities(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM entities")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+            cur = await db.execute(
+                "SELECT entity_type, COUNT(*) AS cnt FROM entities GROUP BY entity_type"
+            )
+            by_type = {r["entity_type"]: r["cnt"] for r in await cur.fetchall()}
+            return {"total": total, "by_type": by_type}
+        except Exception:
+            return {"error": "table_missing", "table": "entities"}
+
+    @staticmethod
+    async def _q_entity_links(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM entity_links")
+            row = await cur.fetchone()
+            return {"total": row[0] if row else 0}
+        except Exception:
+            return {"error": "table_missing", "table": "entity_links"}
+
+    @staticmethod
+    async def _q_session_transcripts(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM session_transcripts")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM session_transcripts WHERE processed_at IS NOT NULL"
+            )
+            row = await cur.fetchone()
+            processed = row[0] if row else 0
+            return {
+                "transcripts_total": total,
+                "processed": processed,
+                "unprocessed": max(total - processed, 0),
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "session_transcripts"}
+
+    @staticmethod
+    async def _q_signal_queue(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM signal_queue")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+            cur = await db.execute(
+                "SELECT status, COUNT(*) AS cnt FROM signal_queue GROUP BY status"
+            )
+            by_status = {r["status"]: r["cnt"] for r in await cur.fetchall()}
+            return {"total": total, "by_status": by_status}
+        except Exception:
+            return {"error": "table_missing", "table": "signal_queue"}
+
+    @staticmethod
+    async def _q_dedup_pairs(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM dedup_rejected_pairs")
+            row = await cur.fetchone()
+            return {"total": row[0] if row else 0}
+        except Exception:
+            return {"error": "table_missing", "table": "dedup_rejected_pairs"}
+
+    async def _query_vault_state(
+        self,
+        vault_root: Path | None = None,
+    ) -> dict[str, Any]:
+        """Inspect the _KoraMemory/ vault filesystem.
+
+        Counts notes per folder, detects working docs in Inbox via
+        ``pipeline:`` frontmatter, and computes rough wikilink density.
+
+        Defaults to ``data/_KoraMemory/`` relative to PROJECT_ROOT, but
+        accepts an override for tests. The walk is bounded to 500 files
+        to avoid stalling on huge vaults — additional files are noted
+        in the response.
+        """
+        import re as _re
+
+        # Default vault root: data dir's _KoraMemory.
+        # Real installs put it under ~/.kora/memory; tests can override.
+        if vault_root is None:
+            vault_root = PROJECT_ROOT / "data" / "_KoraMemory"
+
+        result: dict[str, Any] = {
+            "root": str(vault_root),
+            "exists": vault_root.exists(),
+            "counts": {
+                "total_notes": 0,
+                "long_term_episodic": 0,
+                "long_term_reflective": 0,
+                "long_term_procedural": 0,
+                "user_model": 0,
+                "entities_people": 0,
+                "entities_places": 0,
+                "entities_projects": 0,
+                "inbox": 0,
+                "references": 0,
+                "ideas": 0,
+                "sessions": 0,
+                "moc_pages": 0,
+            },
+            "working_docs": [],
+            "wikilink_density": {
+                "notes_with_wikilinks": 0,
+                "total_wikilinks": 0,
+            },
+            "folder_hierarchy_present": False,
+        }
+
+        if not vault_root.exists():
+            return result
+
+        # Folder-counter mapping (relative path prefix → counts key).
+        folder_map: tuple[tuple[str, str], ...] = (
+            ("Long-Term/Episodic", "long_term_episodic"),
+            ("Long-Term/Reflective", "long_term_reflective"),
+            ("Long-Term/Procedural", "long_term_procedural"),
+            ("User Model", "user_model"),
+            ("Entities/People", "entities_people"),
+            ("Entities/Places", "entities_places"),
+            ("Entities/Projects", "entities_projects"),
+            ("Inbox", "inbox"),
+            ("References", "references"),
+            ("Ideas", "ideas"),
+            ("Sessions", "sessions"),
+            ("Maps of Content", "moc_pages"),
+        )
+        wikilink_re = _re.compile(r"\[\[[^\]]+\]\]")
+        # Match the leading ``pipeline:`` key inside a YAML frontmatter
+        # block. Frontmatter starts at line 1 with ``---``, ends with the
+        # next ``---``, and we only need to detect presence.
+        frontmatter_pipeline_re = _re.compile(
+            r"^---\s*\n(.*?)^---\s*$", _re.DOTALL | _re.MULTILINE,
+        )
+        pipeline_key_re = _re.compile(r"^pipeline\s*:\s*(.+)$", _re.MULTILINE)
+        status_key_re = _re.compile(r"^status\s*:\s*(.+)$", _re.MULTILINE)
+
+        files_walked = 0
+        max_files = 500
+        truncated = False
+
+        for path in vault_root.rglob("*.md"):
+            if files_walked >= max_files:
+                truncated = True
+                break
+            files_walked += 1
+
+            try:
+                rel = path.relative_to(vault_root)
+                rel_str = str(rel)
+            except ValueError:
+                continue
+
+            result["counts"]["total_notes"] += 1
+
+            for prefix, key in folder_map:
+                if rel_str.startswith(prefix):
+                    result["counts"][key] += 1
+                    break
+
+            # Read content (best-effort) for frontmatter + wikilink scan.
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            # Working doc detection: inside Inbox and frontmatter has
+            # ``pipeline:`` key.
+            if rel_str.startswith("Inbox"):
+                fm_match = frontmatter_pipeline_re.search(text)
+                if fm_match:
+                    fm = fm_match.group(1)
+                    p_match = pipeline_key_re.search(fm)
+                    s_match = status_key_re.search(fm)
+                    if p_match:
+                        try:
+                            stat = path.stat()
+                            mtime = datetime.fromtimestamp(
+                                stat.st_mtime, tz=UTC
+                            ).isoformat()
+                            size = stat.st_size
+                        except Exception:
+                            mtime = None
+                            size = 0
+                        result["working_docs"].append({
+                            "path": str(path),
+                            "pipeline_name": p_match.group(1).strip(),
+                            "status": s_match.group(1).strip() if s_match else None,
+                            "mtime": mtime,
+                            "size_bytes": size,
+                        })
+
+            # Wikilink density.
+            matches = wikilink_re.findall(text)
+            if matches:
+                result["wikilink_density"]["notes_with_wikilinks"] += 1
+                result["wikilink_density"]["total_wikilinks"] += len(matches)
+
+        result["files_walked"] = files_walked
+        result["truncated"] = truncated
+
+        # Folder hierarchy: at least the canonical top-level dirs exist.
+        expected_top = (
+            "Long-Term", "User Model", "Entities", "Inbox",
+            "Sessions", "Maps of Content",
+        )
+        result["folder_hierarchy_present"] = all(
+            (vault_root / sub).exists() for sub in expected_top
+        )
+
+        return result
+
+    async def _query_proactive_state(
+        self,
+        db_path: Path | None = None,
+    ) -> dict[str, Any]:
+        """Query notifications, reminders, insights (Phase 8)."""
+        op_db = db_path or (PROJECT_ROOT / "data" / "operational.db")
+        result: dict[str, Any] = {"available": op_db.exists()}
+
+        if not op_db.exists():
+            result["error"] = "db_missing"
+            return result
+
+        try:
+            import aiosqlite
+        except ImportError:
+            return {"available": False, "error": "aiosqlite not installed"}
+
+        try:
+            async with aiosqlite.connect(str(op_db)) as db:
+                db.row_factory = aiosqlite.Row
+                result["notifications"] = await self._q_notifications(db)
+                result["reminders"] = await self._q_reminders(db)
+        except Exception as e:
+            result["error"] = str(e)
+
+        # Insights are not persisted to a table; ContextEngine emits
+        # INSIGHT_AVAILABLE events. AT3 will wire event-stream tracking.
+        result["insights"] = {
+            "persisted": False,
+            "total_if_persisted": None,
+            "note": "ContextEngine emits INSIGHT_AVAILABLE events; "
+                    "AT3 will track via event stream",
+        }
+        return result
+
+    @staticmethod
+    async def _q_notifications(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM notifications")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            by_tier: dict[str, int] = {}
+            try:
+                cur = await db.execute(
+                    "SELECT delivery_tier, COUNT(*) AS cnt FROM notifications "
+                    "GROUP BY delivery_tier"
+                )
+                by_tier = {
+                    (r["delivery_tier"] or "unknown"): r["cnt"]
+                    for r in await cur.fetchall()
+                }
+            except Exception:
+                by_tier = {"_error": "delivery_tier_column_missing"}  # type: ignore[dict-item]
+
+            by_reason: dict[str, int] = {}
+            try:
+                cur = await db.execute(
+                    "SELECT reason, COUNT(*) AS cnt FROM notifications "
+                    "GROUP BY reason"
+                )
+                by_reason = {
+                    (r["reason"] or "none"): r["cnt"]
+                    for r in await cur.fetchall()
+                }
+            except Exception:
+                by_reason = {"_error": "reason_column_missing"}  # type: ignore[dict-item]
+
+            recent: list[dict[str, Any]] = []
+            try:
+                cur = await db.execute(
+                    """SELECT id, priority, content, category, delivered_at,
+                              acknowledged_at, delivery_tier, reason
+                       FROM notifications ORDER BY delivered_at DESC LIMIT 20"""
+                )
+                recent = [dict(r) for r in await cur.fetchall()]
+            except Exception:
+                # Fall back to columns guaranteed by the base schema.
+                try:
+                    cur = await db.execute(
+                        """SELECT id, priority, content, category, delivered_at
+                           FROM notifications ORDER BY delivered_at DESC LIMIT 20"""
+                    )
+                    recent = [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    recent = []
+
+            return {
+                "total": total,
+                "by_tier": by_tier,
+                "by_reason": by_reason,
+                "recent": recent,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "notifications"}
+
+    @staticmethod
+    async def _q_reminders(db: Any) -> dict[str, Any]:
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM reminders")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+
+            cur = await db.execute(
+                "SELECT status, COUNT(*) AS cnt FROM reminders GROUP BY status"
+            )
+            by_status = {r["status"]: r["cnt"] for r in await cur.fetchall()}
+
+            # Mean delivery slip: delivered_at - due_at over delivered
+            # rows. Both columns are added by Phase 8e migrations.
+            mean_slip: float | None = None
+            try:
+                cur = await db.execute(
+                    "SELECT due_at, delivered_at FROM reminders "
+                    "WHERE delivered_at IS NOT NULL AND due_at IS NOT NULL "
+                    "LIMIT 200"
+                )
+                slips: list[float] = []
+                for r in await cur.fetchall():
+                    try:
+                        d_due = datetime.fromisoformat(
+                            str(r["due_at"]).replace("Z", "+00:00")
+                        )
+                        d_del = datetime.fromisoformat(
+                            str(r["delivered_at"]).replace("Z", "+00:00")
+                        )
+                        slips.append((d_del - d_due).total_seconds())
+                    except Exception:
+                        continue
+                if slips:
+                    mean_slip = sum(slips) / len(slips)
+            except Exception:
+                pass
+
+            recent: list[dict[str, Any]] = []
+            try:
+                cur = await db.execute(
+                    """SELECT id, title, status, due_at, delivered_at,
+                              dismissed_at, source, created_at
+                       FROM reminders ORDER BY created_at DESC LIMIT 20"""
+                )
+                recent = [dict(r) for r in await cur.fetchall()]
+            except Exception:
+                try:
+                    cur = await db.execute(
+                        """SELECT id, title, status, created_at
+                           FROM reminders ORDER BY created_at DESC LIMIT 20"""
+                    )
+                    recent = [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    recent = []
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "mean_delivery_slip_seconds": mean_slip,
+                "recent": recent,
+            }
+        except Exception:
+            return {"error": "table_missing", "table": "reminders"}
+
+    # ── Snapshot diff helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _diff_orchestration(
+        s1: dict[str, Any], s2: dict[str, Any], lines: list[str],
+    ) -> None:
+        o1 = s1.get("orchestration_state") or {}
+        o2 = s2.get("orchestration_state") or {}
+        if not (o1.get("available") or o2.get("available")):
+            return
+
+        section_started = False
+
+        def _start_section() -> None:
+            nonlocal section_started
+            if not section_started:
+                lines.append("")
+                lines.append("## Orchestration (Phase 7.5)")
+                section_started = True
+
+        # Pipeline instances
+        p1 = o1.get("pipeline_instances") or {}
+        p2 = o2.get("pipeline_instances") or {}
+        if not p1.get("error") and not p2.get("error"):
+            t1, t2 = p1.get("total", 0), p2.get("total", 0)
+            if t1 != t2:
+                _start_section()
+                lines.append(
+                    f"Pipeline instances: {t1} → {t2} (Δ{t2 - t1:+d})"
+                )
+            bs1 = p1.get("by_state", {}) or {}
+            bs2 = p2.get("by_state", {}) or {}
+            for st in sorted(set(bs1) | set(bs2)):
+                c1, c2 = bs1.get(st, 0), bs2.get(st, 0)
+                if c1 != c2:
+                    _start_section()
+                    lines.append(
+                        f"  pipeline_instances[state={st}]: {c1} → {c2} (Δ{c2 - c1:+d})"
+                    )
+            bn1 = p1.get("by_name", {}) or {}
+            bn2 = p2.get("by_name", {}) or {}
+            for name in sorted(set(bn1) | set(bn2)):
+                c1, c2 = bn1.get(name, 0), bn2.get(name, 0)
+                if c1 != c2:
+                    _start_section()
+                    lines.append(
+                        f"  pipeline_instances[name={name}]: {c1} → {c2} (Δ{c2 - c1:+d})"
+                    )
+
+        # Worker tasks
+        w1 = o1.get("worker_tasks") or {}
+        w2 = o2.get("worker_tasks") or {}
+        if not w1.get("error") and not w2.get("error"):
+            t1, t2 = w1.get("total", 0), w2.get("total", 0)
+            if t1 != t2:
+                _start_section()
+                lines.append(
+                    f"Worker tasks: {t1} → {t2} (Δ{t2 - t1:+d})"
+                )
+            a1, a2 = w1.get("active_count", 0), w2.get("active_count", 0)
+            if a1 != a2:
+                _start_section()
+                lines.append(
+                    f"  worker_tasks[active]: {a1} → {a2} (Δ{a2 - a1:+d})"
+                )
+
+        # Work ledger event types
+        wl1 = o1.get("work_ledger") or {}
+        wl2 = o2.get("work_ledger") or {}
+        if not wl1.get("error") and not wl2.get("error"):
+            t1, t2 = wl1.get("total", 0), wl2.get("total", 0)
+            if t1 != t2:
+                _start_section()
+                lines.append(f"Work ledger events: {t1} → {t2} (Δ{t2 - t1:+d})")
+            e1 = wl1.get("by_event_type", {}) or {}
+            e2 = wl2.get("by_event_type", {}) or {}
+            for et in sorted(set(e1) | set(e2)):
+                c1, c2 = e1.get(et, 0), e2.get(et, 0)
+                if c1 != c2:
+                    _start_section()
+                    lines.append(
+                        f"  work_ledger[{et}]: {c1} → {c2} (Δ{c2 - c1:+d})"
+                    )
+
+        # System state log
+        ss1 = o1.get("system_state_log") or {}
+        ss2 = o2.get("system_state_log") or {}
+        if not ss1.get("error") and not ss2.get("error"):
+            t1, t2 = ss1.get("transitions_total", 0), ss2.get("transitions_total", 0)
+            if t1 != t2:
+                _start_section()
+                lines.append(
+                    f"Phase transitions: {t1} → {t2} (Δ{t2 - t1:+d})"
+                )
+            cur1, cur2 = ss1.get("current_phase"), ss2.get("current_phase")
+            if cur1 != cur2:
+                _start_section()
+                lines.append(f"Current phase: {cur1} → {cur2}")
+
+        # Request limiter
+        rl1 = o1.get("request_limiter") or {}
+        rl2 = o2.get("request_limiter") or {}
+        if not rl1.get("error") and not rl2.get("error"):
+            c1 = rl1.get("by_class", {}) or {}
+            c2 = rl2.get("by_class", {}) or {}
+            for cls in sorted(set(c1) | set(c2)):
+                v1, v2 = c1.get(cls, 0), c2.get(cls, 0)
+                if v1 != v2:
+                    _start_section()
+                    lines.append(
+                        f"  request_limiter[{cls}]: {v1} → {v2} (Δ{v2 - v1:+d})"
+                    )
+
+    @staticmethod
+    def _diff_memory_lifecycle(
+        s1: dict[str, Any], s2: dict[str, Any], lines: list[str],
+    ) -> None:
+        m1 = s1.get("memory_lifecycle") or {}
+        m2 = s2.get("memory_lifecycle") or {}
+        if not (m1.get("available") or m2.get("available")):
+            return
+
+        section_started = False
+
+        def _start_section() -> None:
+            nonlocal section_started
+            if not section_started:
+                lines.append("")
+                lines.append("## Memory lifecycle (Phase 8)")
+                section_started = True
+
+        for key in ("memories", "user_model_facts", "entities", "entity_links"):
+            t1 = (m1.get(key) or {}).get("total", 0) or 0
+            t2 = (m2.get(key) or {}).get("total", 0) or 0
+            if t1 != t2:
+                _start_section()
+                lines.append(f"{key}: {t1} → {t2} (Δ{t2 - t1:+d})")
+
+            bs1 = (m1.get(key) or {}).get("by_status", {}) or {}
+            bs2 = (m2.get(key) or {}).get("by_status", {}) or {}
+            if isinstance(bs1, dict) and isinstance(bs2, dict):
+                for st in sorted(set(bs1) | set(bs2)):
+                    c1, c2 = bs1.get(st, 0), bs2.get(st, 0)
+                    if c1 != c2:
+                        _start_section()
+                        lines.append(
+                            f"  {key}[{st}]: {c1} → {c2} (Δ{c2 - c1:+d})"
+                        )
+
+        # Sessions / signal_queue
+        for key, label in [("sessions", "session_transcripts"),
+                           ("signal_queue", "signal_queue"),
+                           ("dedup_rejected_pairs", "dedup_rejected_pairs")]:
+            d1 = m1.get(key) or {}
+            d2 = m2.get(key) or {}
+            if d1.get("error") or d2.get("error"):
+                continue
+            tot_key = "transcripts_total" if key == "sessions" else "total"
+            t1, t2 = d1.get(tot_key, 0) or 0, d2.get(tot_key, 0) or 0
+            if t1 != t2:
+                _start_section()
+                lines.append(f"{label}: {t1} → {t2} (Δ{t2 - t1:+d})")
+
+    @staticmethod
+    def _diff_vault(
+        s1: dict[str, Any], s2: dict[str, Any], lines: list[str],
+    ) -> None:
+        v1 = s1.get("vault_state") or {}
+        v2 = s2.get("vault_state") or {}
+        if not (v1.get("exists") or v2.get("exists")):
+            return
+
+        section_started = False
+
+        def _start_section() -> None:
+            nonlocal section_started
+            if not section_started:
+                lines.append("")
+                lines.append("## Vault (_KoraMemory/)")
+                section_started = True
+
+        c1 = v1.get("counts", {}) or {}
+        c2 = v2.get("counts", {}) or {}
+        for k in sorted(set(c1) | set(c2)):
+            n1, n2 = c1.get(k, 0), c2.get(k, 0)
+            if n1 != n2:
+                _start_section()
+                lines.append(f"  notes[{k}]: {n1} → {n2} (Δ{n2 - n1:+d})")
+
+        # Working docs delta — set comparison by path.
+        wd1 = {(w or {}).get("path") for w in (v1.get("working_docs") or [])}
+        wd2 = {(w or {}).get("path") for w in (v2.get("working_docs") or [])}
+        appeared = wd2 - wd1
+        disappeared = wd1 - wd2
+        if appeared:
+            _start_section()
+            lines.append(f"  working docs appeared: {len(appeared)}")
+            for p in sorted(filter(None, appeared))[:5]:
+                lines.append(f"    + {p}")
+        if disappeared:
+            _start_section()
+            lines.append(f"  working docs disappeared: {len(disappeared)}")
+            for p in sorted(filter(None, disappeared))[:5]:
+                lines.append(f"    - {p}")
+
+    @staticmethod
+    def _diff_proactive(
+        s1: dict[str, Any], s2: dict[str, Any], lines: list[str],
+    ) -> None:
+        p1 = s1.get("proactive_state") or {}
+        p2 = s2.get("proactive_state") or {}
+        if not (p1.get("available") or p2.get("available")):
+            return
+
+        section_started = False
+
+        def _start_section() -> None:
+            nonlocal section_started
+            if not section_started:
+                lines.append("")
+                lines.append("## Proactive (notifications / reminders)")
+                section_started = True
+
+        n1 = p1.get("notifications") or {}
+        n2 = p2.get("notifications") or {}
+        if not n1.get("error") and not n2.get("error"):
+            t1, t2 = n1.get("total", 0), n2.get("total", 0)
+            if t1 != t2:
+                _start_section()
+                lines.append(f"Notifications: {t1} → {t2} (Δ{t2 - t1:+d})")
+
+        r1 = p1.get("reminders") or {}
+        r2 = p2.get("reminders") or {}
+        if not r1.get("error") and not r2.get("error"):
+            t1, t2 = r1.get("total", 0), r2.get("total", 0)
+            if t1 != t2:
+                _start_section()
+                lines.append(f"Reminders: {t1} → {t2} (Δ{t2 - t1:+d})")
+            bs1 = r1.get("by_status", {}) or {}
+            bs2 = r2.get("by_status", {}) or {}
+            for st in sorted(set(bs1) | set(bs2)):
+                c1, c2 = bs1.get(st, 0), bs2.get(st, 0)
+                if c1 != c2:
+                    _start_section()
+                    lines.append(
+                        f"  reminders[{st}]: {c1} → {c2} (Δ{c2 - c1:+d})"
+                    )
+
+    async def _snapshot_full_state(self) -> dict[str, Any]:
+        """Composite of every state-query method.
+
+        Returned dict has keys for each AT2 dimension. Each query is
+        independently fault-tolerant — a missing table or DB does not
+        kill the whole snapshot.
+        """
+        return {
+            "autonomous_state": await self._query_autonomous_state(),
+            "orchestration_state": await self._query_orchestration_state(),
+            "memory_lifecycle": await self._query_memory_lifecycle_state(),
+            "vault_state": await self._query_vault_state(),
+            "proactive_state": await self._query_proactive_state(),
+        }
 
     async def cmd_idle_wait(self, min_soak: int = 60, timeout: int = 300) -> dict[str, Any]:
         """Wait min_soak seconds while monitoring daemon health and autonomous work.
@@ -956,10 +2107,73 @@ class HarnessServer:
                 result["focus_blocks"] = []
                 result["focus_block_count"] = 0
 
+        # Post-Phase 8: enrich with memory / vault / reminder deliveries so
+        # `life-management-check` answers "did things actually happen?" —
+        # not just "were life tools invoked?".
+        try:
+            memory = await self._query_memory_lifecycle_state()
+            mem_summary: dict[str, Any] = {}
+            for k in ("memories", "user_model_facts", "entities"):
+                entry = memory.get(k) or {}
+                mem_summary[k] = {
+                    "total": entry.get("total", 0),
+                    "by_status": entry.get("by_status", {}),
+                }
+            mem_summary["sessions"] = memory.get("sessions", {})
+            mem_summary["signal_queue"] = memory.get("signal_queue", {})
+            result["memory_lifecycle"] = mem_summary
+        except Exception as e:
+            result["memory_lifecycle"] = {"error": str(e)}
+
+        try:
+            vault = await self._query_vault_state()
+            result["vault_snapshot"] = {
+                "root": vault.get("root"),
+                "exists": vault.get("exists", False),
+                "counts": vault.get("counts", {}),
+                "working_docs_count": len(vault.get("working_docs", [])),
+                "folder_hierarchy_present": vault.get("folder_hierarchy_present", False),
+            }
+        except Exception as e:
+            result["vault_snapshot"] = {"error": str(e)}
+
+        try:
+            proactive = await self._query_proactive_state()
+            reminder_stats = proactive.get("reminders") or {}
+            result["reminder_delivery"] = {
+                "total": reminder_stats.get("total", 0),
+                "by_status": reminder_stats.get("by_status", {}),
+                "mean_delivery_slip_seconds":
+                    reminder_stats.get("mean_delivery_slip_seconds"),
+            }
+            notif_stats = proactive.get("notifications") or {}
+            result["notifications_summary"] = {
+                "total": notif_stats.get("total", 0),
+                "by_tier": notif_stats.get("by_tier", {}),
+                "by_reason": notif_stats.get("by_reason", {}),
+            }
+        except Exception as e:
+            result["reminder_delivery"] = {"error": str(e)}
+            result["notifications_summary"] = {"error": str(e)}
+
         return result
 
     async def cmd_tool_usage_summary(self) -> dict[str, Any]:
-        """Analyze tool usage from conversation history."""
+        """Analyze tool usage from conversation history.
+
+        Buckets mirror ``tests/acceptance/_report.py:TOOL_BUCKETS`` — the
+        two call sites must stay aligned. ``tests/unit/acceptance/
+        test_tool_buckets.py`` enforces that.
+
+        ``orchestration_tools_used`` replaces the retired
+        ``autonomous_tools_used``/``start_autonomous`` bucket
+        (Phase 7.5 retired ``start_autonomous``). ``pipelines_fired`` is
+        an AT3 placeholder — pipelines are triggered, not called as
+        tools, so the answer requires a separate query against
+        ``pipeline_instances``.
+        """
+        from tests.acceptance._report import TOOL_BUCKETS
+
         tool_counts: dict[str, int] = {}
         for msg in self._state.get("messages", []):
             for tc in msg.get("tool_calls", []):
@@ -969,23 +2183,27 @@ class HarnessServer:
                     name = name.split(":")[1].rstrip("]").split(":")[0]
                 tool_counts[name] = tool_counts.get(name, 0) + 1
 
-        # Categorize
-        life_tools = {"log_medication", "log_meal", "create_reminder", "query_reminders",
-                       "quick_note", "start_focus_block", "end_focus_block"}
-        fs_tools = {"read_file", "write_file", "list_directory", "create_directory"}
-        mcp_tools = {"search_web", "fetch_url"}
-        auto_tools = {"start_autonomous"}
-        memory_tools = {"recall", "dispatch_worker"}
-
         return {
             "total_tool_calls": sum(tool_counts.values()),
             "unique_tools": len(tool_counts),
             "tool_counts": tool_counts,
-            "life_management_tools_used": sorted(set(tool_counts) & life_tools),
-            "filesystem_tools_used": sorted(set(tool_counts) & fs_tools),
-            "mcp_tools_used": sorted(set(tool_counts) & mcp_tools),
-            "autonomous_tools_used": sorted(set(tool_counts) & auto_tools),
-            "memory_tools_used": sorted(set(tool_counts) & memory_tools),
+            "life_management_tools_used": sorted(
+                set(tool_counts) & TOOL_BUCKETS["life_tools"]
+            ),
+            "filesystem_tools_used": sorted(
+                set(tool_counts) & TOOL_BUCKETS["filesystem_tools"]
+            ),
+            "mcp_tools_used": sorted(
+                set(tool_counts) & TOOL_BUCKETS["mcp_tools"]
+            ),
+            "orchestration_tools_used": sorted(
+                set(tool_counts) & TOOL_BUCKETS["orchestration_tools"]
+            ),
+            "memory_tools_used": sorted(
+                set(tool_counts) & TOOL_BUCKETS["memory_tools"]
+            ),
+            # AT3 placeholder — populated from pipeline_instances later.
+            "pipelines_fired": [],
         }
 
     async def cmd_capability_health_check(self) -> dict[str, Any]:
@@ -1021,6 +2239,172 @@ class HarnessServer:
 
         _log_event({"event": "capability_health_check", "packs": list(results.keys())})
         return results
+
+    # ── AT2 state-query CLI commands ──────────────────────────────────────
+
+    async def cmd_orchestration_status(self) -> dict[str, Any]:
+        """Return orchestration state summary (pipelines, ledger, phase)."""
+        return await self._query_orchestration_state()
+
+    async def cmd_pipeline_history(self, limit: int = 20) -> dict[str, Any]:
+        """Return recent pipeline_instances with durations."""
+        op_db = PROJECT_ROOT / "data" / "operational.db"
+        if not op_db.exists():
+            return {"available": False, "error": "db_missing"}
+        try:
+            import aiosqlite
+        except ImportError:
+            return {"available": False, "error": "aiosqlite not installed"}
+
+        safe_limit = max(1, min(int(limit), 100))
+        try:
+            async with aiosqlite.connect(str(op_db)) as db:
+                db.row_factory = aiosqlite.Row
+                try:
+                    cur = await db.execute(
+                        """SELECT id, pipeline_name, state, goal, started_at,
+                                  updated_at, completed_at, completion_reason
+                           FROM pipeline_instances
+                           ORDER BY started_at DESC LIMIT ?""",
+                        (safe_limit,),
+                    )
+                    rows = [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    return {
+                        "available": False,
+                        "error": "table_missing",
+                        "table": "pipeline_instances",
+                    }
+
+            for r in rows:
+                started = r.get("started_at")
+                completed = r.get("completed_at")
+                duration_s: float | None = None
+                if started and completed:
+                    try:
+                        s = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+                        e = datetime.fromisoformat(str(completed).replace("Z", "+00:00"))
+                        duration_s = (e - s).total_seconds()
+                    except Exception:
+                        pass
+                r["duration_s"] = duration_s
+
+            return {"available": True, "count": len(rows), "pipelines": rows}
+        except Exception as e:
+            return {"available": False, "error": str(e)}
+
+    async def cmd_working_docs(self) -> dict[str, Any]:
+        """List _KoraMemory/Inbox/*.md files with ``pipeline:`` frontmatter."""
+        state = await self._query_vault_state()
+        return {
+            "available": state.get("exists", False),
+            "root": state.get("root"),
+            "working_docs": state.get("working_docs", []),
+            "count": len(state.get("working_docs", [])),
+        }
+
+    async def cmd_notifications(self, limit: int = 20) -> dict[str, Any]:
+        """Return recent notifications with tier and reason."""
+        op_db = PROJECT_ROOT / "data" / "operational.db"
+        if not op_db.exists():
+            return {"available": False, "error": "db_missing"}
+        try:
+            import aiosqlite
+        except ImportError:
+            return {"available": False, "error": "aiosqlite not installed"}
+
+        safe_limit = max(1, min(int(limit), 100))
+        try:
+            async with aiosqlite.connect(str(op_db)) as db:
+                db.row_factory = aiosqlite.Row
+                notif = await self._q_notifications(db)
+                # Trim recent to requested limit.
+                if isinstance(notif.get("recent"), list):
+                    notif["recent"] = notif["recent"][:safe_limit]
+                return {"available": True, **notif}
+        except Exception as e:
+            return {"available": False, "error": str(e)}
+
+    async def cmd_insights(self, limit: int = 20) -> dict[str, Any]:
+        """Return recent INSIGHT_AVAILABLE events (placeholder)."""
+        op_db = PROJECT_ROOT / "data" / "operational.db"
+        if not op_db.exists():
+            return {"available": False, "error": "db_missing"}
+        try:
+            import aiosqlite
+        except ImportError:
+            return {"available": False, "error": "aiosqlite not installed"}
+
+        safe_limit = max(1, min(int(limit), 100))
+        result: dict[str, Any] = {
+            "available": True,
+            "persisted": False,
+            "note": "Insights are not persisted to a table; "
+                    "ContextEngine emits INSIGHT_AVAILABLE events. "
+                    "AT3 will wire event-stream tracking.",
+            "events": [],
+        }
+        # Best-effort: if there is an event_log or similar we can scrape it.
+        # The live implementation emits over EventEmitter, not SQL, so this
+        # stays empty until AT3 adds the event stream tap.
+        try:
+            async with aiosqlite.connect(str(op_db)) as db:
+                db.row_factory = aiosqlite.Row
+                try:
+                    cur = await db.execute(
+                        "SELECT event_type, metadata_json, timestamp "
+                        "FROM work_ledger WHERE event_type LIKE 'insight_%' "
+                        "ORDER BY id DESC LIMIT ?",
+                        (safe_limit,),
+                    )
+                    result["events"] = [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return result
+
+    async def cmd_phase_history(self, hours: int = 24) -> dict[str, Any]:
+        """Return SystemStatePhase transitions over the last N hours."""
+        op_db = PROJECT_ROOT / "data" / "operational.db"
+        if not op_db.exists():
+            return {"available": False, "error": "db_missing"}
+        try:
+            import aiosqlite
+        except ImportError:
+            return {"available": False, "error": "aiosqlite not installed"}
+
+        safe_hours = max(1, min(int(hours), 24 * 30))
+        try:
+            async with aiosqlite.connect(str(op_db)) as db:
+                db.row_factory = aiosqlite.Row
+                try:
+                    cur = await db.execute(
+                        """SELECT previous_phase, new_phase, transitioned_at, reason
+                           FROM system_state_log
+                           WHERE transitioned_at >= datetime('now', ?)
+                           ORDER BY id DESC LIMIT 200""",
+                        (f"-{safe_hours} hours",),
+                    )
+                    transitions = [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    return {
+                        "available": False,
+                        "error": "table_missing",
+                        "table": "system_state_log",
+                    }
+            return {
+                "available": True,
+                "hours": safe_hours,
+                "count": len(transitions),
+                "transitions": transitions,
+            }
+        except Exception as e:
+            return {"available": False, "error": str(e)}
+
+    async def cmd_vault_snapshot(self) -> dict[str, Any]:
+        """Print vault counts, folder hierarchy check, working-doc count."""
+        return await self._query_vault_state()
 
     async def cmd_stop_server(self) -> dict[str, Any]:
         """Shut down the harness server."""
@@ -1076,6 +2460,28 @@ class HarnessServer:
                 result = await self.cmd_report()
             elif cmd == "capability-health-check":
                 result = await self.cmd_capability_health_check()
+            elif cmd == "orchestration-status":
+                result = await self.cmd_orchestration_status()
+            elif cmd == "pipeline-history":
+                result = await self.cmd_pipeline_history(
+                    limit=int(request.get("limit", 20)),
+                )
+            elif cmd == "working-docs":
+                result = await self.cmd_working_docs()
+            elif cmd == "notifications":
+                result = await self.cmd_notifications(
+                    limit=int(request.get("limit", 20)),
+                )
+            elif cmd == "insights":
+                result = await self.cmd_insights(
+                    limit=int(request.get("limit", 20)),
+                )
+            elif cmd == "phase-history":
+                result = await self.cmd_phase_history(
+                    hours=int(request.get("hours", 24)),
+                )
+            elif cmd == "vault-snapshot":
+                result = await self.cmd_vault_snapshot()
             elif cmd == "stop":
                 result = await self.cmd_stop_server()
             elif cmd == "ping":
@@ -1119,8 +2525,9 @@ class HarnessServer:
         """Start the Unix socket server and WebSocket recv loop."""
         _ensure_dirs()
 
-        # Clean stale autonomous data from previous test runs
-        await _clean_stale_autonomous_data(PROJECT_ROOT / "data" / "operational.db")
+        # Clean stale data from previous test runs (legacy autonomous +
+        # Phase 7.5 orchestration + Phase 8 lifecycle tables)
+        await _clean_stale_test_data(PROJECT_ROOT / "data" / "operational.db")
 
         # Remove stale socket
         if HARNESS_SOCK.exists():

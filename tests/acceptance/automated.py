@@ -18,6 +18,15 @@ Usage:
     python3 -m tests.acceptance.automated tool-usage-summary
     python3 -m tests.acceptance.automated monitor
     python3 -m tests.acceptance.automated report
+
+    # Phase 7.5 / Phase 8 state surface (AT2):
+    python3 -m tests.acceptance.automated orchestration-status
+    python3 -m tests.acceptance.automated pipeline-history [--limit N]
+    python3 -m tests.acceptance.automated working-docs
+    python3 -m tests.acceptance.automated notifications [--limit N]
+    python3 -m tests.acceptance.automated insights [--limit N]
+    python3 -m tests.acceptance.automated phase-history [--hours N]
+    python3 -m tests.acceptance.automated vault-snapshot
 """
 
 from __future__ import annotations
@@ -713,6 +722,58 @@ def cmd_life_management_check() -> None:
         ended = fb.get("ended_at") or "still open"
         print(f"    - [{fb.get('label', '?')}] started={fb.get('started_at', '?')} ended={ended}")
 
+    # Phase 8 enrichment — "did things actually happen?"
+    mem = result.get("memory_lifecycle") or {}
+    if mem and not mem.get("error"):
+        print("\n  Memory lifecycle:")
+        for k in ("memories", "user_model_facts", "entities"):
+            entry = mem.get(k) or {}
+            total = entry.get("total", 0)
+            by_status = entry.get("by_status", {}) or {}
+            status_str = " ".join(
+                f"{s}={c}" for s, c in sorted(by_status.items())
+            ) or "(no status breakdown)"
+            print(f"    {k}: total={total} [{status_str}]")
+        sessions = mem.get("sessions") or {}
+        if sessions and not sessions.get("error"):
+            print(
+                f"    session_transcripts: total={sessions.get('transcripts_total', 0)} "
+                f"processed={sessions.get('processed', 0)} "
+                f"unprocessed={sessions.get('unprocessed', 0)}"
+            )
+        sq = mem.get("signal_queue") or {}
+        if sq and not sq.get("error"):
+            sq_status = " ".join(
+                f"{s}={c}" for s, c in sorted((sq.get("by_status") or {}).items())
+            )
+            print(f"    signal_queue: total={sq.get('total', 0)} [{sq_status}]")
+
+    vault = result.get("vault_snapshot") or {}
+    if vault and vault.get("exists"):
+        counts = vault.get("counts", {})
+        print(
+            f"\n  Vault: notes={counts.get('total_notes', 0)} "
+            f"working_docs={vault.get('working_docs_count', 0)} "
+            f"hierarchy_present={vault.get('folder_hierarchy_present', False)}"
+        )
+
+    rem = result.get("reminder_delivery") or {}
+    if rem and not rem.get("error"):
+        by_status = rem.get("by_status") or {}
+        status_str = " ".join(f"{s}={c}" for s, c in sorted(by_status.items()))
+        slip = rem.get("mean_delivery_slip_seconds")
+        slip_str = f"{slip:.1f}s" if isinstance(slip, (int, float)) else "n/a"
+        print(
+            f"\n  Reminder delivery: total={rem.get('total', 0)} "
+            f"[{status_str}] mean_slip={slip_str}"
+        )
+
+    notif = result.get("notifications_summary") or {}
+    if notif and not notif.get("error"):
+        by_tier = notif.get("by_tier") or {}
+        tier_str = " ".join(f"{t}={c}" for t, c in sorted(by_tier.items()))
+        print(f"\n  Notifications: total={notif.get('total', 0)} [{tier_str}]")
+
 
 def cmd_tool_usage_summary() -> None:
     """Display tool usage summary from conversation history."""
@@ -725,17 +786,24 @@ def cmd_tool_usage_summary() -> None:
     print(f"\n  Total tool calls: {result.get('total_tool_calls', 0)}")
     print(f"  Unique tools: {result.get('unique_tools', 0)}")
 
+    # ``Orchestration`` replaces the retired ``Autonomous`` (start_autonomous
+    # was removed in Phase 7.5). ``Pipelines`` is an AT3 placeholder — pipelines
+    # fire from triggers, not tool calls, so the answer comes from the
+    # pipeline_instances table. AT3 will populate it.
     cats = [
         ("Life management", "life_management_tools_used"),
         ("Filesystem", "filesystem_tools_used"),
         ("MCP (web)", "mcp_tools_used"),
-        ("Autonomous", "autonomous_tools_used"),
+        ("Orchestration", "orchestration_tools_used"),
         ("Memory", "memory_tools_used"),
+        ("Pipelines", "pipelines_fired"),
     ]
     for label, key in cats:
         tools = result.get(key, [])
         if tools:
             print(f"\n  {label}: {', '.join(tools)}")
+        elif label == "Pipelines":
+            print(f"\n  {label}: (AT3 will populate this from pipeline_instances)")
         else:
             print(f"\n  {label}: (none used)")
 
@@ -744,6 +812,184 @@ def cmd_tool_usage_summary() -> None:
         print("\n  Call counts:")
         for name, count in sorted(tool_counts.items(), key=lambda x: -x[1]):
             print(f"    {name}: {count}")
+
+
+def cmd_orchestration_status() -> None:
+    """Print a formatted orchestration-status summary."""
+    result = harness_cmd({"cmd": "orchestration-status"})
+    if "error" in result and not result.get("available"):
+        print(f"Orchestration status error: {result['error']}")
+        sys.exit(1)
+    if not result.get("available"):
+        print("Orchestration tables not available.")
+        return
+
+    print("Orchestration status:")
+
+    pi = result.get("pipeline_instances") or {}
+    if pi.get("error"):
+        print(f"  pipeline_instances: {pi['error']}")
+    else:
+        print(f"  Pipeline instances: total={pi.get('total', 0)}")
+        for state, cnt in sorted((pi.get("by_state") or {}).items()):
+            print(f"    [state={state}] {cnt}")
+        for name, cnt in sorted((pi.get("by_name") or {}).items()):
+            print(f"    [name={name}] {cnt}")
+
+    wt = result.get("worker_tasks") or {}
+    if wt.get("error"):
+        print(f"  worker_tasks: {wt['error']}")
+    else:
+        print(
+            f"  Worker tasks: total={wt.get('total', 0)} "
+            f"active={wt.get('active_count', 0)}"
+        )
+
+    wl = result.get("work_ledger") or {}
+    if wl.get("error"):
+        print(f"  work_ledger: {wl['error']}")
+    else:
+        print(f"  Work ledger events: total={wl.get('total', 0)}")
+        for et, cnt in sorted((wl.get("by_event_type") or {}).items()):
+            print(f"    {et}: {cnt}")
+
+    ss = result.get("system_state_log") or {}
+    if not ss.get("error"):
+        print(
+            f"  Current phase: {ss.get('current_phase', '?')} "
+            f"(transitions: {ss.get('transitions_total', 0)})"
+        )
+
+    rl = result.get("request_limiter") or {}
+    if not rl.get("error"):
+        print(
+            f"  Request limiter: total={rl.get('total_requests_logged', 0)} "
+            f"in_window={rl.get('in_window', 0)} "
+            f"window_seconds={rl.get('window_seconds', 0)}"
+        )
+
+
+def cmd_pipeline_history(limit: int = 20) -> None:
+    """Print recent pipeline_instances with durations."""
+    result = harness_cmd({"cmd": "pipeline-history", "limit": limit})
+    if not result.get("available"):
+        print(f"Pipeline history unavailable: {result.get('error', 'unknown')}")
+        return
+    count = result.get("count", 0)
+    print(f"Pipeline history ({count} recent):")
+    for p in result.get("pipelines", []):
+        dur = p.get("duration_s")
+        dur_s = f"{dur:.1f}s" if isinstance(dur, (int, float)) else "–"
+        completion = p.get("completion_reason") or ""
+        pid = (p.get("id") or "")[:8]
+        print(
+            f"  [{p.get('state', '?')}] {p.get('pipeline_name', '?')}"
+            f" ({pid}) started={p.get('started_at', '?')} dur={dur_s} {completion}"
+        )
+
+
+def cmd_working_docs() -> None:
+    """List working docs under _KoraMemory/Inbox/."""
+    result = harness_cmd({"cmd": "working-docs"})
+    if not result.get("available"):
+        print(f"Vault not available at {result.get('root', '?')}")
+        return
+    docs = result.get("working_docs", [])
+    print(f"Working docs in {result.get('root')}: {len(docs)}")
+    for d in docs:
+        size = d.get("size_bytes", 0)
+        print(
+            f"  [{d.get('status', '?')}] {d.get('pipeline_name', '?')} "
+            f"{size}B mtime={d.get('mtime', '?')}"
+        )
+        print(f"    {d.get('path')}")
+
+
+def cmd_notifications(limit: int = 20) -> None:
+    """Print recent notifications with tier and reason."""
+    result = harness_cmd({"cmd": "notifications", "limit": limit})
+    if not result.get("available"):
+        print(f"Notifications unavailable: {result.get('error', 'unknown')}")
+        return
+    if result.get("error"):
+        print(f"  Notifications table: {result['error']}")
+        return
+    total = result.get("total", 0)
+    print(f"Notifications (total={total}):")
+    by_tier = result.get("by_tier") or {}
+    if by_tier:
+        tier_line = " ".join(f"{k}={v}" for k, v in sorted(by_tier.items()))
+        print(f"  Tiers: {tier_line}")
+    by_reason = result.get("by_reason") or {}
+    if by_reason:
+        reason_line = " ".join(f"{k}={v}" for k, v in sorted(by_reason.items()))
+        print(f"  Reasons: {reason_line}")
+    for n in result.get("recent", []):
+        tier = n.get("delivery_tier") or "?"
+        reason = n.get("reason") or "–"
+        print(
+            f"  [{tier}/{n.get('priority', '?')}] {reason} "
+            f"at {n.get('delivered_at', '?')}: "
+            f"{(n.get('content') or '')[:80]}"
+        )
+
+
+def cmd_insights(limit: int = 20) -> None:
+    """Print recent INSIGHT_AVAILABLE events (placeholder)."""
+    result = harness_cmd({"cmd": "insights", "limit": limit})
+    if not result.get("available"):
+        print(f"Insights unavailable: {result.get('error', 'unknown')}")
+        return
+    print("Insights:")
+    print(f"  Persisted: {result.get('persisted', False)}")
+    if result.get("note"):
+        print(f"  Note: {result['note']}")
+    events = result.get("events") or []
+    if events:
+        print(f"  Recent events ({len(events)}):")
+        for e in events:
+            print(f"    {e.get('event_type', '?')} at {e.get('timestamp', '?')}")
+    else:
+        print("  (no persisted insight events found)")
+
+
+def cmd_phase_history(hours: int = 24) -> None:
+    """Print SystemStatePhase transitions over the last N hours."""
+    result = harness_cmd({"cmd": "phase-history", "hours": hours})
+    if not result.get("available"):
+        print(f"Phase history unavailable: {result.get('error', 'unknown')}")
+        return
+    count = result.get("count", 0)
+    print(f"Phase transitions (last {result.get('hours', hours)}h, {count} rows):")
+    for t in result.get("transitions", []):
+        reason = t.get("reason") or ""
+        print(
+            f"  {t.get('transitioned_at', '?')}  "
+            f"{t.get('previous_phase', '?')} → {t.get('new_phase', '?')}"
+            f" {reason}"
+        )
+
+
+def cmd_vault_snapshot() -> None:
+    """Print vault file counts, folder hierarchy, working-doc count."""
+    result = harness_cmd({"cmd": "vault-snapshot"})
+    if not result.get("exists"):
+        print(f"Vault not found at {result.get('root', '?')}")
+        return
+    print(f"Vault snapshot at {result.get('root')}:")
+    counts = result.get("counts") or {}
+    for k in sorted(counts):
+        print(f"  {k}: {counts[k]}")
+    wd = result.get("working_docs") or []
+    print(f"  working docs: {len(wd)}")
+    density = result.get("wikilink_density") or {}
+    print(
+        f"  wikilinks: {density.get('notes_with_wikilinks', 0)} notes, "
+        f"{density.get('total_wikilinks', 0)} total"
+    )
+    print(f"  folder hierarchy present: {result.get('folder_hierarchy_present', False)}")
+    if result.get("truncated"):
+        print(f"  (walk truncated at {result.get('files_walked')} files)")
 
 
 def cmd_monitor() -> None:
@@ -845,6 +1091,43 @@ def main() -> None:
 
     elif cmd == "report":
         cmd_report()
+
+    elif cmd == "orchestration-status":
+        cmd_orchestration_status()
+
+    elif cmd == "pipeline-history":
+        import argparse as _ap
+        parser = _ap.ArgumentParser()
+        parser.add_argument("--limit", type=int, default=20)
+        parsed = parser.parse_args(args[1:])
+        cmd_pipeline_history(parsed.limit)
+
+    elif cmd == "working-docs":
+        cmd_working_docs()
+
+    elif cmd == "notifications":
+        import argparse as _ap
+        parser = _ap.ArgumentParser()
+        parser.add_argument("--limit", type=int, default=20)
+        parsed = parser.parse_args(args[1:])
+        cmd_notifications(parsed.limit)
+
+    elif cmd == "insights":
+        import argparse as _ap
+        parser = _ap.ArgumentParser()
+        parser.add_argument("--limit", type=int, default=20)
+        parsed = parser.parse_args(args[1:])
+        cmd_insights(parsed.limit)
+
+    elif cmd == "phase-history":
+        import argparse as _ap
+        parser = _ap.ArgumentParser()
+        parser.add_argument("--hours", type=int, default=24)
+        parsed = parser.parse_args(args[1:])
+        cmd_phase_history(parsed.hours)
+
+    elif cmd == "vault-snapshot":
+        cmd_vault_snapshot()
 
     else:
         print(f"Unknown command: {cmd}")

@@ -18,6 +18,39 @@ from typing import Any
 _PROJECT_ROOT = Path(__file__).parents[2].resolve()
 
 
+# ── Tool buckets ──────────────────────────────────────────────────────────────
+# Single source of truth for the report and the harness ``tool-usage-summary``
+# command. ``tests/unit/acceptance/test_tool_buckets.py`` enforces both
+# call sites use the same dict.
+#
+# ``orchestration_tools`` replaces the retired ``start_autonomous`` /
+# ``auto_tools`` bucket. The 7 supervisor orchestration tools come from
+# ``SUPERVISOR_TOOLS`` in ``kora_v2/graph/dispatch.py`` (Phase 7.5b).
+TOOL_BUCKETS: dict[str, set[str]] = {
+    "life_tools": {
+        "log_medication", "log_meal", "create_reminder",
+        "query_reminders", "query_medications", "query_meals",
+        "query_focus_blocks", "quick_note",
+        "start_focus_block", "end_focus_block",
+    },
+    "filesystem_tools": {
+        "read_file", "write_file", "list_directory",
+        "create_directory", "file_exists",
+    },
+    "mcp_tools": {"search_web", "fetch_url"},
+    "orchestration_tools": {
+        "decompose_and_dispatch",
+        "get_running_tasks",
+        "get_task_progress",
+        "get_working_doc",
+        "cancel_task",
+        "modify_task",
+        "record_decision",
+    },
+    "memory_tools": {"recall"},
+}
+
+
 def _normalize_tool_name(tc: Any) -> str:
     """Strip auth wrapper / bracket markers to get the real tool name.
 
@@ -131,7 +164,20 @@ def _auto_mark_coverage(
     ):
         auto[11] = "x"
 
-    # Item 12 (newly ACTIVE): BackgroundWorker has registered items
+    # Item 8 (un-deferred in AT1): decompose_and_dispatch creates a
+    # pipeline_instance with sub-tasks. Tool-call evidence is the AT1
+    # signal; AT3 will add a real query against pipeline_instances /
+    # worker_tasks for the multi-stage check.
+    if tool_counts.get("decompose_and_dispatch", 0) >= 1:
+        auto[8] = "x"
+
+    # Item 12 (un-deferred in AT1): real background pipelines fire during
+    # DEEP_IDLE. The legacy BackgroundWorker count was dropped along
+    # with the worker itself (Phase 7.5); the equivalent post-7.5 signal
+    # is "any orchestration core pipeline has logged a row in
+    # work_ledger". Until AT3 wires that query, we accept the legacy
+    # status field as a fallback if the harness still sets it, and
+    # otherwise leave the item for operator marking.
     if latest_status and latest_status.get("background_worker_items", 0) >= 1:
         auto[12] = "x"
 
@@ -152,11 +198,16 @@ def _auto_mark_coverage(
         elif has_approved or has_denied:
             auto[17] = "~"
 
-    # Item 21: autonomous execution
-    if auto_state.get("available") and (
-        auto_state.get("plans")
+    # Item 21: long-running autonomous execution via decompose_and_dispatch.
+    # AT3 will replace this with an evidence query against
+    # pipeline_instances WHERE intent_duration='long'. For now we accept
+    # any decompose_and_dispatch tool call as best-effort signal; the
+    # legacy auto_state-derived counters have been removed (the
+    # autonomous_plans / autonomous_checkpoints tables were retired in
+    # Phase 7.5 along with start_autonomous).
+    if (
+        tool_counts.get("decompose_and_dispatch", 0) >= 1
         or auto_state.get("total_items", 0) > 0
-        or auto_state.get("checkpoint_count", 0) > 0
     ):
         auto[21] = "x"
 
@@ -173,7 +224,7 @@ def _auto_mark_coverage(
         if total_records > 0:
             auto[23] = "x"
 
-    # Item 24: capability pack surface — either a real call OR a pack
+    # Item 100: capability pack surface — either a real call OR a pack
     # that reports unconfigured/degraded with a remediation hint.
     any_cap_calls = bool(
         tool_usage.get("capability_workspace")
@@ -181,28 +232,35 @@ def _auto_mark_coverage(
         or tool_usage.get("capability_vault")
     )
     if any_cap_calls:
-        auto[24] = "x"
+        auto[100] = "x"
     elif cap_health:
         for pack_name in ("workspace", "browser", "vault", "doctor"):
             info = cap_health.get(pack_name, {})
             if info.get("status") in (
                 "unconfigured", "degraded", "unhealthy", "unimplemented"
             ) and info.get("remediation"):
-                auto[24] = "x"
+                auto[100] = "x"
                 break
 
-    # Item 25: disclosed-failure path — the assistant acknowledged a
+    # Item 101: disclosed-failure path — the assistant acknowledged a
     # tool failure plainly rather than silent fallback.
     if _msg_mentions(
         "unavailable", "failed", "permission denied", "can't pull",
         "couldn't", "not available",
     ):
-        auto[25] = "x"
+        auto[101] = "x"
 
-    # Item 26: policy matrix — 4 capability packs visible + policy
+    # Item 102: policy matrix — 4 capability packs visible + policy
     # grants section has data.
     if len(cap_health) >= 4:
-        auto[26] = "x"
+        auto[102] = "x"
+
+    # Items 24-67 (Phase 7.5 + Phase 8 orchestration / memory / vault /
+    # context / proactive coverage) all need real evidence queries
+    # against orchestration tables (pipeline_instances, worker_tasks,
+    # work_ledger, system_state_log, runtime_pipelines, open_decisions).
+    # AT3 wires those queries; for AT1 they are intentionally left for
+    # operator marking via coverage.md.
 
     return auto
 
@@ -299,17 +357,18 @@ def _extract_tool_usage(messages: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             tool_counts[name] = tool_counts.get(name, 0) + 1
 
-    life_tools = {
-        "log_medication", "log_meal", "create_reminder",
-        "query_reminders", "query_medications", "query_meals",
-        "query_focus_blocks", "quick_note",
-        "start_focus_block", "end_focus_block",
-    }
-    fs_tools = {"read_file", "write_file", "list_directory", "create_directory", "file_exists"}
+    # Buckets must mirror tests/acceptance/_harness_server.py:cmd_tool_usage_summary.
+    # Test test_buckets_consistent enforces alignment; update both when adding tools.
+    #
+    # ``orchestration_tools`` replaces the retired ``auto_tools`` /
+    # ``start_autonomous`` bucket. The 7 supervisor orchestration tools
+    # below come from kora_v2/graph/dispatch.py SUPERVISOR_TOOLS (Phase 7.5b).
+    life_tools = TOOL_BUCKETS["life_tools"]
+    fs_tools = TOOL_BUCKETS["filesystem_tools"]
     # Legacy MCP tool names — kept for backward-compat; capability tools go in their own buckets
-    mcp_tools = {"search_web", "fetch_url"}
-    auto_tools = {"start_autonomous"}
-    memory_tools = {"recall"}
+    mcp_tools = TOOL_BUCKETS["mcp_tools"]
+    orchestration_tools = TOOL_BUCKETS["orchestration_tools"]
+    memory_tools = TOOL_BUCKETS["memory_tools"]
 
     # Capability-pack buckets: any tool name starting with the pack prefix.
     capability_workspace = sorted(
@@ -329,8 +388,13 @@ def _extract_tool_usage(messages: list[dict[str, Any]]) -> dict[str, Any]:
         "life_management": sorted(t for t in tool_counts if t in life_tools),
         "filesystem": sorted(t for t in tool_counts if t in fs_tools),
         "mcp": sorted(t for t in tool_counts if t in mcp_tools),
-        "autonomous": sorted(t for t in tool_counts if t in auto_tools),
+        "orchestration": sorted(t for t in tool_counts if t in orchestration_tools),
         "memory": sorted(t for t in tool_counts if t in memory_tools),
+        # AT3 placeholder: pipelines fire from triggers, not tool calls, so
+        # they need a separate bucketing path (likely a query against the
+        # pipeline_instances table). Empty list keeps the report shape
+        # stable until AT3 wires it up.
+        "pipelines": [],
         # Phase 9 capability-pack buckets
         "capability_workspace": capability_workspace,
         "capability_browser": capability_browser,
@@ -658,10 +722,18 @@ async def build_report(
     else:
         lines.append("- MCP (web): (no tools called)")
 
-    if tool_usage["autonomous"]:
-        lines.append(f"- Autonomous: {', '.join(tool_usage['autonomous'])}")
+    if tool_usage["orchestration"]:
+        lines.append(
+            f"- Orchestration: {', '.join(tool_usage['orchestration'])}"
+        )
     else:
-        lines.append("- Autonomous: (no tools called)")
+        lines.append("- Orchestration: (no tools called)")
+
+    # AT3 will populate the pipelines bucket from pipeline_instances / work_ledger.
+    lines.append(
+        "- Pipelines: (AT3 will fill this in; pipelines fire from triggers, "
+        "not tool calls)"
+    )
 
     if tool_usage["capability_workspace"]:
         lines.append(f"- Capability (workspace): {', '.join(tool_usage['capability_workspace'])}")
@@ -789,12 +861,12 @@ async def build_report(
                     f"- [{u.get('update_type', '?')}] "
                     f"{(u.get('summary') or '')[:140]}"
                 )
-    elif tool_usage["autonomous"] or total_items_auto > 0:
+    elif tool_usage["orchestration"] or total_items_auto > 0:
         lines.append("\n## Autonomous Execution")
         lines.append(
-            "start_autonomous was called but no plan rows were found — "
-            "the harness may have wiped autonomous_plans between "
-            f"restarts (total items in DB: {total_items_auto}, "
+            "decompose_and_dispatch fired but no plan rows were found — "
+            "AT3 will wire an evidence query against pipeline_instances / "
+            f"worker_tasks (total items in legacy DB: {total_items_auto}, "
             f"checkpoints: {auto_state.get('checkpoint_count', 0)})."
         )
         if items_by_status:
@@ -804,7 +876,7 @@ async def build_report(
             lines.append(f"Items by status: {status_summary}")
     else:
         lines.append("\n## Autonomous Execution")
-        lines.append("No autonomous work initiated during this test run.")
+        lines.append("No long-background dispatch observed during this test run.")
         lines.append("Coverage item 21 is NOT satisfied.")
 
     # ── Compaction ────────────────────────────────────────────────────────
@@ -891,16 +963,20 @@ async def build_report(
         gap_warnings.append("No filesystem tools used (item 22)")
     if not tool_usage["mcp"]:
         gap_warnings.append("No MCP/web tools used (item 9)")
-    if not tool_usage["autonomous"]:
-        gap_warnings.append("No autonomous work started (item 21)")
-    # Phase 9 capability-pack gap check (item 24)
+    if not tool_usage["orchestration"]:
+        gap_warnings.append(
+            "No orchestration tools used "
+            "(items 8, 21, 25-31, 43 — decompose_and_dispatch / "
+            "get_task_progress / cancel_task / record_decision)"
+        )
+    # Phase 9 capability-pack gap check (item 100)
     any_cap_calls = (
         tool_usage["capability_workspace"]
         or tool_usage["capability_browser"]
         or tool_usage["capability_vault"]
     )
     if not any_cap_calls:
-        # Check if at least one pack is UNCONFIGURED/DEGRADED (still satisfies item 24)
+        # Check if at least one pack is UNCONFIGURED/DEGRADED (still satisfies item 100)
         cap_gap = True
         for pack_name in ("workspace", "browser", "vault"):
             info = cap_health.get(pack_name, {})
@@ -909,7 +985,7 @@ async def build_report(
                 break
         if cap_gap:
             gap_warnings.append(
-                "No capability-pack tool calls and no degraded/unconfigured packs (item 24)"
+                "No capability-pack tool calls and no degraded/unconfigured packs (item 100)"
             )
 
     if gap_warnings:
