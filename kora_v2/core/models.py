@@ -443,3 +443,20 @@ class LifeContext(BaseModel):
     items_summary: dict[str, Any] = Field(default_factory=dict)
 
     insights: list[str] = Field(default_factory=list)
+
+
+class Insight(BaseModel):
+    """Structured cross-domain insight produced by ContextEngine.
+
+    Phase 8d upgrade: replaces the plain-string insights on LifeContext
+    with typed objects carrying confidence, domain, and evidence.
+    Used by the ProactiveAgent ``proactive_pattern_scan`` pipeline.
+    """
+
+    type: str  # energy_calendar_mismatch, medication_focus, routine_trend, etc.
+    title: str
+    description: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    domain: str  # adhd, health, productivity, emotional
+    evidence: list[str] = Field(default_factory=list)
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
