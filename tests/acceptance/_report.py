@@ -613,6 +613,209 @@ async def _query_autonomous_state() -> dict[str, Any]:
         return {"available": False}
 
 
+def _render_benchmarks_dashboard(snapshots_dir: Path) -> list[str]:
+    """Render the AT4 Benchmarks dashboard from sidecar JSON files.
+
+    Reads ``<snapshot>.benchmarks.json`` sidecars under ``snapshots_dir``
+    (mtime-sorted), renders the latest as a multi-table markdown
+    dashboard, and appends a trend mini-table if more than one sidecar
+    is present. Returns an empty list when no sidecar exists so the
+    caller can append unconditionally.
+    """
+    if not snapshots_dir.exists():
+        return []
+    bench_files = sorted(
+        snapshots_dir.glob("*.benchmarks.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not bench_files:
+        return []
+
+    latest_path = bench_files[-1]
+    try:
+        bench = json.loads(latest_path.read_text())
+    except Exception:
+        return []
+    if not isinstance(bench, dict):
+        return []
+
+    out: list[str] = []
+    out.append(f"\n## Benchmarks (latest: {latest_path.stem})")
+
+    # ── Latency ──
+    out.append("\n### Latency")
+    out.append("| Metric | Value |")
+    out.append("| ------ | ----- |")
+    out.append(f"| Responses | {int(bench.get('response_count', 0) or 0)} |")
+    out.append(
+        f"| p50 latency | {bench.get('response_latency_p50_ms', 0)} ms |"
+    )
+    out.append(
+        f"| p95 latency | {bench.get('response_latency_p95_ms', 0)} ms |"
+    )
+
+    # ── Token usage ──
+    prompt = int(bench.get("total_prompt_tokens", 0) or 0)
+    completion = int(bench.get("total_completion_tokens", 0) or 0)
+    mean_resp = bench.get("tokens_per_response_mean", 0)
+    out.append("\n### Token Usage")
+    out.append("| Prompt | Completion | Mean / response |")
+    out.append("| ------ | ---------- | --------------- |")
+    out.append(f"| {prompt} | {completion} | {mean_resp} |")
+
+    # ── Request budget (5h sliding window) ──
+    by_class = bench.get("requests_by_class") or {}
+    if isinstance(by_class, dict) and by_class:
+        out.append("\n### Request Budget (5h sliding window)")
+        out.append("| Class | Count | Remaining fraction |")
+        out.append("| ----- | ----- | ------------------ |")
+        remaining = bench.get("remaining_budget_fraction", 1.0)
+        for cls, count in sorted(by_class.items()):
+            out.append(f"| {cls} | {int(count or 0)} | {remaining} |")
+
+    # ── Compaction ──
+    tier_counts = bench.get("compaction_tier_counts") or {}
+    if isinstance(tier_counts, dict) and tier_counts:
+        out.append("\n### Compaction")
+        out.append("| Tier | Count |")
+        out.append("| ---- | ----- |")
+        for tier, count in sorted(tier_counts.items()):
+            out.append(f"| {tier} | {int(count or 0)} |")
+
+    # ── Pipelines ──
+    fires_by_name = bench.get("pipeline_fires_by_name") or {}
+    fires_by_trigger = bench.get("pipeline_fires_by_trigger_type") or {}
+    if isinstance(fires_by_name, dict) and fires_by_name:
+        out.append("\n### Pipelines")
+        out.append("| Name | Fires |")
+        out.append("| ---- | ----- |")
+        for name, count in sorted(
+            fires_by_name.items(), key=lambda kv: -int(kv[1] or 0)
+        ):
+            out.append(f"| {name} | {int(count or 0)} |")
+    success = int(bench.get("pipeline_success_count", 0) or 0)
+    fail = int(bench.get("pipeline_fail_count", 0) or 0)
+    if isinstance(fires_by_trigger, dict) and fires_by_trigger:
+        out.append("\n**By trigger type**")
+        out.append("| Trigger | Fires |")
+        out.append("| ------- | ----- |")
+        for trig, count in sorted(fires_by_trigger.items()):
+            out.append(f"| {trig} | {int(count or 0)} |")
+    if success or fail or fires_by_name:
+        out.append(f"\n_Pipeline outcomes: success={success}, fail={fail}_")
+
+    # ── Notifications ──
+    notif_tier = bench.get("notifications_by_tier") or {}
+    notif_reason = bench.get("notifications_by_reason") or {}
+    if (isinstance(notif_tier, dict) and notif_tier) or (
+        isinstance(notif_reason, dict) and notif_reason
+    ):
+        out.append("\n### Notifications")
+        if isinstance(notif_tier, dict) and notif_tier:
+            out.append("| Tier | Count |")
+            out.append("| ---- | ----- |")
+            for tier, count in sorted(notif_tier.items()):
+                out.append(f"| {tier} | {int(count or 0)} |")
+        if isinstance(notif_reason, dict) and notif_reason:
+            out.append("\n**By reason**")
+            out.append("| Reason | Count |")
+            out.append("| ------ | ----- |")
+            for reason, count in sorted(notif_reason.items()):
+                out.append(f"| {reason} | {int(count or 0)} |")
+
+    # ── Memory lifecycle ──
+    out.append("\n### Memory Lifecycle")
+    out.append(
+        "| Memories created | Consolidated | Dedup-merged | "
+        "Entities created | Entities merged |"
+    )
+    out.append(
+        "| ---------------- | ------------ | ------------ | "
+        "---------------- | --------------- |"
+    )
+    out.append(
+        f"| {int(bench.get('memories_created', 0) or 0)} "
+        f"| {int(bench.get('memories_consolidated', 0) or 0)} "
+        f"| {int(bench.get('memories_dedup_merged', 0) or 0)} "
+        f"| {int(bench.get('entities_created', 0) or 0)} "
+        f"| {int(bench.get('entities_merged', 0) or 0)} |"
+    )
+
+    # ── Vault ──
+    out.append("\n### Vault")
+    out.append(
+        "| Notes | Wikilinks | Entity pages | MOC pages | "
+        "Active working docs |"
+    )
+    out.append(
+        "| ----- | --------- | ------------ | --------- | "
+        "------------------- |"
+    )
+    out.append(
+        f"| {int(bench.get('vault_notes_total', 0) or 0)} "
+        f"| {int(bench.get('vault_wikilinks_total', 0) or 0)} "
+        f"| {int(bench.get('vault_entity_pages', 0) or 0)} "
+        f"| {int(bench.get('vault_moc_pages', 0) or 0)} "
+        f"| {int(bench.get('vault_working_docs_active', 0) or 0)} |"
+    )
+
+    # ── Phase dwell time ──
+    dwell = bench.get("phase_dwell_seconds") or {}
+    if isinstance(dwell, dict) and dwell:
+        out.append("\n### Phase Dwell Time")
+        out.append("| SystemStatePhase | Seconds |")
+        out.append("| ---------------- | ------- |")
+        for phase, secs in sorted(dwell.items()):
+            try:
+                secs_f = float(secs)
+            except (TypeError, ValueError):
+                secs_f = 0.0
+            out.append(f"| {phase} | {secs_f} |")
+
+    # ── Trend across snapshots ──
+    if len(bench_files) >= 2:
+        trend_rows: list[dict[str, Any]] = []
+        for path in bench_files:
+            try:
+                row = json.loads(path.read_text())
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            trend_rows.append({
+                "snapshot": path.stem.replace(".benchmarks", ""),
+                "p50": row.get("response_latency_p50_ms", 0),
+                "p95": row.get("response_latency_p95_ms", 0),
+                "remaining": row.get("remaining_budget_fraction", 1.0),
+                "memories": int(row.get("vault_notes_total", 0) or 0),
+                "working_docs": int(
+                    row.get("vault_working_docs_active", 0) or 0
+                ),
+            })
+        if trend_rows:
+            out.append("\n### Trend across snapshots")
+            out.append(
+                "| Snapshot | p50 ms | p95 ms | Budget remaining "
+                "| Vault notes | Working docs |"
+            )
+            out.append(
+                "| -------- | ------ | ------ | ---------------- "
+                "| ----------- | ------------ |"
+            )
+            for r in trend_rows:
+                out.append(
+                    f"| {r['snapshot']} | {r['p50']} | {r['p95']} "
+                    f"| {r['remaining']} | {r['memories']} "
+                    f"| {r['working_docs']} |"
+                )
+            out.append(
+                f"\n_Trend store: `data/acceptance/benchmarks.csv` "
+                f"({len(bench_files)} sidecar(s) in snapshots/)_"
+            )
+
+    return out
+
+
 async def build_report(
     session_state: dict[str, Any],
     snapshots_dir: Path,
@@ -915,8 +1118,12 @@ async def build_report(
                 msg_count = snap.get("conversation", {}).get("message_count", "?")
                 health_status = _snapshot_health_status(snap)
                 # Include autonomous state in snapshot summary
-                auto_state = snap.get("autonomous_state", {})
-                auto_items = auto_state.get("total_items", 0) if auto_state.get("available") else "-"
+                snap_auto_state = snap.get("autonomous_state", {})
+                auto_items = (
+                    snap_auto_state.get("total_items", 0)
+                    if snap_auto_state.get("available")
+                    else "-"
+                )
                 lines.append(
                     f"- **{snap_path.stem}** @ {ts}: "
                     f"{msg_count} msgs | health={health_status} | items={auto_items}"
@@ -993,53 +1200,13 @@ async def build_report(
         for w in gap_warnings:
             lines.append(f"- {w}")
 
-    # ── Benchmarks (AT3 placeholder — AT4 polishes the formatting) ───────
-    # Enumerate any ``*.benchmarks.json`` sidecars written alongside
-    # snapshots. Each sidecar is a :class:`BenchmarkSummary` JSON dump.
-    # The report currently surfaces the latest summary; trend analysis
-    # lives in ``data/acceptance/benchmarks.csv`` (central CSV written
-    # by ``HarnessServer.cmd_snapshot``).
-    bench_files = sorted(snapshots_dir.glob("*.benchmarks.json"))
-    if bench_files:
-        latest = bench_files[-1]
-        try:
-            bench = json.loads(latest.read_text())
-        except Exception:
-            bench = {}
-        lines.append(f"\n## Benchmarks (latest: {latest.stem})")
-        lines.append(
-            f"- responses: {bench.get('response_count', 0)} "
-            f"p50={bench.get('response_latency_p50_ms', 0)}ms "
-            f"p95={bench.get('response_latency_p95_ms', 0)}ms"
-        )
-        lines.append(
-            f"- tokens: prompt={bench.get('total_prompt_tokens', 0)} "
-            f"completion={bench.get('total_completion_tokens', 0)} "
-            f"mean_per_response={bench.get('tokens_per_response_mean', 0)}"
-        )
-        lines.append(
-            f"- remaining_budget_fraction: "
-            f"{bench.get('remaining_budget_fraction', 1.0)}"
-        )
-        lines.append(
-            f"- pipelines: success={bench.get('pipeline_success_count', 0)} "
-            f"fail={bench.get('pipeline_fail_count', 0)}"
-        )
-        lines.append(
-            f"- memory deltas: created={bench.get('memories_created', 0)} "
-            f"consolidated={bench.get('memories_consolidated', 0)} "
-            f"dedup_merged={bench.get('memories_dedup_merged', 0)}"
-        )
-        lines.append(
-            f"- vault: notes={bench.get('vault_notes_total', 0)} "
-            f"wikilinks={bench.get('vault_wikilinks_total', 0)} "
-            f"entity_pages={bench.get('vault_entity_pages', 0)} "
-            f"moc_pages={bench.get('vault_moc_pages', 0)}"
-        )
-        lines.append(
-            f"- central trend CSV: data/acceptance/benchmarks.csv"
-            f" ({len(bench_files)} sidecar(s) in snapshots/)"
-        )
+    # ── Benchmarks dashboard (AT4) ──────────────────────────────────────
+    # Render the latest ``<snapshot>.benchmarks.json`` sidecar as a real
+    # markdown dashboard with per-category tables. When more than one
+    # sidecar exists, append a "Trend across snapshots" mini-table so
+    # the operator can see how key metrics evolved across the run. If
+    # no sidecar exists, the entire section is omitted gracefully.
+    lines.extend(_render_benchmarks_dashboard(snapshots_dir))
 
     # ── Errors ────────────────────────────────────────────────────────────
     errors = session_state.get("errors", [])
