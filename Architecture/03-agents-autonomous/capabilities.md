@@ -17,7 +17,7 @@ The system has 24 Python files across the `kora_v2/capabilities/` tree. It was i
 | [`kora_v2/capabilities/policy.py`](../../kora_v2/capabilities/policy.py) | Policy matrix: `PolicyMatrix`, `PolicyKey`, `PolicyRule`, `ApprovalMode`, `Decision`, `SessionState`, `TaskState` |
 | [`kora_v2/capabilities/registry.py`](../../kora_v2/capabilities/registry.py) | `ActionRegistry`, `CapabilityRegistry`, module-level singleton |
 
-### `browser/` (5 files)
+### `browser/` (6 files)
 
 | File | Purpose |
 |---|---|
@@ -28,7 +28,7 @@ The system has 24 Python files across the `kora_v2/capabilities/` tree. It was i
 | [`browser/health.py`](../../kora_v2/capabilities/browser/health.py) | `check_browser_health()` |
 | [`browser/policy.py`](../../kora_v2/capabilities/browser/policy.py) | `build_browser_policy()` |
 
-### `vault/` (5 files)
+### `vault/` (6 files)
 
 | File | Purpose |
 |---|---|
@@ -39,7 +39,7 @@ The system has 24 Python files across the `kora_v2/capabilities/` tree. It was i
 | [`vault/health.py`](../../kora_v2/capabilities/vault/health.py) | `check_vault_health()` |
 | [`vault/policy.py`](../../kora_v2/capabilities/vault/policy.py) | `build_vault_policy()` |
 
-### `workspace/` (5 files)
+### `workspace/` (6 files)
 
 | File | Purpose |
 |---|---|
@@ -401,7 +401,7 @@ This means importing `kora_v2.capabilities` is sufficient for the default regist
 
 - The DI container (`kora_v2/core/di.py`) calls `pack.bind()` on all registered capabilities during startup.
 - Capability health checks are exposed via the daemon's doctor endpoint.
-- The executor worker (`agents/workers/executor.py`) can dispatch to capability actions when the supervisor routes work to it.
+- The supervisor dispatch path can execute dotted capability actions through `graph/capability_bridge.py`. The executor currently pulls browser capability tools into its research path; do not describe it as a general workspace/vault capability dispatcher.
 - Skills (`kora_v2/skills/`) reference capability action names in their `tools` lists (e.g., `browser.open`, `vault.write_note`) so the supervisor LLM sees them as available tools when the relevant skill is active.
 - The `WorkspaceActionContext` holds an `MCPManager` reference from `kora_v2/mcp/manager.py`.
 - The `PolicyMatrix` uses `SessionState` and `TaskState` to track per-session/per-task grants — these are passed in by the caller, not stored globally.

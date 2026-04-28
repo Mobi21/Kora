@@ -41,6 +41,51 @@ logger = structlog.get_logger()
 MINIMAX_DOMAINS = ("api.minimax.io", "api.minimaxi.com")
 
 
+# Unicode ranges covering CJK ideographs + common punctuation variants that
+# occasionally leak into English MiniMax output (observed in acceptance:
+# "往下翻", "成功"). Fullwidth punctuation (U+FF00-U+FFEF) and CJK symbols
+# are also covered to catch "，。！" style leaks.
+_CJK_LEAK_RE = re.compile(
+    r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]+"
+)
+
+
+def _strip_cjk_leaks(text: str) -> tuple[str, int]:
+    """Remove stray CJK runs from model output.
+
+    MiniMax M2.7 is trained on a large Chinese corpus and occasionally
+    code-switches into Mandarin mid-sentence in English replies. This is
+    cosmetic but jarring. Strip the run and drop any now-empty
+    surrounding whitespace / quote pair. Preserve fenced code blocks and
+    inline backticks untouched — users may legitimately request non-Latin
+    content inside code.
+
+    Returns ``(clean_text, replacement_count)``. Replacement count is a
+    telemetry signal (logged by _parse_response) rather than a behavioural
+    flag.
+    """
+    if not text:
+        return text, 0
+    # Split on fenced code blocks and inline backticks so we don't touch
+    # anything inside them.
+    parts = re.split(r"(```[\s\S]*?```|`[^`]*`)", text)
+    count = 0
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            # Odd indices are the delimiters themselves (code blocks /
+            # inline code) — leave untouched.
+            continue
+        new_part, n = _CJK_LEAK_RE.subn("", part)
+        if n:
+            # Clean up orphan delimiters left by the replacement
+            # (e.g. empty quote pairs ``""`` / ``''``) and double spaces.
+            new_part = re.sub(r"\s{2,}", " ", new_part)
+            new_part = re.sub(r"\s+([,.;!?])", r"\1", new_part)
+            count += n
+            parts[i] = new_part
+    return "".join(parts), count
+
+
 def _build_base_url(base_url: str) -> str:
     """Build the full API URL, auto-appending /anthropic for MiniMax domains."""
     base_url = base_url.rstrip("/")
@@ -341,6 +386,8 @@ class MiniMaxProvider(LLMProviderBase):
         """
         system_blocks, api_messages = self._format_messages(messages)
         api_messages = self.cleanup_incomplete_messages(api_messages)
+        if not api_messages:
+            raise LLMGenerationError("message list is empty after cleanup; cannot call API")
 
         # System prompt from parameter takes precedence
         if system_prompt:
@@ -457,6 +504,8 @@ class MiniMaxProvider(LLMProviderBase):
         """Streaming API call -- yields StreamChunk events."""
         system_blocks, api_messages = self._format_messages(messages)
         api_messages = self.cleanup_incomplete_messages(api_messages)
+        if not api_messages:
+            raise LLMGenerationError("message list is empty after cleanup; cannot stream")
 
         if system_prompt:
             system_blocks = self._build_system_blocks(system_prompt)
@@ -647,20 +696,34 @@ class MiniMaxProvider(LLMProviderBase):
             if role == "tool":
                 tool_result_blocks: list[dict[str, Any]] = []
                 while idx < len(messages) and isinstance(messages[idx], dict) and messages[idx].get("role") == "tool":
+                    # A tool_result without a tool_use_id is malformed and
+                    # will later explode LangChain's ToolMessage validator
+                    # (KeyError on 'tool_call_id'). Skip it — pair integrity
+                    # is handled by ensure_tool_pair_integrity upstream, so
+                    # the matching tool_use will also be stripped.
+                    tc_id = messages[idx].get("tool_call_id")
+                    if not tc_id:
+                        logger.warning(
+                            "dropping_tool_result_missing_tool_call_id",
+                            content_preview=str(messages[idx].get("content", ""))[:80],
+                        )
+                        idx += 1
+                        continue
                     tool_result_blocks.append(
                         {
                             "type": "tool_result",
-                            "tool_use_id": messages[idx].get("tool_call_id", ""),
+                            "tool_use_id": tc_id,
                             "content": messages[idx].get("content", ""),
                         }
                     )
                     idx += 1
-                api_messages.append(
-                    {
-                        "role": "user",
-                        "content": tool_result_blocks,
-                    }
-                )
+                if tool_result_blocks:
+                    api_messages.append(
+                        {
+                            "role": "user",
+                            "content": tool_result_blocks,
+                        }
+                    )
                 continue
 
             # Regular user/assistant messages
@@ -703,12 +766,15 @@ class MiniMaxProvider(LLMProviderBase):
         tool_calls: list[ToolCall] = []
         content_blocks: list[dict[str, Any]] = []
 
+        cjk_leaks = 0
         for block in response.content:
             block_type = getattr(block, "type", "")
 
             if block_type == "text":
-                text_content += block.text
-                content_blocks.append({"type": "text", "text": block.text})
+                clean_text, leak_count = _strip_cjk_leaks(block.text)
+                cjk_leaks += leak_count
+                text_content += clean_text
+                content_blocks.append({"type": "text", "text": clean_text})
 
             elif block_type == "thinking":
                 thinking_content += block.thinking
@@ -753,6 +819,9 @@ class MiniMaxProvider(LLMProviderBase):
         # Update running totals
         self._total_prompt_tokens += prompt_tokens
         self._total_completion_tokens += completion_tokens
+
+        if cjk_leaks:
+            logger.info("cjk_leak_sanitized", runs_stripped=cjk_leaks)
 
         # Content moderation flags
         input_sensitive = getattr(response, "input_sensitive", False)

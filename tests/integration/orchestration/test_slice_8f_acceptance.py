@@ -490,6 +490,37 @@ async def test_8f_4_acyclic_dispatch_succeeds(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_8f_4_dispatch_seed_failure_returns_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared pipeline must not report ok if no runnable task is seeded."""
+    engine = await _make_engine(tmp_path)
+
+    async def _fail_dispatch_task(**kwargs):
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr(engine, "dispatch_task", _fail_dispatch_task)
+
+    result = await _orch_decompose_and_dispatch(
+        engine,
+        {
+            "goal": "research X then summarise",
+            "pipeline_name": "seed_failure_test_8f",
+            "stages": ["gather", "summarise"],
+            "in_turn": False,
+        },
+        session_id="sess-8f-seed-failure",
+    )
+
+    parsed = json.loads(result)
+    assert parsed["status"] == "error"
+    assert parsed["error_category"] == "dispatch"
+    assert parsed["pipeline_name"] == "seed_failure_test_8f"
+    assert "no runnable worker task" in parsed["message"]
+
+
+@pytest.mark.asyncio
 async def test_8f_4_acyclic_dag_dispatch_with_per_stage_tool_scope_succeeds(
     tmp_path: Path,
 ) -> None:

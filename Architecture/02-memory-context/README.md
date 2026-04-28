@@ -8,7 +8,7 @@ Kora remembers things through three cooperating subsystems. The **memory** subsy
 
 Kora has two copies of every memory, and they are not equal:
 
-- **`_KoraMemory/` (canonical)** — plain Markdown files with YAML frontmatter. These are the ground truth. If the projection DB were deleted tomorrow, it could be rebuilt from these files entirely.
+- **Configured memory root** — plain Markdown files with YAML frontmatter under `settings.memory.kora_memory_path` (default `~/.kora/memory`). These are the ground truth. If the projection DB were deleted tomorrow, it could be rebuilt from these files entirely.
 - **`data/projection.db` (derived)** — a SQLite database that indexes the same content for fast search. It adds FTS5 full-text indexes and, when `sqlite-vec` is installed, 768-dimensional float32 vector embeddings for semantic search. Triggers keep FTS5 in sync automatically; vector embeddings are written manually during the write pipeline.
 
 This means writes always go to the filesystem first, then to the projection DB. Reads always come from the projection DB (fast path) or — for the Memory Worker's full-content retrieval — directly from the filesystem.
@@ -18,7 +18,7 @@ This means writes always go to the filesystem first, then to the projection DB. 
 ## Directory layout
 
 ```
-_KoraMemory/
+<memory_root>/
 ├── Long-Term/
 │   └── {note_id}.md          # episodic, reflective, procedural memories
 └── User Model/
@@ -70,7 +70,7 @@ WritePipeline.store() or store_user_model_fact()
   │      (person patterns, location patterns, medication patterns)
   │
   ├─ 3. FilesystemMemoryStore.write_note()
-  │      Writes {note_id}.md to _KoraMemory/Long-Term/ or User Model/{domain}/
+  │      Writes {note_id}.md to <memory_root>/Long-Term/ or User Model/{domain}/
   │      YAML frontmatter: id, memory_type, importance, entities, tags, timestamps
   │
   ├─ 4. LocalEmbeddingModel.embed(content, task_type="search_document")
@@ -123,8 +123,8 @@ For complex recall requiring cross-referencing or synthesis, the supervisor disp
 
 | Concept | Where it lives | Lifespan | Purpose |
 |---|---|---|---|
-| Long-term memory | `_KoraMemory/Long-Term/*.md` + `memories` table | Persistent | Episodic, reflective, procedural memories from conversations |
-| User Model facts | `_KoraMemory/User Model/{domain}/*.md` + `user_model_facts` table | Persistent | Structured 21-domain profile with Bayesian confidence |
+| Long-term memory | `<memory_root>/Long-Term/*.md` + `memories` table | Persistent | Episodic, reflective, procedural memories from conversations |
+| User Model facts | `<memory_root>/User Model/{domain}/*.md` + `user_model_facts` table | Persistent | Structured 21-domain profile with Bayesian confidence |
 | Working memory items | In-memory `WorkingMemoryLoader` result, max 5 items | Per turn | Open threads from `SessionBridge`, items due within 48h |
 | Conversation history | In-memory message list | Per session | Raw turns managed by compaction pipeline |
 
@@ -136,7 +136,7 @@ For complex recall requiring cross-referencing or synthesis, the supervisor disp
 
 User Model data has two representations:
 
-1. **Filesystem**: `_KoraMemory/User Model/{domain}/{note_id}.md` — each note is a Markdown file with YAML frontmatter. The `domain` subdirectory matches one of 21 canonical domain names (e.g. `identity`, `preferences`, `adhd_profile`).
+1. **Filesystem**: `<memory_root>/User Model/{domain}/{note_id}.md` — each note is a Markdown file with YAML frontmatter. The `domain` subdirectory matches one of 21 canonical domain names (e.g. `identity`, `preferences`, `adhd_profile`).
 
 2. **Projection DB**: the `user_model_facts` table, with fields for `domain`, `confidence`, `evidence_count`, and `contradiction_count`. Confidence is Bayesian: `evidence_count / (evidence_count + contradiction_count + 2)`, starting at ~0.33 and converging toward 1.0 as confirmations accumulate.
 

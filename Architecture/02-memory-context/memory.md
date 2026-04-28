@@ -59,7 +59,7 @@ Wraps `NoteMetadata` and adds `body: str` — the text after the frontmatter del
 The 21 canonical subdomain names:
 `identity`, `preferences`, `relationships`, `routines`, `health`, `work`, `education`, `finances`, `hobbies`, `goals`, `values`, `communication_style`, `emotional_patterns`, `triggers`, `strengths`, `challenges`, `medications`, `pets`, `living_situation`, `diet`, `adhd_profile`.
 
-Any `write_note()` call with `memory_type="user_model"` and an unrecognized `domain` falls back to `_KoraMemory/User Model/` directly.
+Any `write_note()` call with `memory_type="user_model"` and an unrecognized `domain` falls back to `<memory_root>/User Model/` directly.
 
 ### `FilesystemMemoryStore`
 
@@ -123,7 +123,7 @@ Packs a Python list of floats to `struct.pack(f"{len(vec)}f", *vec)` — the bin
 ### Tables
 
 ```sql
--- Long-term memories (from _KoraMemory/Long-Term/)
+-- Long-term memories (from <memory_root>/Long-Term/)
 memories (
     id TEXT PRIMARY KEY,
     content TEXT NOT NULL,
@@ -133,11 +133,15 @@ memories (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     entities TEXT,          -- JSON array of entity names (not FTS-indexed)
+    status TEXT DEFAULT 'active',
+    consolidated_into TEXT,
+    merged_from TEXT,
+    deleted_at TEXT,
     tags TEXT,              -- JSON array of tags (not FTS-indexed)
     source_path TEXT NOT NULL
 )
 
--- User Model facts (from _KoraMemory/User Model/)
+-- User Model facts (from <memory_root>/User Model/)
 user_model_facts (
     id TEXT PRIMARY KEY,
     domain TEXT NOT NULL,
@@ -168,6 +172,8 @@ entity_links (
     CHECK (memory_id IS NOT NULL OR user_model_fact_id IS NOT NULL)
 )
 ```
+
+Startup migrations add soft-delete/consolidation columns. Active retrieval filters for active rows, and consolidation/dedup preserve tombstone metadata instead of treating every merge as a hard delete.
 
 ### Virtual tables
 
@@ -478,7 +484,7 @@ The system prompt instructs the Memory Worker on:
 
 | Event | When it fires |
 |-------|---------------|
-| `MEMORY_STORED` | A new note is written to `_KoraMemory/` and projected into `projection.db`. Consumed by `proactive_pattern_scan` (wakes pattern-scan triggers) and the `post_session_memory` pipeline. |
+| `MEMORY_STORED` | A new note is written to `<memory_root>/` and projected into `projection.db`. Consumed by `proactive_pattern_scan` (wakes pattern-scan triggers) and the `post_session_memory` pipeline. |
 | `MEMORY_SOFT_DELETED` | A note is tombstoned rather than physically deleted. The filesystem copy stays put; the projection row is flipped to `deleted=1`. |
 | `ENTITY_MERGED` | Two entity rows are merged into one. Emits the surviving id + the merged-in id so downstream consumers can rebind references. |
 
@@ -486,9 +492,9 @@ These three live under the `# Memory` block of `kora_v2/core/events.py` alongsid
 
 ---
 
-## Working documents — `_KoraMemory/Inbox/`
+## Working documents — `<memory_root>/Inbox/`
 
-Long-running orchestration tasks (`LONG_BACKGROUND` preset, e.g. `user_autonomous_task`) write a per-instance working document to `_KoraMemory/Inbox/<task_id>.md`. These are intentionally stored alongside user memory rather than in the SQL layer so the supervisor can quote section contents back to the user in the turn response and so the user themselves can edit the file to steer an in-flight task.
+Long-running orchestration tasks (`LONG_BACKGROUND` preset, e.g. `user_autonomous_task`) write a per-instance working document to `<memory_root>/Inbox/<task_id>.md`. These are intentionally stored alongside user memory rather than in the SQL layer so the supervisor can quote section contents back to the user in the turn response and so the user themselves can edit the file to steer an in-flight task.
 
 Each document has:
 

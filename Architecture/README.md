@@ -1,8 +1,8 @@
 # Kora Architecture Atlas
 
-A full, implementation-grounded map of Kora — every subsystem, every module, every non-obvious behavior — derived directly from `kora_v2/` source code (not from specs or legacy docs).
+A public, implementation-grounded map of Kora. The current source-backed snapshot is [`current-architecture.md`](current-architecture.md); older cluster deep dives remain useful for subsystem detail, but `current-architecture.md` wins when a page still contains Phase 7.5-era wording.
 
-If you are new to this codebase, read [`overview.md`](overview.md) first. It gives you the mental model you need to read any of the cluster docs without context-switching.
+If you are new to this codebase, read [`current-architecture.md`](current-architecture.md) first. It gives you the current mental model, acceptance caveats, and verified counts before you branch into the older cluster pages.
 
 ## How this atlas is organized
 
@@ -10,27 +10,29 @@ Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a Rich C
 
 | # | Cluster | What lives here | Read when you want to understand… |
 |---|---------|-----------------|-----------------------------------|
-| 01 | [Runtime core](01-runtime-core/README.md) | `core/`, `daemon/`, `runtime/`, `runtime/orchestration/`, `graph/` | How a turn runs and how every non-conversation job is scheduled. The DI container, FastAPI server, WebSocket protocol, LangGraph supervisor, turn tracing, and the Phase 7.5 `OrchestrationEngine` that replaced `BackgroundWorker`. |
-| 02 | [Memory & context](02-memory-context/README.md) | `memory/`, `context/`, `tools/` | How Kora remembers. Filesystem-canonical memory, projection DB, hybrid retrieval, compaction, the `recall()` fast path, all 23 registered tools. |
+| 00 | [Current architecture](current-architecture.md) | whole system | Current source-backed architecture, recent acceptance caveats, and corrected counts. |
+| 01 | [Runtime core](01-runtime-core/README.md) | `core/`, `daemon/`, `runtime/`, `runtime/orchestration/`, `graph/` | How a turn runs and how every non-conversation job is scheduled. The DI container, FastAPI server, WebSocket protocol, LangGraph supervisor, turn tracing, `TriggerEvaluator`, and the current `OrchestrationEngine`. |
+| 02 | [Memory & context](02-memory-context/README.md) | `memory/`, `context/`, `tools/` | How Kora remembers. Configurable filesystem-canonical memory, projection DB, hybrid retrieval, compaction, the `recall()` fast path, and the current 47 registered Python tools. |
 | 03 | [Agents & autonomous](03-agents-autonomous/README.md) | `agents/workers/`, `autonomous/`, `capabilities/`, `skills/`, `routing/` | How Kora *does* things. Worker harnesses (planner/executor/reviewer), multi-step autonomous plans, capability packs, YAML skills. |
 | 04 | [Conversation & LLM](04-conversation-llm/README.md) | `llm/`, `emotion/`, `cli/`, `mcp/`, `quality/` | How Kora talks. LLM providers (MiniMax via Anthropic SDK, Claude Code delegate), two-tier PAD emotion, Rich CLI, MCP manager, quality sampling. |
-| 05 | [Life engine & ADHD](05-life-adhd/README.md) | `life/`, `adhd/` | Why Kora is different. Routines, reminders, proactive surfacing, morning/crash/day bounds, trend detection, shame-free output rules. Phase 5 work. |
+| 05 | [Life OS, support & ADHD](05-life-adhd/README.md) | `life/`, `support/`, `safety/`, `adhd/` | Kora's current product center: day plans, reality ledger, repair loop, load meter, proactivity policy, stabilization, context packs, future bridges, support profiles, crisis boundary, routines, reminders, and ADHD-aware behavior. |
 
 ## Navigation index
 
 ### 01 — Runtime core
+- [Current architecture](current-architecture.md) — source-backed whole-system snapshot and acceptance caveats
 - [Cluster README](01-runtime-core/README.md) — request→turn→response flow, lifecycle, cross-subsystem map
 - [core.md](01-runtime-core/core.md) — DI container, settings, `operational.db` schema, event bus, retry, logging
 - [daemon.md](01-runtime-core/daemon.md) — FastAPI routes, WebSocket turn queue, launcher, lockfile, auth relay, session bridge, orchestration engine lifecycle
 - [runtime.md](01-runtime-core/runtime.md) — `GraphTurnRunner`, compaction circuit breaker, inspector, artifact store, checkpointer lifecycle
-- [orchestration.md](01-runtime-core/orchestration.md) — `OrchestrationEngine`, `WorkerTask` FSM, pipelines, triggers, dispatcher, `SystemState`, `RequestLimiter`, `NotificationGate`, working docs (Phase 7.5)
-- [graph.md](01-runtime-core/graph.md) — LangGraph supervisor: full topology, every node, every edge, tool-footprint tracker, CJK filter, the 7 new orchestration supervisor tools
+- [orchestration.md](01-runtime-core/orchestration.md) — `OrchestrationEngine`, `TriggerEvaluator`, `WorkerTask` FSM, pipelines, triggers, dispatcher, `SystemState`, `RequestLimiter`, `NotificationGate`, working docs
+- [graph.md](01-runtime-core/graph.md) — LangGraph supervisor, tool-footprint tracker, CJK filter, and the 11 supervisor tools
 
 ### 02 — Memory & context
 - [Cluster README](02-memory-context/README.md) — filesystem vs projection DB, write/read flows, working vs long-term memory
 - [memory.md](02-memory-context/memory.md) — `FilesystemMemoryStore`, `ProjectionDB` (FTS5 + vec0), hybrid retrieval algorithm, `WritePipeline`, `SignalScanner`
 - [context.md](02-memory-context/context.md) — `WorkingMemoryLoader`, `ContextBudgetMonitor` (5-tier), 4-stage compaction pipeline, `ContextEngine`
-- [tools.md](02-memory-context/tools.md) — registry, `@tool` decorator, auth levels, `recall()` fast path, all 23 tools, `DomainVerbResolver`
+- [tools.md](02-memory-context/tools.md) — registry, `@tool` decorator, auth levels, `recall()` fast path, current 47 Python tools, `DomainVerbResolver`
 
 ### 03 — Agents & autonomous
 - [Cluster README](03-agents-autonomous/README.md) — worker vs capability vs skill distinction, turn-lifecycle fit
@@ -48,21 +50,21 @@ Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a Rich C
 - [mcp.md](04-conversation-llm/mcp.md) — MCP manager lifecycle, tool exposure, server config
 - [quality.md](04-conversation-llm/quality.md) — quality measurement, sampling, stub areas
 
-### 05 — Life engine & ADHD
-- [Cluster README](05-life-adhd/README.md) — how life and adhd fit together, the Phase 5 narrative
-- [life.md](05-life-adhd/life.md) — routines (stateful sessions), reminders, proactive surfacing, `ContextEngine` integration hub
+### 05 — Life OS, support & ADHD
+- [Cluster README](05-life-adhd/README.md) — Life OS product loop plus support/safety/ADHD integration
+- [life.md](05-life-adhd/life.md) — day plans, ledger, load, repair, proactivity policy, stabilization, context packs, future bridge, trusted support, routines, reminders, and `ContextEngine`
 - [adhd.md](05-life-adhd/adhd.md) — morning/crash/day bounds, trend detection, shame-free output rules, timezone fixes
 
 ## How this was produced
 
-This atlas was built by reading every `.py` file in `kora_v2/`. Five Sonnet agents worked in parallel — one per cluster — each instructed to base every claim on real code with `file:line` references. No content was sourced from `Documentation/`, `README.md`, or legacy spec folders. When source disagrees with any legacy doc, **the atlas follows source**.
+This atlas started as a source-derived cluster map. It has since drifted in places as the worktree moved through Phase 8 memory, vault, proactive, reminder, trigger-evaluator, and capability work. Use [`current-architecture.md`](current-architecture.md) for the current checked facts, and treat older cluster pages as deep dives that may still contain stale local claims.
 
-The initial pass was generated against the commit at the tip of `main` on 2026-04-14. Phase 7.5 (orchestration layer) updates were folded in on 2026-04-15 against branch `feature/phase-7-5-orchestration` at commits `d35e3a5` / `9a0d0d6`. Regenerate any cluster by re-running that cluster's agent prompt against the current HEAD.
+The latest refresh pass was performed on 2026-04-28 against the dirty `main` worktree at `d056894`, using live code, `/tmp/claude/kora_acceptance` artifacts, Life OS manual probes, and parallel subagent audits. The current product center is now Life OS. The latest local `/tmp` general acceptance report is a short Day 1 run, not a full green proof; the latest remembered clean full pre-pivot run from 2026-04-26 reported `67/69` active items satisfied with deferred item `1` and still-red items `48` and `55`.
 
 ## Ground rules for reading
 
-- **Every `file.py:42` reference is a real line.** Click through.
-- **"Stub" means stub.** When a doc says a feature is stubbed, the code really is empty or placeholder. Don't trust CLAUDE.md, trust the atlas.
+- **Every `file.py:42` reference should be rechecked when editing docs.** The worktree is active.
+- **"Stub" means only what current code proves.** Several older pages still call Phase 8 handlers stubs even though real handlers are wired.
 - **Timezone-aware date logic matters.** Phase 5 fixed three timezone collapse bugs — see [adhd.md](05-life-adhd/adhd.md).
 - **The `routing/` directory is empty.** Routing logic lives in the supervisor graph and the autonomous graph, not in `routing/`.
 - **MiniMax speaks the Anthropic API.** The LLM provider uses `anthropic.AsyncAnthropic` pointed at `https://api.minimax.io/anthropic`.
@@ -70,7 +72,7 @@ The initial pass was generated against the commit at the tip of `main` on 2026-0
 ## Top-level repo context
 
 - Primary package: `kora_v2/` — everything else (`kora/`, `src/`, `Documentation/archive/`) is legacy or docs.
-- Canonical memory: `_KoraMemory/` on the filesystem (gitignored).
-- Runtime state: `data/operational.db` (27 tables) + per-session SQLite checkpointer.
+- Canonical memory: `settings.memory.kora_memory_path`, default `~/.kora/memory` (acceptance can override it under `/tmp/claude/kora_acceptance/memory`).
+- Runtime state: `data/operational.db`, `data/projection.db`, and per-session SQLite checkpointers.
 - Entry point: `kora_v2.daemon.launcher:main` → `kora` console script.
-- Stack: Python 3.11+, FastAPI, LangGraph, `anthropic` SDK, `sqlite-vec`, Rich.
+- Stack: Python 3.12+, FastAPI, LangGraph, `anthropic` SDK, `sqlite-vec`, Rich.

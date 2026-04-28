@@ -1,20 +1,32 @@
 # Kora
 
-An ADHD-aware, local-first AI companion.
+A local-first Life OS agent for keeping a messy day believable.
 
 > ⚠️ **Pre-alpha — active development.**
 > APIs, file layouts, database schemas, and behavior change from week to week. There are no releases, no stability guarantees, and no support. Credentials, conversations, and memory all live on your machine, but the runtime itself is not considered safe for daily use. **Install at your own risk.**
 
 ## What Kora is
 
-Kora's core identity is **ADHD-awareness as a design premise**, not a feature set. The memory system, the planner, the pacing, the proactive surfacing of things you forgot — they're shaped from the ground up around how an ADHD brain actually works. Four capability pillars serve that core:
+Kora's product center is now **Life OS**: a local-first agent for day-to-day life management when planning, initiation, transitions, sensory load, social load, low energy, anxiety, burnout, or executive dysfunction make ordinary productivity tools unrealistic.
 
-1. **Subagent-first architecture.** A LangGraph supervisor delegates to specialized workers (memory, planner, executor, reviewer). The supervisor decides what to do; workers execute. No classifier, no intent router — the LLM self-regulates based on prompt guidance.
-2. **Quality-first design.** Every agent output flows through typed Pydantic schemas and quality gates. A dedicated Reviewer worker catches problems before the user sees them. Structural enforcement, not aspirational.
-3. **Autonomous execution.** Kora can take multi-step tasks (research → plan → implement → review → ship) and run them end-to-end over hours, with 30-minute reflection checkpoints. You can chat concurrently while autonomous work continues in the background.
-4. **Life-management infrastructure.** The concrete layer that makes ADHD-awareness real: routines, medication reminders, finance, diet, time awareness, and proactive surfacing of pending commitments. Implemented as an on-demand life worker plus a proactive background agent that watches for things you forgot.
+The core loop is:
 
-Those four pillars read as ADHD-aware once they're put together: Kora passively infers energy and focus from conversation signals (no self-reporting — that's itself an executive-function task), compensates for working-memory drift by surfacing due-soon items, breaks down tasks into 2-minute micro-steps when you're stuck, learns a personal time-estimation correction factor, and tracks a dedicated ADHD profile in the user model. None of that is bolted on; it's how the agents are built.
+```text
+Plan Today -> Confirm Reality -> Repair The Day -> Bridge Tomorrow
+```
+
+Kora is designed to maintain a believable day plan, notice when reality diverges, make it easy for the user to correct Kora, and repair the rest of the day without shame. Coding, research, writing, browser, workspace, and vault work still exist as optional capability packs, but they are no longer the main product acceptance surface.
+
+Current Life OS pillars:
+
+1. **Believable day planning.** Kora creates versioned day plans from calendar entries, items, reminders, routines, and current load. Only one plan is active for a local day; older revisions stay queryable for repair proof.
+2. **Reality ledger.** Medication, meals, focus blocks, reminders, quick notes, corrections, inferred events, and tool-generated life events are recorded in a durable Life Event Ledger.
+3. **Repair engine.** Kora detects stale plans, partial/skipped/blocked reality, overload, and "I'm behind" reports, then proposes/apply safe private repairs such as shrinking tasks, adding buffers, deferring nonessential work, or creating a new plan revision.
+4. **Life Load and support modes.** The Life Load Meter produces explainable load factors and can drive quiet, high-support, recovery, or Stabilization Mode behavior.
+5. **Support profiles.** A baseline `general_life_management` profile is active by default. ADHD, anxiety, autism/sensory, low-energy, and burnout profiles are suggested or user-activated; active profiles change runtime decisions, not just wording.
+6. **Context packs and bridges.** Kora can create context packs for admin/anxiety/sensory-heavy situations and Future Self Bridges that carry partial, skipped, blocked, or dropped items into tomorrow with first moves.
+7. **Proactivity with restraint.** Every nudge candidate gets a durable send/defer/suppress/queue decision, including quiet/stabilization suppression and feedback such as "too much" or "wrong."
+8. **Safety boundary.** Crisis language preempts normal planning, repair, and productivity flows and writes a durable safety-boundary record.
 
 ## Architecture at a glance
 
@@ -39,14 +51,15 @@ Those four pillars read as ADHD-aware once they're put together: Kora passively 
 │  Infrastructure: LLM provider, tool registry, MCP        │
 │  manager, quality gates, DI container, event bus         │
 │                                                          │
-│  Storage: _KoraMemory/ (canonical markdown + YAML),      │
-│  projection.db (derived), items.db, operational.db       │
+│  Storage: memory root (canonical markdown + YAML),       │
+│  projection.db (derived), operational.db                 │
 └──────────────────────────────────────────────────────────┘
 ```
 
 - **Supervisor graph** (`kora_v2/graph/`) — the main conversation loop, built on LangGraph.
-- **Workers** (`kora_v2/agents/workers/`) — memory, planner, executor, reviewer. Typed Pydantic I/O, shared harness, quality gates.
+- **Workers** (`kora_v2/agents/workers/`) — planner, executor, reviewer. Typed Pydantic I/O, shared harness, quality gates.
 - **Filesystem-canonical memory** (`kora_v2/memory/`, `_KoraMemory/`) — markdown notes with YAML frontmatter are the source of truth. SQLite (`projection.db`) is a derived index for fast recall via FTS5 + local embeddings.
+- **Life OS services** (`kora_v2/life/`, `kora_v2/support/`, `kora_v2/safety/`) — day plans, ledger, load meter, repair, proactivity policy, stabilization, context packs, future bridges, support profiles, trusted support exports, and crisis safety.
 - **Daemon + CLI** (`kora_v2/daemon/`, `kora_v2/cli/`) — FastAPI daemon bound to `127.0.0.1`, Rich terminal client over WebSocket.
 - **MiniMax M2.7** is the primary LLM (205K context). Claude Code is available as a user-toggled delegate for deep planning and research.
 
@@ -126,14 +139,16 @@ kora_v2/
 ├── daemon/        # FastAPI server, launcher, lockfile, session mgmt
 ├── emotion/       # Two-tier PAD emotion assessment
 ├── graph/         # LangGraph supervisor graph
-├── life/          # Life-management (routines, etc.)
+├── life/          # Life OS services: day plans, ledger, load, repair, bridge
 ├── llm/           # LLM provider abstractions (MiniMax, Claude Code)
 ├── mcp/           # MCP (Model Context Protocol) client integration
 ├── memory/        # Filesystem store, projection DB, retrieval, embeddings
 ├── quality/       # Quality measurement and sampling
 ├── routing/       # Intent and verb routing helpers
 ├── runtime/       # Turn runner, checkpointer, inspector, stores
+├── safety/        # Crisis safety boundary
 ├── skills/        # YAML skill definitions (code, emotional, autonomous...)
+├── support/       # Life OS support profiles and runtime modules
 └── tools/         # recall(), filesystem, life-management tools, registry
 
 tests/             # unit / integration / acceptance / fixtures
@@ -157,11 +172,18 @@ data/              # lockfile, token, logs, databases — gitignored, created at
 .venv/bin/python -c "import kora_v2"
 ```
 
+## Acceptance focus
+
+Life OS acceptance is the product-center gate. A convincing pass requires durable proof for the Plan Today -> Confirm Reality -> Repair The Day -> Bridge Tomorrow loop: DB rows, domain events, tool calls, day-plan revisions, repair actions, nudge decisions, support mode state, context packs, future bridges, support profiles/signals, and safety-boundary records.
+
+The old coding/research/writing acceptance checks are treated as optional capability-pack health. They should not make the Life OS core look red unless they break core life-management behavior.
+
 ## Security & constraints
 
 - **Local-first.** The daemon binds to `127.0.0.1` only. No remote exposure without an explicit tunnel you set up yourself.
 - **Secrets via `.env`.** Never commit credentials. `.env` is gitignored; use `.env.example` as the template.
 - **Auth token** at `data/.api_token` is generated per-session and required for all daemon API calls.
+- **Not clinical care.** Kora can support planning, routines, grounding, and user-authored support workflows. It is not a clinician, therapist, emergency responder, diagnostic system, or replacement for professional care.
 - **No deception.** The system is designed to be reliable and non-manipulative; contribution that violates this is out of scope.
 
 ## License

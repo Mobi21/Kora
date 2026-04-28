@@ -13,18 +13,20 @@ Start: python3 -m tests.acceptance._harness_server
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
 import time
 import traceback
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).parents[2].resolve()
+_DEFAULT_PROJECT_ROOT = Path(__file__).parents[2].resolve()
+PROJECT_ROOT = _DEFAULT_PROJECT_ROOT
 ACCEPT_DIR = Path(os.environ.get("KORA_ACCEPTANCE_DIR", "/tmp/claude/kora_acceptance"))
 OUTPUT_DIR = ACCEPT_DIR / "acceptance_output"
 SNAPSHOTS_DIR = OUTPUT_DIR / "snapshots"
@@ -143,9 +145,9 @@ def _rest_get(path: str, port: int, host: str, token: str) -> dict[str, Any] | N
 #   1. Legacy autonomous tables (Phase ≤ 7): autonomous_plans,
 #      autonomous_checkpoints, items, autonomous_updates,
 #      item_state_history, item_artifact_links, item_deps.
-#   2. Phase 7.5 + Phase 8 tables: 8 orchestration tables, the
-#      Phase 8a session_transcripts + signal_queue, the Phase 8b
-#      dedup_rejected_pairs, plus notifications and reminders.
+#   2. Phase 7.5 + Phase 8 tables: orchestration rows, LangGraph
+#      checkpoints, turn traces, lifecycle/session artifacts, and the
+#      user-facing operational rows acceptance explicitly verifies.
 #
 # Order matters where foreign keys are involved (children before
 # parents). worker_tasks → pipeline_instances; work_ledger references
@@ -166,6 +168,7 @@ _ORCHESTRATION_TABLES: tuple[str, ...] = (
     "work_ledger",
     "worker_tasks",
     "pipeline_instances",
+    "permission_grants",
     "trigger_state",
     "system_state_log",
     "request_limiter_log",
@@ -173,6 +176,33 @@ _ORCHESTRATION_TABLES: tuple[str, ...] = (
     "runtime_pipelines",
 )
 
+_RUNTIME_STATE_TABLES: tuple[str, ...] = (
+    "checkpoints",
+    "turn_trace_events",
+    "turn_traces",
+    "sessions",
+)
+
+_LIFE_MANAGEMENT_TABLES: tuple[str, ...] = (
+    "medication_log",
+    "meal_log",
+    "focus_blocks",
+    "quick_notes",
+    "reminders",
+    "routine_sessions",
+    "routines",
+)
+
+_LIFECYCLE_TABLES: tuple[str, ...] = (
+    "notifications",
+    "session_transcripts",
+    "signal_queue",
+    "dedup_rejected_pairs",
+)
+
+# Backward-compatible table set imported by unit tests and older harness
+# helpers. The expanded cleanup path also includes runtime state and life
+# management tables, but this alias preserves the previous public subset.
 _PROACTIVE_TABLES: tuple[str, ...] = (
     "notifications",
     "reminders",
@@ -186,9 +216,9 @@ async def _clean_stale_test_data(db_path: Path) -> None:
     """Wipe stale data from previous test runs (Phase ≤ 7 + Phase 8).
 
     Phase ≤ 7 tables (autonomous_*, items, etc.) plus Phase 7.5
-    orchestration (8 tables), Phase 8 memory lifecycle adjuncts
-    (signal_queue, session_transcripts, dedup_rejected_pairs), and
-    proactive surfaces (notifications, reminders).
+    orchestration rows, LangGraph checkpoints, session / trace
+    artifacts, Phase 8 lifecycle adjuncts, and the user-facing life
+    management rows acceptance validates.
 
     The previous ``_clean_stale_autonomous_data`` only wiped the legacy
     autonomous tables, which left a post-Phase 8 system in mixed state
@@ -205,11 +235,13 @@ async def _clean_stale_test_data(db_path: Path) -> None:
         return
     try:
         async with aiosqlite.connect(str(db_path)) as db:
-            # Children first, then parents, then proactive tables.
+            # Children first, then parents, then runtime/lifecycle rows.
             for table in (
                 *_LEGACY_AUTONOMOUS_TABLES,
                 *_ORCHESTRATION_TABLES,
-                *_PROACTIVE_TABLES,
+                *_RUNTIME_STATE_TABLES,
+                *_LIFE_MANAGEMENT_TABLES,
+                *_LIFECYCLE_TABLES,
             ):
                 try:
                     await db.execute(f"DELETE FROM {table}")
@@ -218,6 +250,87 @@ async def _clean_stale_test_data(db_path: Path) -> None:
             await db.commit()
     except Exception:
         pass  # DB may be locked or corrupted — not fatal for test startup
+
+
+def _clean_stale_projection_data(db_path: Path) -> None:
+    """Wipe acceptance-owned projection rows while keeping the schema.
+
+    Acceptance uses a scratch vault root, so retaining old projection rows
+    creates split-brain evidence: entity links point at a previous memory
+    tree while the report counts files in the fresh acceptance tree.
+    """
+    if not db_path.exists():
+        return
+
+    def _remove_projection_file() -> None:
+        for path in (
+            db_path,
+            db_path.with_name(f"{db_path.name}-wal"),
+            db_path.with_name(f"{db_path.name}-shm"),
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    try:
+        try:
+            import pysqlite3 as sqlite3  # type: ignore[import-untyped]
+        except ImportError:
+            import sqlite3  # type: ignore[no-redef]
+
+        with sqlite3.connect(str(db_path)) as db:
+            db.execute("PRAGMA trusted_schema=ON")
+            try:
+                import sqlite_vec
+
+                db.enable_load_extension(True)
+                sqlite_vec.load(db)
+                db.enable_load_extension(False)
+            except Exception:
+                pass
+
+            uncleared_tables: list[str] = []
+            for table in (
+                "entity_links",
+                "memories_vec",
+                "user_model_vec",
+                "memories",
+                "user_model_facts",
+                "entities",
+            ):
+                try:
+                    db.execute(f"DELETE FROM {table}")
+                except sqlite3.OperationalError:
+                    uncleared_tables.append(table)
+            db.commit()
+
+            if uncleared_tables:
+                raise RuntimeError(
+                    "projection cleanup left uncleared tables: "
+                    + ", ".join(uncleared_tables)
+                )
+    except Exception:
+        # projection.db is a derived cache. If sqlite-vec cannot be loaded
+        # during acceptance cleanup, recreating the file is safer than leaving
+        # stale vec rowids that make the next run half-index memories.
+        _remove_projection_file()
+
+
+def _reset_daemon_runtime_files(data_dir: Path) -> None:
+    """Drop persisted conversation identity files between acceptance runs.
+
+    The daemon persists ``thread_id`` / ``session_id`` on disk so the
+    LangGraph checkpoint state survives restart. That is correct for real
+    usage, but the acceptance harness needs a fresh conversation identity
+    every run; otherwise a stale checkpoint can be replayed into the first
+    turn and break the clean-room test session before any new message lands.
+    """
+    for name in ("thread_id", "session_id"):
+        try:
+            (data_dir / name).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # Backward-compat alias — one slice of grace before removal.
@@ -323,6 +436,44 @@ class HarnessServer:
             if self._running:
                 _log_event({"event": "ws_recv_loop_error", "error": str(e)})
 
+    async def _ensure_ws_connected(self) -> bool:
+        """Ensure a WebSocket and receive loop are both running."""
+        if self._ws is None:
+            if not await self.connect_to_kora():
+                return False
+        if self._recv_task is None or self._recv_task.done():
+            self._recv_task = asyncio.create_task(self._recv_loop())
+        return True
+
+    async def _disconnect_for_idle(self) -> bool:
+        """Close the conversation WebSocket so runtime can enter idle phases."""
+        if self._ws is None:
+            return False
+        if self._recv_task is not None:
+            self._recv_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._recv_task
+            self._recv_task = None
+        with contextlib.suppress(Exception):
+            await self._ws.close()
+        self._ws = None
+        _log_event({"event": "idle_ws_closed"})
+        return True
+
+    async def _reconnect_after_idle(self) -> None:
+        """Restore the harness WebSocket after an idle soak."""
+        if self._ws is not None:
+            return
+        if await self._ensure_ws_connected():
+            _log_event(
+                {
+                    "event": "idle_ws_reconnected",
+                    "session_id": self._kora_session_id,
+                }
+            )
+        else:
+            _log_event({"event": "idle_ws_reconnect_failed"})
+
     async def _handle_ws_event(self, data: dict[str, Any]) -> None:
         """Route a single WebSocket event."""
         msg_type = data.get("type", "")
@@ -330,6 +481,14 @@ class HarnessServer:
         if msg_type == "ping":
             if self._ws:
                 await self._ws.send(json.dumps({"type": "pong"}))
+            return
+
+        if msg_type in {"session_ready", "session_greeting"}:
+            if msg_type == "session_ready":
+                meta = data.get("metadata", {})
+                self._kora_session_id = meta.get("session_id")
+                self._state["kora_session_id"] = self._kora_session_id
+                _save_session(self._state)
             return
 
         if msg_type == "auth_request":
@@ -413,12 +572,10 @@ class HarnessServer:
 
     # ── Command handlers ──────────────────────────────────────────────────
 
-    async def cmd_send(self, message: str, timeout: float = 180.0) -> dict[str, Any]:
+    async def cmd_send(self, message: str, timeout: float = 600.0) -> dict[str, Any]:
         """Send a message to Kora and return the response."""
-        if self._ws is None:
-            ok = await self.connect_to_kora()
-            if not ok:
-                return {"error": "Cannot connect to Kora daemon"}
+        if not await self._ensure_ws_connected():
+            return {"error": "Cannot connect to Kora daemon"}
 
         if self._busy:
             return {"error": "Harness is busy with another request"}
@@ -1043,8 +1200,14 @@ class HarnessServer:
             by_event_type = {r["event_type"]: r["cnt"] for r in await cur.fetchall()}
 
             cur = await db.execute(
+                "SELECT reason, COUNT(*) AS cnt FROM work_ledger "
+                "WHERE reason IS NOT NULL AND reason != '' GROUP BY reason"
+            )
+            by_reason = {r["reason"]: r["cnt"] for r in await cur.fetchall()}
+
+            cur = await db.execute(
                 """SELECT timestamp, event_type, pipeline_instance_id,
-                          worker_task_id, trigger_name, reason
+                          worker_task_id, trigger_name, reason, metadata_json
                    FROM work_ledger
                    ORDER BY id DESC LIMIT 30"""
             )
@@ -1053,6 +1216,7 @@ class HarnessServer:
             return {
                 "total": total,
                 "by_event_type": by_event_type,
+                "by_reason": by_reason,
                 "recent": recent,
             }
         except Exception:
@@ -1377,7 +1541,17 @@ class HarnessServer:
                 "SELECT entity_type, COUNT(*) AS cnt FROM entities GROUP BY entity_type"
             )
             by_type = {r["entity_type"]: r["cnt"] for r in await cur.fetchall()}
-            return {"total": total, "by_type": by_type}
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM entities "
+                "WHERE metadata LIKE '%\"merged_from\"%'"
+            )
+            row = await cur.fetchone()
+            with_merged_from = row[0] if row else 0
+            return {
+                "total": total,
+                "by_type": by_type,
+                "with_merged_from": with_merged_from,
+            }
         except Exception:
             return {"error": "table_missing", "table": "entities"}
 
@@ -1448,10 +1622,23 @@ class HarnessServer:
         """
         import re as _re
 
-        # Default vault root: data dir's _KoraMemory.
-        # Real installs put it under ~/.kora/memory; tests can override.
+        # Default vault root: settings.memory.kora_memory_path (which
+        # resolves to ~/.kora/memory out of the box). Previously this
+        # hard-coded ``data/_KoraMemory`` so the acceptance report said
+        # "Vault not available" while working docs and bridges were
+        # being written under the real settings root.
         if vault_root is None:
-            vault_root = PROJECT_ROOT / "data" / "_KoraMemory"
+            if PROJECT_ROOT != _DEFAULT_PROJECT_ROOT:
+                vault_root = PROJECT_ROOT / "data" / "_KoraMemory"
+            else:
+                try:
+                    from kora_v2.core.settings import get_settings as _get_settings
+
+                    vault_root = Path(
+                        _get_settings().memory.kora_memory_path
+                    ).expanduser()
+                except Exception:  # noqa: BLE001
+                    vault_root = PROJECT_ROOT / "data" / "_KoraMemory"
 
         result: dict[str, Any] = {
             "root": str(vault_root),
@@ -1507,11 +1694,28 @@ class HarnessServer:
         pipeline_key_re = _re.compile(r"^pipeline\s*:\s*(.+)$", _re.MULTILINE)
         status_key_re = _re.compile(r"^status\s*:\s*(.+)$", _re.MULTILINE)
 
+        def _priority(path: Path) -> tuple[int, str]:
+            try:
+                rel = path.relative_to(vault_root)
+                parts = rel.parts
+            except ValueError:
+                return (99, str(path))
+            if parts[:1] == ("Entities",):
+                return (0, str(rel))
+            if parts[:1] == ("Sessions",):
+                return (1, str(rel))
+            if parts[:1] == ("Maps of Content",):
+                return (2, str(rel))
+            if parts[:1] == ("Inbox",):
+                return (3, str(rel))
+            return (10, str(rel))
+
+        paths = sorted(vault_root.rglob("*.md"), key=_priority)
         files_walked = 0
         max_files = 500
         truncated = False
 
-        for path in vault_root.rglob("*.md"):
+        for path in paths:
             if files_walked >= max_files:
                 truncated = True
                 break
@@ -1567,6 +1771,14 @@ class HarnessServer:
             if matches:
                 result["wikilink_density"]["notes_with_wikilinks"] += 1
                 result["wikilink_density"]["total_wikilinks"] += len(matches)
+
+        # The bounded content scan above protects huge user vaults, but
+        # coverage gates for Entities/Sessions/MOCs need folder counts
+        # that are not biased by traversal order or the 500-file cap.
+        for prefix, key in folder_map:
+            folder = vault_root / prefix
+            if folder.exists():
+                result["counts"][key] = sum(1 for _ in folder.rglob("*.md"))
 
         result["files_walked"] = files_walked
         result["truncated"] = truncated
@@ -2031,103 +2243,113 @@ class HarnessServer:
         deadline = start + timeout
         polls = 0
         errors = 0
+        disconnected_for_idle = await self._disconnect_for_idle()
 
-        # Snapshot autonomous state at start for delta calculation
-        initial_auto = await self._query_autonomous_state()
-        initial_items = initial_auto.get("total_items", 0)
-        initial_checkpoints = initial_auto.get("checkpoint_count", 0)
+        try:
+            # Give the daemon a moment to process WebSocket close and
+            # publish SESSION_END before measuring the idle soak.
+            if disconnected_for_idle:
+                await asyncio.sleep(1)
 
-        # AT3: capture the before-state for manifest evaluation (if asked).
-        before_state: dict[str, Any] | None = None
-        if manifest:
-            try:
-                before_state = await self._snapshot_full_state()
-            except Exception:
-                before_state = {}
+            # Snapshot autonomous state at start for delta calculation
+            initial_auto = await self._query_autonomous_state()
+            initial_items = initial_auto.get("total_items", 0)
+            initial_checkpoints = initial_auto.get("checkpoint_count", 0)
 
-        _update_monitor(
-            self._state,
-            f"idle-wait started: min_soak={min_soak}s timeout={timeout}s\n"
-            f"autonomous: items={initial_items} active_plans={initial_auto.get('active_plan_count', 0)} "
-            f"checkpoints={initial_checkpoints}",
-        )
+            # AT3: capture the before-state for manifest evaluation (if asked).
+            before_state: dict[str, Any] | None = None
+            if manifest:
+                try:
+                    before_state = await self._snapshot_full_state()
+                except Exception:
+                    before_state = {}
 
-        while time.monotonic() < deadline:
-            elapsed = time.monotonic() - start
-            # Poll every 5 seconds
-            await asyncio.sleep(5)
-            polls += 1
+            _update_monitor(
+                self._state,
+                f"idle-wait started: min_soak={min_soak}s timeout={timeout}s\n"
+                f"autonomous: items={initial_items} active_plans={initial_auto.get('active_plan_count', 0)} "
+                f"checkpoints={initial_checkpoints}",
+            )
 
-            # Check daemon health
-            is_healthy = await asyncio.get_event_loop().run_in_executor(None, self._check_health)
-            if not is_healthy:
-                errors += 1
-                _log_event({"event": "idle_health_fail", "elapsed": elapsed, "errors": errors})
-                _update_monitor(self._state, f"idle-wait: health check failed (error #{errors})")
-                if errors >= 3:
-                    return {
+            while time.monotonic() < deadline:
+                elapsed = time.monotonic() - start
+                # Poll every 5 seconds
+                await asyncio.sleep(5)
+                polls += 1
+
+                # Check daemon health
+                is_healthy = await asyncio.get_event_loop().run_in_executor(None, self._check_health)
+                if not is_healthy:
+                    errors += 1
+                    _log_event({"event": "idle_health_fail", "elapsed": elapsed, "errors": errors})
+                    _update_monitor(self._state, f"idle-wait: health check failed (error #{errors})")
+                    if errors >= 3:
+                        return {
+                            "elapsed": elapsed,
+                            "polls": polls,
+                            "errors": errors,
+                            "error": "Daemon became unhealthy during idle wait",
+                        }
+
+                # Check autonomous state every 3 polls (~15s)
+                if polls % 3 == 0:
+                    current_auto = await self._query_autonomous_state()
+                    current_items = current_auto.get("total_items", 0)
+                    current_checkpoints = current_auto.get("checkpoint_count", 0)
+                    active_plans = current_auto.get("active_plan_count", 0)
+                    _update_monitor(
+                        self._state,
+                        f"idle-wait: elapsed={elapsed:.0f}s polls={polls}\n"
+                        f"autonomous: items={current_items} (Δ{current_items - initial_items:+d}) "
+                        f"active_plans={active_plans} checkpoints={current_checkpoints}",
+                    )
+                    _log_event({
+                        "event": "idle_autonomous_check",
+                        "elapsed": elapsed,
+                        "items": current_items,
+                        "items_delta": current_items - initial_items,
+                        "active_plans": active_plans,
+                        "checkpoints": current_checkpoints,
+                        "checkpoints_delta": current_checkpoints - initial_checkpoints,
+                    })
+
+                if elapsed >= min_soak:
+                    current_auto = await self._query_autonomous_state()
+                    _update_monitor(self._state, f"idle-wait: complete after {elapsed:.0f}s")
+                    result: dict[str, Any] = {
                         "elapsed": elapsed,
                         "polls": polls,
                         "errors": errors,
-                        "error": "Daemon became unhealthy during idle wait",
+                        "quiescent": True,
+                        "autonomous_state": current_auto,
+                        "items_delta": current_auto.get("total_items", 0) - initial_items,
+                        "checkpoints_delta": current_auto.get("checkpoint_count", 0) - initial_checkpoints,
                     }
+                    if manifest:
+                        result["manifest"] = await self._eval_idle_manifest(
+                            manifest, before_state
+                        )
+                    return result
 
-            # Check autonomous state every 3 polls (~15s)
-            if polls % 3 == 0:
-                current_auto = await self._query_autonomous_state()
-                current_items = current_auto.get("total_items", 0)
-                current_checkpoints = current_auto.get("checkpoint_count", 0)
-                active_plans = current_auto.get("active_plan_count", 0)
-                _update_monitor(
-                    self._state,
-                    f"idle-wait: elapsed={elapsed:.0f}s polls={polls}\n"
-                    f"autonomous: items={current_items} (Δ{current_items - initial_items:+d}) "
-                    f"active_plans={active_plans} checkpoints={current_checkpoints}",
+            elapsed = time.monotonic() - start
+            current_auto = await self._query_autonomous_state()
+            result_timeout: dict[str, Any] = {
+                "elapsed": elapsed,
+                "polls": polls,
+                "errors": errors,
+                "timeout": True,
+                "autonomous_state": current_auto,
+                "items_delta": current_auto.get("total_items", 0) - initial_items,
+                "checkpoints_delta": current_auto.get("checkpoint_count", 0) - initial_checkpoints,
+            }
+            if manifest:
+                result_timeout["manifest"] = await self._eval_idle_manifest(
+                    manifest, before_state
                 )
-                _log_event({
-                    "event": "idle_autonomous_check",
-                    "elapsed": elapsed,
-                    "items": current_items,
-                    "items_delta": current_items - initial_items,
-                    "active_plans": active_plans,
-                    "checkpoints": current_checkpoints,
-                    "checkpoints_delta": current_checkpoints - initial_checkpoints,
-                })
-
-            if elapsed >= min_soak:
-                current_auto = await self._query_autonomous_state()
-                _update_monitor(self._state, f"idle-wait: complete after {elapsed:.0f}s")
-                result: dict[str, Any] = {
-                    "elapsed": elapsed,
-                    "polls": polls,
-                    "errors": errors,
-                    "quiescent": True,
-                    "autonomous_state": current_auto,
-                    "items_delta": current_auto.get("total_items", 0) - initial_items,
-                    "checkpoints_delta": current_auto.get("checkpoint_count", 0) - initial_checkpoints,
-                }
-                if manifest:
-                    result["manifest"] = await self._eval_idle_manifest(
-                        manifest, before_state
-                    )
-                return result
-
-        elapsed = time.monotonic() - start
-        current_auto = await self._query_autonomous_state()
-        result_timeout: dict[str, Any] = {
-            "elapsed": elapsed,
-            "polls": polls,
-            "errors": errors,
-            "timeout": True,
-            "autonomous_state": current_auto,
-            "items_delta": current_auto.get("total_items", 0) - initial_items,
-            "checkpoints_delta": current_auto.get("checkpoint_count", 0) - initial_checkpoints,
-        }
-        if manifest:
-            result_timeout["manifest"] = await self._eval_idle_manifest(
-                manifest, before_state
-            )
-        return result_timeout
+            return result_timeout
+        finally:
+            if disconnected_for_idle:
+                await self._reconnect_after_idle()
 
     async def _eval_idle_manifest(
         self, manifest_name: str, before_state: dict[str, Any] | None,
@@ -2173,13 +2395,70 @@ class HarnessServer:
         self._state["simulated_hours_offset"] = (
             self._state.get("simulated_hours_offset", 0) + hours
         )
+        adjusted: dict[str, int] = {}
+        db_path = PROJECT_ROOT / "data" / "operational.db"
+        if db_path.exists():
+            try:
+                import aiosqlite
+
+                delta = timedelta(hours=float(hours))
+
+                def shift_iso(value: str | None) -> str | None:
+                    if not value:
+                        return value
+                    try:
+                        parsed = datetime.fromisoformat(
+                            str(value).replace("Z", "+00:00")
+                        )
+                    except (TypeError, ValueError):
+                        return value
+                    return (parsed - delta).isoformat()
+
+                async with aiosqlite.connect(str(db_path)) as db:
+                    db.row_factory = aiosqlite.Row
+                    try:
+                        cur = await db.execute(
+                            "SELECT id, due_at FROM reminders "
+                            "WHERE status != 'delivered' AND due_at IS NOT NULL"
+                        )
+                        rows = await cur.fetchall()
+                        for row in rows:
+                            await db.execute(
+                                "UPDATE reminders SET due_at=? WHERE id=?",
+                                (shift_iso(row["due_at"]), row["id"]),
+                            )
+                        adjusted["reminders"] = len(rows)
+                    except Exception:
+                        adjusted["reminders"] = 0
+                    try:
+                        cur = await db.execute(
+                            "SELECT id, posed_at FROM open_decisions "
+                            "WHERE status='open'"
+                        )
+                        rows = await cur.fetchall()
+                        for row in rows:
+                            await db.execute(
+                                "UPDATE open_decisions SET posed_at=? WHERE id=?",
+                                (shift_iso(row["posed_at"]), row["id"]),
+                            )
+                        adjusted["open_decisions"] = len(rows)
+                    except Exception:
+                        adjusted["open_decisions"] = 0
+                    await db.commit()
+            except Exception:
+                adjusted["error"] = 1
         _save_session(self._state)
-        _log_event({"event": "time_advance", "hours": hours,
-                    "total_offset": self._state["simulated_hours_offset"]})
+        _log_event({
+            "event": "time_advance",
+            "hours": hours,
+            "total_offset": self._state["simulated_hours_offset"],
+            "adjusted": adjusted,
+        })
         _update_monitor(self._state)
         return {
             "hours_advanced": hours,
             "total_offset": self._state["simulated_hours_offset"],
+            "adjusted": adjusted,
         }
 
     async def cmd_monitor(self) -> dict[str, Any]:
@@ -2196,13 +2475,172 @@ class HarnessServer:
         were never serialized into session_state.
         """
         from tests.acceptance._report import build_report
+        finalization = await self._drain_report_finalization()
         path = await build_report(
             self._state,
             SNAPSHOTS_DIR,
             OUTPUT_DIR,
             compaction_events=list(self._compaction_events),
         )
-        return {"path": str(path)}
+        return {"path": str(path), "finalization": finalization}
+
+    async def _drain_report_finalization(self) -> dict[str, Any]:
+        """Give protected memory/vault pipelines a bounded chance to finish.
+
+        Normal background services may remain slow; this is only the
+        acceptance report boundary, where the harness needs to avoid
+        snapshotting immediately after it caused a SESSION_END memory pass.
+        """
+        timeout = float(os.environ.get("KORA_ACCEPTANCE_FINAL_DRAIN_SECONDS", "120"))
+        timeout = max(0.0, min(timeout, 180.0))
+        started = datetime.now(UTC)
+        disconnected = False
+        if timeout <= 0:
+            return {"status": "skipped", "timeout_s": timeout}
+
+        try:
+            disconnected = await self._disconnect_for_idle()
+        except Exception as exc:  # noqa: BLE001
+            _log_event({"event": "report_finalization_disconnect_failed", "error": str(exc)})
+
+        deadline = time.monotonic() + timeout
+        quiet_polls = 0
+        last_state: dict[str, Any] = {}
+
+        while time.monotonic() < deadline:
+            last_state = await self._query_protected_finalization_state(started)
+            active = int(last_state.get("active_count", 0) or 0)
+            if active == 0:
+                quiet_polls += 1
+                if quiet_polls >= 2:
+                    status = "drained"
+                    break
+            else:
+                quiet_polls = 0
+            _update_monitor(
+                self._state,
+                "report finalization drain: "
+                f"active protected pipelines={active}",
+            )
+            await asyncio.sleep(2.0)
+        else:
+            status = "timeout"
+
+        if disconnected:
+            try:
+                await self._reconnect_after_idle()
+            except Exception as exc:  # noqa: BLE001
+                _log_event({"event": "report_finalization_reconnect_failed", "error": str(exc)})
+            else:
+                # Reconnecting can flush SESSION_END / sequence-complete work
+                # that was queued while the harness was disconnected. Take a
+                # second quiet pass so the report does not snapshot the narrow
+                # gap before those protected pipelines appear in the DB.
+                post_reconnect_quiet = 0
+                while time.monotonic() < deadline:
+                    last_state = await self._query_protected_finalization_state(
+                        started
+                    )
+                    active = int(last_state.get("active_count", 0) or 0)
+                    if active == 0:
+                        post_reconnect_quiet += 1
+                        if post_reconnect_quiet >= 3:
+                            break
+                    else:
+                        post_reconnect_quiet = 0
+                    _update_monitor(
+                        self._state,
+                        "report finalization post-reconnect drain: "
+                        f"active protected pipelines={active}",
+                    )
+                    await asyncio.sleep(2.0)
+
+        elapsed = (datetime.now(UTC) - started).total_seconds()
+        result = {
+            "status": status,
+            "elapsed_s": elapsed,
+            "timeout_s": timeout,
+            "disconnected_for_idle": disconnected,
+            **last_state,
+        }
+        _log_event({"event": "report_finalization_drain", **result})
+        return result
+
+    @staticmethod
+    async def _query_protected_finalization_state(
+        since: datetime,
+    ) -> dict[str, Any]:
+        op_db = PROJECT_ROOT / "data" / "operational.db"
+        if not op_db.exists():
+            return {"active_count": 0, "error": "operational_db_missing"}
+        try:
+            import aiosqlite
+        except ImportError:
+            return {"active_count": 0, "error": "aiosqlite_missing"}
+
+        names = ("post_session_memory", "post_memory_vault")
+        active_states = ("pending", "running", "paused")
+        task_active_states = (
+            "pending",
+            "running",
+            "checkpointing",
+            "paused_for_state",
+            "paused_for_rate_limit",
+            "paused_for_dependency",
+        )
+        try:
+            async with aiosqlite.connect(str(op_db)) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    f"""
+                    SELECT id, pipeline_name, state, started_at, updated_at,
+                           completed_at, completion_reason
+                    FROM pipeline_instances
+                    WHERE pipeline_name IN ({",".join("?" for _ in names)})
+                      AND state IN ({",".join("?" for _ in active_states)})
+                    ORDER BY started_at DESC
+                    """,
+                    (*names, *active_states),
+                )
+                active = [dict(r) for r in await cur.fetchall()]
+
+                cur = await db.execute(
+                    f"""
+                    SELECT wt.id, wt.pipeline_instance_id, pi.pipeline_name,
+                           wt.stage_name, wt.state, wt.result_summary,
+                           wt.error_message, wt.created_at, wt.last_step_at
+                    FROM worker_tasks wt
+                    JOIN pipeline_instances pi ON pi.id = wt.pipeline_instance_id
+                    WHERE pi.pipeline_name IN ({",".join("?" for _ in names)})
+                      AND wt.state IN ({",".join("?" for _ in task_active_states)})
+                    ORDER BY wt.created_at DESC
+                    LIMIT 20
+                    """,
+                    (*names, *task_active_states),
+                )
+                active_tasks = [dict(r) for r in await cur.fetchall()]
+
+                cur = await db.execute(
+                    f"""
+                    SELECT pipeline_name, COUNT(*) AS cnt
+                    FROM pipeline_instances
+                    WHERE pipeline_name IN ({",".join("?" for _ in names)})
+                      AND state='completed'
+                      AND completed_at >= ?
+                    GROUP BY pipeline_name
+                    """,
+                    (*names, since.isoformat()),
+                )
+                completed_since = {r["pipeline_name"]: r["cnt"] for r in await cur.fetchall()}
+        except Exception as exc:  # noqa: BLE001
+            return {"active_count": 0, "error": str(exc)}
+
+        return {
+            "active_count": len(active),
+            "active": active,
+            "active_tasks": active_tasks,
+            "completed_since": completed_since,
+        }
 
     async def cmd_test_auth(self) -> dict[str, Any]:
         """Enable auth test mode: deny first request, approve all subsequent."""
@@ -2223,8 +2661,60 @@ class HarnessServer:
         """Run error recovery tests: send malformed inputs, verify session survives."""
         results = []
 
+        async def _raw_ws_probe(test_name: str, payload: str) -> None:
+            if not await self._ensure_ws_connected():
+                results.append({
+                    "test": test_name,
+                    "survived": False,
+                    "error": "Cannot connect to Kora daemon",
+                })
+                return
+            if self._busy:
+                results.append({
+                    "test": test_name,
+                    "survived": False,
+                    "error": "Harness is busy with another request",
+                })
+                return
+            self._busy = True
+            self._response_data = {"tokens": [], "tool_calls": []}
+            self._response_ready = asyncio.Event()
+            try:
+                await self._ws.send(payload)
+                try:
+                    await asyncio.wait_for(self._response_ready.wait(), timeout=20.0)
+                except TimeoutError:
+                    results.append({
+                        "test": test_name,
+                        "survived": False,
+                        "error": "No graceful error response",
+                    })
+                    return
+                error = self._response_data.get("error")
+                results.append({
+                    "test": test_name,
+                    "survived": bool(error),
+                    "response": error or "(no error frame)",
+                    "error": None if error else "missing error frame",
+                })
+            except Exception as e:
+                results.append({
+                    "test": test_name,
+                    "survived": False,
+                    "error": str(e),
+                })
+            finally:
+                self._busy = False
+                self._response_data = None
+                self._response_ready = None
+
+        await _raw_ws_probe("malformed_json_frame", "{not valid json")
+        await _raw_ws_probe(
+            "empty_chat_content",
+            json.dumps({"type": "chat", "content": ""}),
+        )
+
         test_cases = [
-            ("empty_message", ""),
             ("special_chars", "!@#$%^&*(){}[]|\\/<>?~`"),
             ("long_message", "test " * 500),
             ("unicode", "\u00e9\u00e8\u00ea \U0001F680\U0001F31F \u4f60\u597d\u4e16\u754c"),
@@ -2250,6 +2740,13 @@ class HarnessServer:
                 })
 
         all_survived = all(r.get("survived", False) for r in results)
+        self._state["error_recovery_results"] = results
+        _save_session(self._state)
+        _log_event({
+            "event": "error_recovery_complete",
+            "all_survived": all_survived,
+            "results": results,
+        })
         return {"results": results, "all_survived": all_survived}
 
     async def cmd_compaction_status(self) -> dict[str, Any]:
@@ -2259,6 +2756,42 @@ class HarnessServer:
             "event_count": len(self._compaction_events),
             "events": self._compaction_events,
         }
+
+    async def cmd_skill_gating_check(self) -> dict[str, Any]:
+        """Verify representative prompts activate distinct skill/tool sets."""
+        try:
+            from kora_v2.graph.supervisor import _infer_active_skills
+            from kora_v2.skills.loader import SkillLoader
+
+            loader = SkillLoader()
+            loader.load_all()
+            cases = {
+                "life": "I just took my adderall and need a lunch reminder",
+                "code": "Fix the failing python test in this repo",
+                "web": "Research the latest local-first privacy tools",
+            }
+            results: dict[str, Any] = {}
+            for name, text in cases.items():
+                skills = _infer_active_skills(text, loader)
+                tools = loader.get_active_tools(skills)
+                results[name] = {"skills": skills, "tools": tools}
+
+            passed = (
+                "life_management" in results["life"]["skills"]
+                and "code_work" not in results["life"]["skills"]
+                and "web_research" not in results["life"]["skills"]
+                and "code_work" in results["code"]["skills"]
+                and "life_management" not in results["code"]["skills"]
+                and "web_research" in results["web"]["skills"]
+                and "life_management" not in results["web"]["skills"]
+            )
+            out = {"passed": passed, "cases": results}
+            self._state["skill_gating_check"] = out
+            _save_session(self._state)
+            _log_event({"event": "skill_gating_check", **out})
+            return out
+        except Exception as exc:
+            return {"passed": False, "error": str(exc)}
 
     async def cmd_life_management_check(self) -> dict[str, Any]:
         """Query life management DB tables."""
@@ -2531,6 +3064,92 @@ class HarnessServer:
             "working_docs": state.get("working_docs", []),
             "count": len(state.get("working_docs", [])),
         }
+
+    async def cmd_edit_working_doc(
+        self,
+        text: str = "user-added acceptance plan item",
+    ) -> dict[str, Any]:
+        """Append an unchecked Current Plan item to the newest live working doc."""
+        state = await self._query_vault_state()
+        docs = [
+            d for d in state.get("working_docs", [])
+            if str(d.get("status") or "").strip() not in {
+                "done", "failed", "cancelled",
+            }
+        ]
+        if not docs:
+            return {"ok": False, "error": "no active working docs"}
+        user_docs = [
+            d for d in docs
+            if str(d.get("pipeline_name") or "") not in {
+                "anticipatory_prep",
+                "commitment_tracking",
+                "connection_making",
+                "contextual_engagement",
+                "continuity_check",
+                "post_memory_vault",
+                "post_session_memory",
+                "proactive_pattern_scan",
+                "routine_morning_launch",
+                "session_bridge_pruning",
+                "skill_refinement",
+                "stuck_detection",
+                "wake_up_preparation",
+                "weekly_adhd_profile",
+            }
+        ]
+        if user_docs:
+            docs = user_docs
+        docs.sort(key=lambda d: str(d.get("mtime") or ""), reverse=True)
+        path = Path(str(docs[0].get("path")))
+        item_text = str(text).strip() or "user-added acceptance plan item"
+        try:
+            content = path.read_text(encoding="utf-8")
+            line = f"- [ ] {item_text}"
+            if line in content:
+                return {
+                    "ok": True,
+                    "path": str(path),
+                    "added": False,
+                    "text": item_text,
+                }
+            lines = content.splitlines()
+            insert_at: int | None = None
+            for idx, existing in enumerate(lines):
+                if existing.strip() != "# Current Plan":
+                    continue
+                insert_at = len(lines)
+                for next_idx in range(idx + 1, len(lines)):
+                    if (
+                        lines[next_idx].startswith("# ")
+                        and lines[next_idx].strip() != "# Current Plan"
+                    ):
+                        insert_at = next_idx
+                        break
+                break
+            if insert_at is None:
+                if lines and lines[-1].strip():
+                    lines.append("")
+                lines.extend(["# Current Plan", line])
+            else:
+                if insert_at > 0 and lines[insert_at - 1].strip():
+                    lines.insert(insert_at, line)
+                else:
+                    lines.insert(insert_at, line)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            _log_event({
+                "event": "working_doc_edited",
+                "path": str(path),
+                "text": item_text,
+            })
+            return {
+                "ok": True,
+                "path": str(path),
+                "added": True,
+                "text": item_text,
+            }
+        except Exception as exc:
+            return {"ok": False, "path": str(path), "error": str(exc)}
 
     async def cmd_notifications(self, limit: int = 20) -> dict[str, Any]:
         """Return recent notifications with tier and reason."""
@@ -2872,6 +3491,8 @@ class HarnessServer:
                 result = await self.cmd_test_error()
             elif cmd == "compaction-status":
                 result = await self.cmd_compaction_status()
+            elif cmd == "skill-gating-check":
+                result = await self.cmd_skill_gating_check()
             elif cmd == "life-management-check":
                 result = await self.cmd_life_management_check()
             elif cmd == "tool-usage-summary":
@@ -2890,6 +3511,13 @@ class HarnessServer:
                 )
             elif cmd == "working-docs":
                 result = await self.cmd_working_docs()
+            elif cmd == "edit-working-doc":
+                result = await self.cmd_edit_working_doc(
+                    text=str(
+                        request.get("text")
+                        or "user-added acceptance plan item"
+                    )
+                )
             elif cmd == "notifications":
                 result = await self.cmd_notifications(
                     limit=int(request.get("limit", 20)),
@@ -2960,9 +3588,17 @@ class HarnessServer:
         """Start the Unix socket server and WebSocket recv loop."""
         _ensure_dirs()
 
-        # Clean stale data from previous test runs (legacy autonomous +
-        # Phase 7.5 orchestration + Phase 8 lifecycle tables)
-        await _clean_stale_test_data(PROJECT_ROOT / "data" / "operational.db")
+        # Only a fresh run should wipe operational state. A harness
+        # restart during the same acceptance session (e.g. the restart
+        # resilience phase) must preserve the live conversation and
+        # orchestration state so the reconnect can verify continuity.
+        if (
+            os.environ.get("KORA_ACCEPTANCE_PRE_CLEANED") != "1"
+            and not self._state.get("messages")
+        ):
+            _reset_daemon_runtime_files(PROJECT_ROOT / "data")
+            await _clean_stale_test_data(PROJECT_ROOT / "data" / "operational.db")
+            _clean_stale_projection_data(PROJECT_ROOT / "data" / "projection.db")
 
         # Remove stale socket
         if HARNESS_SOCK.exists():
@@ -2987,7 +3623,10 @@ class HarnessServer:
 
         self._running = True
         self._shutdown_event = asyncio.Event()
-        self._state["started_at"] = datetime.now(UTC).isoformat()
+        now_iso = datetime.now(UTC).isoformat()
+        if not self._state.get("started_at"):
+            self._state["started_at"] = now_iso
+        self._state["harness_started_at"] = now_iso
         _save_session(self._state)
         _update_monitor(self._state, "Harness server started")
 

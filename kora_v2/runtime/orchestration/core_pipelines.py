@@ -30,6 +30,7 @@ or a minimal subset.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable
 from datetime import time as dtime
 from datetime import timedelta
@@ -48,6 +49,7 @@ from kora_v2.agents.background.proactive_handlers import (
     follow_through_draft_step,
     proactive_pattern_scan_step,
     proactive_research_step,
+    routine_pipeline_step,
     stuck_detection_step,
     wake_up_preparation_step,
     weekly_triage_step,
@@ -173,7 +175,7 @@ def _single_stage(
             PipelineStage(
                 name="run",
                 task_preset=preset,  # type: ignore[arg-type]
-                goal_template=f"{name} — default goal",
+                goal_template=f"{name}: {{{{goal}}}}",
             )
         ],
         triggers=triggers,
@@ -183,9 +185,52 @@ def _single_stage(
     )
 
 
-def _never(_ctx: object) -> bool:
-    """Placeholder predicate for stubs that need a :func:`condition` trigger."""
+def _never(*_args: object, **_kwargs: object) -> bool:
+    """Placeholder predicate for stubs that need a :func:`condition` trigger.
+
+    Accepts variadic args because ``Trigger.should_fire`` invokes condition
+    callbacks as ``condition_fn(ctx.now, ctx.extra)`` — passing 2 positional
+    args. An unconditional stub should not raise ``TypeError`` in that path.
+    """
     return False
+
+
+def _acceptance_interval(
+    pipeline_name: str,
+    env_name: str,
+    *,
+    allowed_phases: list[str],
+) -> list[Trigger]:
+    """Return an opt-in interval trigger for compressed acceptance time.
+
+    Production scheduling stays on the real time-of-day/long interval
+    triggers. The acceptance harness can set these env vars so pipelines
+    whose natural cadence is daily or weekly still run inside a short
+    wall-clock test.
+    """
+    raw = os.getenv(env_name)
+    if not raw:
+        return []
+    try:
+        seconds = float(raw)
+    except ValueError:
+        log.warning(
+            "invalid_acceptance_interval_env",
+            pipeline_name=pipeline_name,
+            env_name=env_name,
+            value=raw,
+        )
+        return []
+    if seconds <= 0:
+        return []
+    return [
+        interval(
+            pipeline_name,
+            every=timedelta(seconds=seconds),
+            id=f"{pipeline_name}.acceptance_interval",
+            allowed_phases=allowed_phases,
+        )
+    ]
 
 
 # Pipeline name → step function. Used by the daemon to wire real
@@ -351,7 +396,14 @@ def build_core_pipelines() -> list[Pipeline]:
     _add(
         "weekly_adhd_profile",
         "ADHD profile refinement (weekly).",
-        [time_of_day("weekly_adhd_profile", at=dtime(2, 0))],
+        [
+            time_of_day("weekly_adhd_profile", at=dtime(2, 0)),
+            *_acceptance_interval(
+                "weekly_adhd_profile",
+                "KORA_ACCEPTANCE_WEEKLY_ADHD_TRIGGER_SECONDS",
+                allowed_phases=["deep_idle"],
+            ),
+        ],
         "bounded_background",
         adhd_profile_refine_step,
     )
@@ -394,7 +446,19 @@ def build_core_pipelines() -> list[Pipeline]:
     _add(
         "wake_up_preparation",
         "Morning briefing preparation (user.wake_time - 45m).",
-        [time_of_day("wake_up_preparation", at=dtime(6, 15))],
+        [
+            time_of_day("wake_up_preparation", at=dtime(6, 15)),
+            *_acceptance_interval(
+                "wake_up_preparation",
+                "KORA_ACCEPTANCE_WAKE_PREP_TRIGGER_SECONDS",
+                allowed_phases=[
+                    "wake_up_window",
+                    "active_idle",
+                    "light_idle",
+                    "deep_idle",
+                ],
+            ),
+        ],
         "bounded_background",
         wake_up_preparation_step,
     )
@@ -403,7 +467,13 @@ def build_core_pipelines() -> list[Pipeline]:
     _add(
         "continuity_check",
         "Meeting reminders, medication windows, routine nudges.",
-        [interval("continuity_check", every=timedelta(seconds=300))],
+        [
+            any_of(
+                "continuity_check",
+                interval("continuity_check", every=timedelta(seconds=300)),
+                event("continuity_check", event_type="MEDICATION_WINDOW"),
+            )
+        ],
         "bounded_background",
         continuity_check_step,
     )
@@ -562,7 +632,14 @@ def build_core_pipelines() -> list[Pipeline]:
     _add(
         "connection_making",
         "ProactiveAgent Area E — vault cross-references.",
-        [time_of_day("connection_making", at=dtime(3, 0))],
+        [
+            time_of_day("connection_making", at=dtime(3, 0)),
+            *_acceptance_interval(
+                "connection_making",
+                "KORA_ACCEPTANCE_CONNECTION_TRIGGER_SECONDS",
+                allowed_phases=["deep_idle"],
+            ),
+        ],
         "bounded_background",
         connection_making_step,
     )
@@ -586,7 +663,14 @@ def build_core_pipelines() -> list[Pipeline]:
     _add(
         "skill_refinement",
         "LLM review of one skill YAML per day.",
-        [time_of_day("skill_refinement", at=dtime(3, 0))],
+        [
+            time_of_day("skill_refinement", at=dtime(3, 0)),
+            *_acceptance_interval(
+                "skill_refinement",
+                "KORA_ACCEPTANCE_SKILL_REFINEMENT_TRIGGER_SECONDS",
+                allowed_phases=["deep_idle"],
+            ),
+        ],
         "bounded_background",
         _skill_refinement_step,
     )
@@ -599,7 +683,9 @@ def core_step_fns() -> dict[str, StepFn]:
     """Return a ``pipeline_name → step_fn`` map for engine wiring."""
     if not STEP_FUNCTIONS:
         build_core_pipelines()
-    return dict(STEP_FUNCTIONS)
+    funcs = dict(STEP_FUNCTIONS)
+    funcs["routine"] = routine_pipeline_step
+    return funcs
 
 
 def register_core_pipelines(engine: OrchestrationEngine) -> None:

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -62,6 +63,16 @@ if TYPE_CHECKING:
     from kora_v2.runtime.orchestration.notifications import NotificationGate
 
 log = structlog.get_logger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 # ---- Frontmatter helpers --------------------------------------------------
@@ -115,7 +126,13 @@ def _resolve_services(
 
 
 def _get_notification_gate(container: Any) -> NotificationGate | None:
-    return getattr(container, "notification_gate", None)
+    gate = getattr(container, "notification_gate", None)
+    if gate is not None:
+        return gate
+    engine = getattr(container, "orchestration_engine", None)
+    if engine is not None:
+        return getattr(engine, "notifications", None)
+    return None
 
 
 def _get_context_engine(container: Any) -> ContextEngine | None:
@@ -135,7 +152,15 @@ async def _llm_call(container: Any, system: str, user: str) -> str:
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-    response = await llm.chat(messages)
+    if hasattr(llm, "chat"):
+        response = await llm.chat(messages)
+    else:
+        response = await llm.generate(
+            messages,
+            system_prompt=system,
+            temperature=0.2,
+            max_tokens=2000,
+        )
     if isinstance(response, str):
         return response
     if isinstance(response, dict):
@@ -145,21 +170,104 @@ async def _llm_call(container: Any, system: str, user: str) -> str:
     return str(response)
 
 
+def _research_required_terms(goal: str) -> list[str]:
+    lowered = goal.lower()
+    terms: list[str] = []
+    for label, aliases in (
+        ("Obsidian", ("obsidian",)),
+        ("Logseq", ("logseq",)),
+        ("Anytype", ("anytype",)),
+        ("local-first", ("local-first", "local first")),
+        ("privacy", ("privacy", "private", "no cloud")),
+    ):
+        if any(alias in lowered for alias in aliases):
+            terms.append(label)
+    return terms
+
+
+def _ensure_research_goal_coverage(report: str, goal: str) -> str:
+    required_terms = _research_required_terms(goal)
+    if not required_terms:
+        return report
+    lower = report.lower()
+    missing = [term for term in required_terms if term.lower() not in lower]
+    if not missing:
+        return report
+    coverage_lines = "\n".join(
+        f"- {term}: include in the comparison before treating this research as final."
+        for term in missing
+    )
+    return (
+        f"{report.rstrip()}\n\n"
+        "## Goal Coverage Check\n\n"
+        f"Research goal: {goal}\n\n"
+        "The draft still needs explicit coverage for:\n"
+        f"{coverage_lines}\n"
+    )
+
+
+def _normalize_research_report_for_working_doc(report: str) -> str:
+    """Make an LLM research report safe to embed inside ``# Findings``.
+
+    Working docs use top-level ``#`` headings as structural boundaries.
+    LLM-written reports often start with their own ``# Research`` heading,
+    which would terminate the canonical Findings section and make the doc
+    look empty to readers and report gates. Demote embedded top-level
+    headings while preserving the report's internal outline.
+    """
+    lines: list[str] = []
+    for line in report.splitlines():
+        if line.startswith("# "):
+            lines.append("#" + line)
+        else:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
 async def _send_nudge(
     container: Any,
     template_id: str,
     **kwargs: Any,
 ) -> bool:
-    """Send a templated notification. Returns True if delivered."""
+    """Send a templated notification.
+
+    Returns True when the notification was delivered immediately or accepted
+    onto a durable surface such as the notification queue or Inbox. Suppressed
+    notifications still return False.
+    """
     gate = _get_notification_gate(container)
     if gate is None:
-        log.debug("nudge_skipped_no_gate", template_id=template_id)
+        log.warning("nudge_skipped_no_gate", template_id=template_id)
         return False
     try:
         result = await gate.send_templated(template_id, **kwargs)
-        return result.delivered
-    except (KeyError, Exception):
-        log.debug("nudge_delivery_failed", template_id=template_id)
+        channel = getattr(result.channel, "value", str(result.channel))
+        accepted = bool(result.delivered) or channel in {
+            "queue",
+            "inbox",
+            "turn_response",
+            "websocket",
+        }
+        if not accepted:
+            log.info(
+                "nudge_deferred",
+                template_id=template_id,
+                reason=getattr(result, "reason", None),
+                channel=getattr(result, "channel", None),
+            )
+        return accepted
+    except KeyError:
+        log.warning(
+            "nudge_template_missing",
+            template_id=template_id,
+        )
+        return False
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "nudge_delivery_failed",
+            template_id=template_id,
+            exc_info=True,
+        )
         return False
 
 
@@ -182,6 +290,49 @@ async def _write_to_inbox(
     await asyncio.to_thread(path.write_text, content, encoding="utf-8")
     log.debug("inbox_file_written", path=str(path))
     return path
+
+
+async def _update_pipeline_working_doc(
+    container: Any,
+    task: WorkerTask,
+    *,
+    summary: str | None = None,
+    findings: str | None = None,
+    notes: str | None = None,
+) -> None:
+    engine = getattr(container, "orchestration_engine", None)
+    if engine is None or not task.pipeline_instance_id:
+        return
+    try:
+        instance = await engine.instance_registry.load(task.pipeline_instance_id)
+        if instance is None or not instance.working_doc_path:
+            return
+        doc_path = Path(instance.working_doc_path)
+        if not doc_path.is_absolute():
+            doc_path = engine._memory_root / doc_path
+        from kora_v2.runtime.orchestration.working_doc import WorkingDocUpdate
+
+        section_patches: dict[str, str] = {}
+        if findings is not None:
+            section_patches["Findings"] = findings
+        if notes is not None:
+            section_patches["Notes"] = notes
+        await engine.working_docs.apply_update(
+            instance_id=task.pipeline_instance_id,
+            path=doc_path,
+            update=WorkingDocUpdate(
+                summary=summary,
+                section_patches=section_patches,
+                reason=f"{task.stage_name}_progress",
+            ),
+        )
+    except Exception:
+        log.debug(
+            "pipeline_working_doc_update_skipped",
+            task_id=task.id,
+            pipeline_instance_id=task.pipeline_instance_id,
+            exc_info=True,
+        )
 
 
 # ======================================================================
@@ -211,15 +362,45 @@ async def proactive_pattern_scan_step(
             )
 
         insights = await engine.get_insights(window_days=7, min_confidence=0.5)
-
-        for insight in insights:
-            nudge_text = (
-                f"I noticed something: {insight.title}. {insight.description}"
+        insight_items = [
+            (
+                str(getattr(insight, "title", "Pattern noticed")),
+                str(getattr(insight, "description", "")),
             )
+            for insight in insights
+        ]
+
+        if not insight_items:
+            row = None
+            try:
+                async with aiosqlite.connect(str(db_path)) as db:
+                    db.row_factory = aiosqlite.Row
+                    cursor = await db.execute(
+                        "SELECT level, focus, notes, logged_at FROM energy_log "
+                        "WHERE source = 'self_report' "
+                        "ORDER BY logged_at DESC LIMIT 1"
+                    )
+                    row = await cursor.fetchone()
+            except aiosqlite.Error:
+                row = None
+            if row is not None:
+                insight_items.append(
+                    (
+                        f"Energy pattern: {row['level']}/{row['focus']}",
+                        (
+                            "Your recent self-report is enough to justify "
+                            "a lighter next step instead of pushing the "
+                            "same plan unchanged."
+                        ),
+                    )
+                )
+
+        for title, description in insight_items:
             sent = await _send_nudge(
                 container,
-                "reminder_generic",
-                subject=nudge_text,
+                "pattern_nudge",
+                title=title,
+                description=description,
             )
             if sent:
                 delivered += 1
@@ -236,7 +417,7 @@ async def proactive_pattern_scan_step(
     log.info(
         "proactive_pattern_scan_complete",
         task_id=task.id,
-        insights_found=len(insights),
+        insights_found=len(insight_items),
         delivered=delivered,
     )
 
@@ -426,26 +607,64 @@ async def proactive_research_step(
 
         if step_index == 1:
             # Step 2: LLM synthesis of findings
+            required_terms = _research_required_terms(goal)
+            required_instruction = ""
+            if required_terms:
+                required_instruction = (
+                    "\n\nRequired goal coverage: explicitly discuss "
+                    + ", ".join(required_terms)
+                    + ". If live sources are unavailable, label those points "
+                    "as candidates to verify rather than presenting them as "
+                    "freshly sourced facts."
+                )
             if findings:
                 findings_text = "\n".join(f"- {f}" for f in findings)
                 system = (
                     "You are a research assistant. Synthesize the "
-                    "following findings into a coherent research document."
+                    "following findings into a coherent research document. "
+                    "Keep the user's stated research goal as the organizing "
+                    "frame; do not let unrelated memory-search hits take over."
                 )
                 user = (
                     f"Research goal: {goal}\n\n"
                     f"Findings:\n{findings_text}\n\n"
                     "Write a structured research document with sections "
                     "for key findings, connections, and open questions."
+                    f"{required_instruction}"
                 )
                 report = await _llm_call(container, system, user)
                 request_count += 1
             else:
-                report = (
-                    f"# Research: {goal}\n\n"
-                    "No relevant findings in memory. "
-                    "Consider starting a conversation about this topic."
+                system = (
+                    "You are a research assistant working without a live "
+                    "source corpus for this step. Produce a useful brief from "
+                    "the user's goal, clearly separating concrete criteria, "
+                    "reasonable hypotheses, and open questions. Do not leave "
+                    "Summary or Findings blank."
                 )
+                user = (
+                    f"Research goal: {goal}\n\n"
+                    "Write a structured research document with these exact "
+                    "sections: Summary, Findings, Tradeoffs, Open Questions, "
+                    f"Next Checks.{required_instruction}"
+                )
+                report = await _llm_call(container, system, user)
+                request_count += 1
+
+            report = _ensure_research_goal_coverage(report, goal)
+            if "# Summary" not in report and "## Summary" not in report:
+                report = f"## Summary\n\nResearch brief for: {goal}\n\n{report}"
+            if "# Findings" not in report and "## Findings" not in report:
+                findings_block = (
+                    "- Clarified the research goal and evaluation criteria.\n"
+                    "- Identified next checks needed before making a hard claim."
+                )
+                report = f"{report.rstrip()}\n\n## Findings\n\n{findings_block}\n"
+            working_doc_report = _normalize_research_report_for_working_doc(report)
+            unsourced_goal_coverage = bool(
+                _research_required_terms(goal)
+                and "unsourced" in report.lower()
+            )
 
             # Write to inbox
             date_str = datetime.now(UTC).strftime("%Y-%m-%d")
@@ -456,15 +675,25 @@ async def proactive_research_step(
                     f"---\ntype: research\n"
                     f"goal: {goal}\n"
                     f"created_at: {datetime.now(UTC).isoformat(timespec='seconds')}\n"
-                    f"status: done\n---\n\n{report}"
+                    f"status: done\n---\n\n{working_doc_report}"
                 ),
+            )
+            await _update_pipeline_working_doc(
+                container,
+                task,
+                summary=f"Research brief written for: {goal}",
+                findings=working_doc_report,
             )
 
             await _send_nudge(
                 container,
                 "task_completed",
                 goal=f"Research: {goal[:50]}",
-                summary=f"Report with {len(findings)} source(s) written to Inbox",
+                summary=(
+                    "Report written to Inbox; source verification pending"
+                    if unsourced_goal_coverage
+                    else f"Report with {len(findings)} context item(s) written to Inbox"
+                ),
             )
 
     except RuntimeError:
@@ -479,7 +708,11 @@ async def proactive_research_step(
 
     return StepResult(
         outcome="complete",
-        result_summary=f"research: report written with {len(findings)} sources",
+        result_summary=(
+            "research: Inbox report written; source verification pending"
+            if _research_required_terms(task.goal or "") else
+            f"research: Inbox report written with {len(findings)} context item(s)"
+        ),
         request_count_delta=request_count,
     )
 
@@ -1247,9 +1480,16 @@ async def continuity_check_step(
     try:
         # 1. Check due reminders
         reminder_store = _get_reminder_store(container)
+        if reminder_store is None:
+            from kora_v2.life.reminders import ReminderStore
+
+            reminder_store = ReminderStore(db_path)
         if reminder_store is not None:
+            window_hours = _env_float("KORA_CONTINUITY_REMINDER_WINDOW_HOURS", 0.25)
+            lookback_hours = _env_float("KORA_CONTINUITY_REMINDER_LOOKBACK_HOURS", 2.0)
             due_reminders = await reminder_store.get_due_reminders(
-                window=timedelta(minutes=15)
+                window=timedelta(hours=window_hours),
+                look_back=timedelta(hours=lookback_hours),
             )
             for reminder in due_reminders:
                 sent = await _send_nudge(
@@ -1298,6 +1538,34 @@ async def continuity_check_step(
     return StepResult(
         outcome="complete",
         result_summary=f"continuity_check: {delivered} reminders/nudges delivered",
+    )
+
+
+async def routine_pipeline_step(
+    task: WorkerTask, ctx: StepContext
+) -> StepResult:
+    """Deliver the nudge for a user-created routine runtime pipeline."""
+    container, _db_path = _resolve_services(task)
+    delivered = 0
+    try:
+        sent = await _send_nudge(
+            container,
+            "reminder_generic",
+            subject=task.goal or "A saved routine is ready to run.",
+        )
+        delivered = 1 if sent else 0
+    except RuntimeError:
+        raise
+    except Exception:
+        log.exception("routine_pipeline_step_error", task_id=task.id)
+        return StepResult(
+            outcome="failed",
+            error_message="routine_pipeline_step_error",
+        )
+
+    return StepResult(
+        outcome="complete",
+        result_summary=f"routine pipeline nudge delivered={delivered}",
     )
 
 

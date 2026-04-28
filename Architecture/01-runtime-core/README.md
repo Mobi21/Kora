@@ -2,7 +2,7 @@
 
 This cluster documents the five subsystems that form Kora's runtime core: the dependency injection and shared utilities (`core/`), the FastAPI daemon process (`daemon/`), the turn execution and inspection layer (`runtime/`), the orchestration engine that owns every background and autonomous job (`runtime/orchestration/`), and the LangGraph conversation graph (`graph/`).
 
-All documentation is derived from live source. File and line references are accurate as of commit `9a0d0d6` on branch `feature/phase-7-5-orchestration` — the slice that replaced `BackgroundWorker` with the `OrchestrationEngine`.
+This page is a subsystem deep dive. It was originally generated during Phase 7.5 and has been partially refreshed; for the current whole-system snapshot and acceptance caveats, start with [`../current-architecture.md`](../current-architecture.md).
 
 ---
 
@@ -193,16 +193,16 @@ The `frozen_prefix` field is cached in the checkpoint — it is only rebuilt on 
 
 ## Background Work
 
-Phase 7.5 replaced the two-tier `BackgroundWorker` with the `OrchestrationEngine` (`runtime/orchestration/engine.py`). A single dispatcher loop owns every background and autonomous job: memory consolidation, signal scanning, session-bridge pruning, skill refinement, proactive area scans, morning briefings, and user autonomous tasks.
+Phase 7.5 replaced the two-tier `BackgroundWorker` with the `OrchestrationEngine` (`runtime/orchestration/engine.py`). Current code now splits orchestration into a trigger loop plus a dispatch loop: `TriggerEvaluator` fires interval/event/time/sequence/user-action triggers, while `Dispatcher` steps ready `WorkerTask` rows.
 
-Instead of tier-based cooldowns, each job is a declarative `Pipeline` with explicit triggers (8 kinds: `INTERVAL`, `EVENT`, `CONDITION`, `TIME_OF_DAY`, `SEQUENCE_COMPLETE`, `USER_ACTION`, `ANY_OF`, `ALL_OF`). The dispatcher:
+Instead of tier-based cooldowns, each job is a declarative `Pipeline` with explicit triggers (8 kinds: `INTERVAL`, `EVENT`, `CONDITION`, `TIME_OF_DAY`, `SEQUENCE_COMPLETE`, `USER_ACTION`, `ANY_OF`, `ALL_OF`). The trigger evaluator and dispatcher together:
 
 1. Classifies the current `SystemStatePhase` (7 values: `CONVERSATION`, `ACTIVE_IDLE`, `LIGHT_IDLE`, `DEEP_IDLE`, `WAKE_UP_WINDOW`, `DND`, `SLEEPING`).
-2. Evaluates every trigger; any pipeline whose predicate fires in the current phase is eligible.
-3. Picks the highest-priority eligible pipeline that fits within the `RequestLimiter`'s 5-hour window (4500-request cap, 300 reserved for `CONVERSATION`, 100 reserved for `NOTIFICATION`).
-4. Dispatches one `WorkerTask` per tick using one of three presets: `IN_TURN` (300s hard cap, conversation-class budget), `BOUNDED_BACKGROUND` (1800s, idle-only, background class), `LONG_BACKGROUND` (unbounded, pauses on conversation, pauses on topic overlap).
+2. Evaluate triggers and start triggered pipeline instances.
+3. Pick ready worker tasks that fit within the `RequestLimiter`'s 5-hour window (4500-request cap, 300 reserved for `CONVERSATION`, 100 reserved for `NOTIFICATION`).
+4. Step tasks using one of three presets: `IN_TURN` (300s hard cap, conversation-class budget), `BOUNDED_BACKGROUND` (1800s, idle-only, background class), `LONG_BACKGROUND` (unbounded, pauses on conversation, pauses on topic overlap).
 
-The 20 core pipelines are declared in `runtime/orchestration/core_pipelines.py`. Two have real step functions in Slice 7.5b — `session_bridge_pruning` (replaces the old idle task, `interval(3600s, deep_idle)`) and `skill_refinement` (replaces the old idle task, `time_of_day(3:00)`). The `user_autonomous_task` pipeline wraps the 12-node autonomous graph through a factory-built step function. The remaining 17 pipelines have stub steps that Phase 8 will flesh out.
+The 20 core pipelines are declared in `runtime/orchestration/core_pipelines.py`. Current code wires real handlers for memory steward, vault organizer, weekly ADHD profile, user autonomous work, wake preparation, continuity checks, proactive pattern scan, anticipatory prep, proactive research, article digest, follow-through drafts, contextual engagement, commitment tracking, stuck detection, weekly triage, draft-on-observation, and connection making. `in_turn_subagent` is still stubbed; `session_bridge_pruning` and `skill_refinement` are registered housekeeping no-ops.
 
 See [orchestration.md](orchestration.md) for the full treatment (WorkerTask FSM, pipeline validation, dispatcher fairness, request limiter rules, notification gate, working docs).
 

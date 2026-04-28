@@ -254,11 +254,17 @@ async def test_item_29_mid_flight_task_query(tmp_path: Path) -> None:
 
 async def test_item_30_task_cancellation(tmp_path: Path) -> None:
     engine = await _make_engine(tmp_path)
-    cancel_seen: list[bool] = []
+    engine.register_pipeline(_make_pipeline("research"))
+    doc_path, instance = await _spawn_research_pipeline(
+        engine,
+        goal="cancel-probe partial preservation",
+        seed_plan_items=["draft option A", "draft option B"],
+    )
+    instance.working_doc_path = str(doc_path)
+    await engine.instance_registry.save(instance)
 
     async def step_fn(task: WorkerTask, ctx: StepContext) -> StepResult:
         if task.cancellation_requested:
-            cancel_seen.append(True)
             return StepResult(outcome="cancelled", result_summary="stopped")
         return StepResult(outcome="running")
 
@@ -267,6 +273,8 @@ async def test_item_30_task_cancellation(tmp_path: Path) -> None:
         system_prompt="p",
         step_fn=step_fn,
         preset="bounded_background",
+        stage_name="run",
+        pipeline_instance_id=instance.id,
     )
     await engine.tick_once()  # one running tick
     ok = await engine.cancel_task(task.id, reason="supervisor_request")
@@ -280,6 +288,11 @@ async def test_item_30_task_cancellation(tmp_path: Path) -> None:
         WorkerTaskState.COMPLETED,
         WorkerTaskState.FAILED,
     }
+    doc_text = doc_path.read_text(encoding="utf-8")
+    assert "status: cancelled" in doc_text
+    assert "Pipeline cancelled" in doc_text
+    assert "existing working doc content preserved" in doc_text
+    assert "draft option A" in doc_text
 
 
 # ── Item 31: user edit to working document picked up by reconcile ──────
@@ -601,6 +614,58 @@ async def test_item_44_runtime_pipeline_persists(tmp_path: Path) -> None:
     decl = json.loads(row["declaration_json"])
     assert decl["name"] == "morning_routine"
     assert decl["stages"][0]["name"] == "run"
+
+
+async def test_runtime_pipeline_declarations_load_on_engine_start(
+    tmp_path: Path,
+) -> None:
+    engine = await _make_engine(tmp_path)
+    routine = Pipeline(
+        name="loaded_routine",
+        description="Runtime routine restored at boot",
+        stages=[
+            PipelineStage(
+                name="research",
+                task_preset="bounded_background",  # type: ignore[arg-type]
+                goal_template="Research something",
+                tool_scope=["search_web"],
+            ),
+            PipelineStage(
+                name="write_note",
+                task_preset="bounded_background",  # type: ignore[arg-type]
+                goal_template="Write the note",
+                depends_on=["research"],
+                tool_scope=["write_file"],
+            ),
+        ],
+        triggers=[],
+        interruption_policy=InterruptionPolicy.PAUSE_ON_CONVERSATION,
+        failure_policy=FailurePolicy.FAIL_PIPELINE,
+        intent_duration="short",
+    )
+    await engine.register_runtime_pipeline(
+        routine, created_by_session="sess-42"
+    )
+
+    restarted = OrchestrationEngine(
+        engine._db_path,
+        schedule_profile=UserScheduleProfile(timezone="UTC"),
+        memory_root=tmp_path / "_KoraMemory",
+        tick_interval=10.0,
+    )
+    await restarted.start()
+    try:
+        loaded = restarted.pipelines.get("loaded_routine")
+        assert loaded.intent_duration == "short"
+        assert [stage.name for stage in loaded.stages] == [
+            "research",
+            "write_note",
+        ]
+        assert loaded.stages[0].tool_scope == ["search_web"]
+        assert loaded.stages[1].depends_on == ["research"]
+        assert loaded.stages[1].tool_scope == ["write_file"]
+    finally:
+        await restarted.stop(graceful=True)
 
 
 # ── Item 46: supervisor dispatch-and-end (templated ack, no LLM) ───────

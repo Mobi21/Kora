@@ -26,18 +26,28 @@ from kora_v2.autonomous.state import (
     AutonomousCheckpoint,
     AutonomousState,
 )
+from kora_v2.core.exceptions import LLMTimeoutError
 
 log = structlog.get_logger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
 TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "cancelled", "failed"})
+_TRANSIENT_STEP_RETRY_LIMIT: int = 3
 
 # Keywords that suggest this is a routine rather than a one-off task
 _ROUTINE_KEYWORDS: frozenset[str] = frozenset({
     "routine", "morning", "evening", "habit", "daily", "walkthrough",
     "checklist", "ritual", "regular",
 })
+
+
+def _is_transient_provider_timeout(exc: Exception) -> bool:
+    """Return True for provider timeouts that should checkpoint and retry."""
+    if isinstance(exc, (LLMTimeoutError, TimeoutError)):
+        return True
+    text = str(exc).lower()
+    return "timed out" in text and ("minimax" in text or "provider" in text)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -363,6 +373,13 @@ async def execute_step(
             except Exception:
                 pass  # Non-fatal
 
+    # Pipeline-level context that downstream workers need so they don't
+    # ask "what topic?" on every step. The autonomous planner populates
+    # state.metadata["goal"] from the root intent; prior_results let us
+    # hand the executor the accumulating chain of step outputs.
+    pipeline_goal = str(state.metadata.get("goal", "") or "")
+    prior_results = dict(state.metadata.get("step_results", {}) or {})
+
     try:
         # Determine worker to dispatch
         _CODE_WORKERS = {"code"}
@@ -376,13 +393,28 @@ async def execute_step(
             if use_delegate:
                 result_json = await _delegate_to_claude_code(step_data, container)
             else:
-                result_json = await _dispatch_to_executor(step_data, container)
+                result_json = await _dispatch_to_executor(
+                    step_data,
+                    container,
+                    pipeline_goal=pipeline_goal,
+                    prior_step_results=prior_results,
+                )
         elif worker_name in _EXEC_WORKERS:
-            result_json = await _dispatch_to_executor(step_data, container)
+            result_json = await _dispatch_to_executor(
+                step_data,
+                container,
+                pipeline_goal=pipeline_goal,
+                prior_step_results=prior_results,
+            )
         elif worker_name == "reviewer":
             result_json = await _dispatch_to_reviewer(step_data, container)
         else:
-            result_json = await _dispatch_to_executor(step_data, container)
+            result_json = await _dispatch_to_executor(
+                step_data,
+                container,
+                pipeline_goal=pipeline_goal,
+                prior_step_results=prior_results,
+            )
 
         # Move step from pending to completed
         state = state.model_copy(deep=True)
@@ -424,6 +456,35 @@ async def execute_step(
                     pass
 
     except Exception as exc:
+        if _is_transient_provider_timeout(exc):
+            state = state.model_copy(deep=True)
+            retry_counts = dict(state.metadata.get("step_retry_counts", {}) or {})
+            retry_count = int(retry_counts.get(step_id, 0)) + 1
+            retry_counts[step_id] = retry_count
+            state.metadata["step_retry_counts"] = retry_counts
+            state.metadata["last_transient_error"] = str(exc)
+            state.metadata["retry_pending_step_id"] = step_id
+
+            if retry_count <= _TRANSIENT_STEP_RETRY_LIMIT:
+                log.warning(
+                    "autonomous_execute_step_transient_timeout",
+                    step_id=step_id,
+                    retry_count=retry_count,
+                    retry_limit=_TRANSIENT_STEP_RETRY_LIMIT,
+                    error=str(exc),
+                )
+                state.status = "checkpointing"
+                state.last_checkpoint_at = datetime.now(UTC)
+                state.safe_resume_token = str(uuid.uuid4())
+                return state
+
+            log.error(
+                "autonomous_execute_step_timeout_retries_exhausted",
+                step_id=step_id,
+                retry_count=retry_count,
+                error=str(exc),
+            )
+
         log.error(
             "autonomous_execute_step_failed",
             step_id=step_id,
@@ -437,15 +498,82 @@ async def execute_step(
     return state
 
 
-async def _dispatch_to_executor(step_data: dict[str, Any], container: Any) -> str:
-    """Dispatch a step to the executor worker."""
+_AUTONOMOUS_EXECUTOR_DEFAULT_TOOLS: tuple[str, ...] = (
+    "read_file",
+    "write_file",
+    "list_directory",
+    "create_directory",
+    "search_web",
+    "fetch_url",
+)
+
+
+async def _dispatch_to_executor(
+    step_data: dict[str, Any],
+    container: Any,
+    *,
+    pipeline_goal: str = "",
+    prior_step_results: dict[str, Any] | None = None,
+) -> str:
+    """Dispatch a step to the executor worker.
+
+    The autonomous planner produces step titles/descriptions that often omit
+    the original user goal and don't pre-declare which tools they need. That
+    leaves the executor worker looking at a sentence like "Investigate
+    Technical Decision #1" with no context and no tool surface, which causes
+    honest "Cannot proceed" responses that the graph silently accepts.
+
+    We compensate here by:
+
+    1. Prepending the pipeline goal to the task so the executor always knows
+       what it is actually working on.
+    2. Seeding ``tools_available`` with a default filesystem + research tool
+       set when the planner produced an empty list. This triggers the
+       executor's existing tool-inclusion heuristics (see
+       ``executor.py::_execute``) so the LLM is handed real filesystem and
+       research tool schemas, not just ``structured_execution_output``.
+    3. Folding any prior step results into ``context`` so each step can
+       build on what came before.
+    """
     from kora_v2.core.models import ExecutionConstraints, ExecutionInput
 
-    task_desc = step_data.get("description") or step_data.get("title", "Execute step")
+    title = step_data.get("title", "").strip()
+    description = step_data.get("description", "").strip()
+    base_task = description or title or "Execute step"
+
+    goal_prefix = ""
+    if pipeline_goal and pipeline_goal.strip():
+        goal_prefix = f"Pipeline goal: {pipeline_goal.strip()}\n\nStep: "
+
+    task_desc = f"{goal_prefix}{base_task}"
+
+    declared_tools = list(step_data.get("tools_needed") or [])
+    if not declared_tools:
+        declared_tools = list(_AUTONOMOUS_EXECUTOR_DEFAULT_TOOLS)
+
+    context_parts: list[str] = []
+    if title and description and title != description:
+        context_parts.append(f"Step title: {title}")
+    if pipeline_goal and pipeline_goal.strip():
+        context_parts.append(f"Original pipeline goal: {pipeline_goal.strip()}")
+    if prior_step_results:
+        recent_preview = []
+        for sid, payload in list(prior_step_results.items())[-3:]:
+            if isinstance(payload, str):
+                snippet = payload[:200]
+            else:
+                snippet = str(payload)[:200]
+            recent_preview.append(f"- {sid}: {snippet}")
+        if recent_preview:
+            context_parts.append(
+                "Recent step results:\n" + "\n".join(recent_preview)
+            )
+    exec_context = "\n\n".join(context_parts) if context_parts else description
+
     exec_input = ExecutionInput(
         task=task_desc,
-        tools_available=step_data.get("tools_needed", []),
-        context=step_data.get("description", ""),
+        tools_available=declared_tools,
+        context=exec_context,
         constraints=ExecutionConstraints(timeout_seconds=300),
         energy_level=step_data.get("energy_level"),
         estimated_minutes=step_data.get("estimated_minutes"),

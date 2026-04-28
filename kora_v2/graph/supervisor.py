@@ -20,15 +20,24 @@ and ``container.event_emitter``.
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from kora_v2.graph.dispatch import SUPERVISOR_TOOLS, execute_tool, get_available_tools
+from kora_v2.graph.dispatch import (
+    _PROTECTED_SYSTEM_PIPELINES,
+    SUPERVISOR_TOOLS,
+    _explicitly_mentions_protected_pipeline,
+    execute_tool,
+    get_available_tools,
+)
 from kora_v2.graph.prompts import build_dynamic_suffix, build_frozen_prefix
 from kora_v2.graph.state import SupervisorState
 from kora_v2.llm.types import GenerationResult
@@ -65,6 +74,875 @@ _CORE_SKILLS_FALLBACK = [
     "web_research",
     "file_creation",
 ]
+
+_CANCEL_CONTROL_WORDS = {
+    "actually",
+    "background",
+    "cancel",
+    "cancelled",
+    "canceling",
+    "cancelling",
+    "don't",
+    "extra",
+    "keep",
+    "pause",
+    "paused",
+    "right",
+    "running",
+    "stop",
+    "stopped",
+    "task",
+    "tasks",
+    "there",
+    "waste",
+    "work",
+}
+
+
+def _cancel_target_words(text: str) -> list[str]:
+    normalized = text.lower().replace("_", " ").replace("-", " ")
+    words: list[str] = []
+    for raw in normalized.split():
+        word = raw.strip(".,;:!?()[]{}\"'")
+        if len(word) < 5 or word in _CANCEL_CONTROL_WORDS:
+            continue
+        words.append(word)
+    return words
+
+
+def _reason_preserves_research(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "research" in lowered
+        and any(
+            phrase in lowered
+            for phrase in (
+                "keep",
+                "preserve",
+                "do not cancel",
+                "don't cancel",
+                "dont cancel",
+                "do not disturb",
+                "don't disturb",
+                "dont disturb",
+                "do not touch",
+                "don't touch",
+                "dont touch",
+            )
+        )
+    )
+
+
+def _target_words_from_cancel_request(text: str) -> list[str]:
+    """Extract the positive target of a cancel request.
+
+    Users often say things like "cancel only cancel-probe; do not cancel the
+    research task". The protected clause is important context, but it must not
+    contribute target words or the scorer will select the task the user asked
+    us to preserve.
+    """
+    lowered = text.lower()
+    if not re.search(r"\b(?:cancel|stop|pause|kill)\b(?![-_])", lowered):
+        return []
+    first_sentence = re.split(r"[.;\n]", lowered, maxsplit=1)[0]
+    only_match = re.search(
+        r"\b(?:cancel|stop|pause|kill)\s+only\s+(.+?)(?:\s+right\s+now|\s+now|$)",
+        first_sentence,
+    )
+    if only_match:
+        return _cancel_target_words(only_match.group(1))
+
+    positive = re.split(
+        r"\b(?:do not|don't|dont|keep|preserve)\b",
+        lowered,
+        maxsplit=1,
+    )[0]
+    return _cancel_target_words(positive)
+
+
+def _latest_user_text(state: SupervisorState) -> str:
+    """Return the latest user/human message text from graph state."""
+    for msg in reversed(state.get("messages", [])):
+        role = (
+            msg.get("role", "")
+            if isinstance(msg, dict)
+            else getattr(msg, "type", "")
+        )
+        content = (
+            msg.get("content", "")
+            if isinstance(msg, dict)
+            else getattr(msg, "content", "")
+        )
+        if role in ("user", "human") and isinstance(content, str):
+            return content
+    return ""
+
+
+def _loaded_skill_names(skill_loader: Any | None) -> set[str]:
+    if skill_loader is None:
+        return set(_CORE_SKILLS_FALLBACK)
+    try:
+        names = {s.name for s in skill_loader.get_all_skills()}
+    except Exception:
+        names = set()
+    return names or set(_CORE_SKILLS_FALLBACK)
+
+
+def _infer_active_skills(
+    user_text: str,
+    skill_loader: Any | None,
+) -> list[str]:
+    """Infer the smallest practical skill set for this turn.
+
+    The old graph passed every loaded skill as active on every turn, which
+    made skill gating mostly decorative. This heuristic is intentionally
+    conservative: include the domains that clearly match the user's words
+    plus a tiny planning fallback for generic task requests.
+    """
+    available = _loaded_skill_names(skill_loader)
+    text = user_text.lower()
+    active: list[str] = []
+
+    def add(name: str) -> None:
+        if name in available and name not in active:
+            active.append(name)
+
+    def has_any(*needles: str) -> bool:
+        return any(needle in text for needle in needles)
+
+    def has_word(*words: str) -> bool:
+        import re as _re
+
+        return any(
+            _re.search(rf"\b{_re.escape(word)}\b", text) is not None
+            for word in words
+        )
+
+    if has_any(
+        "med", "adderall", "vyvanse", "melatonin", "meal", "breakfast",
+        "lunch", "dinner", "snack", "coffee", "focus", "remind",
+        "reminder", "routine", "sleep", "energy", "scatter", "scattered",
+        "tired", "overwhelmed", "quick note", "note to self",
+        "note:", "remember:", "spent ", "bought ",
+    ):
+        add("life_management")
+
+    if has_any(
+        "plan", "schedule", "task", "todo", "to-do", "priority",
+        "week", "today", "tomorrow", "briefing", "what should i do",
+        "review", "decide", "decision", "can't decide", "cant decide",
+        "weighing", "open question",
+    ):
+        add("planning")
+        if "life_management" in available:
+            add("life_management")
+
+    if has_any(".py", ".tsx") or has_word(
+        "code", "bug", "test", "tests", "repo", "python", "typescript",
+        "react", "component", "function", "class", "database", "sqlite",
+        "api", "implement", "fix",
+    ):
+        add("code_work")
+        add("file_creation")
+
+    if has_any(
+        "file", "folder", "directory", "write", "read", "create",
+        "save", "draft", "outline", "brief", "document", "markdown",
+    ):
+        add("file_creation")
+
+    if has_any(
+        "research", "search", "latest", "current", "look up", "deep dive",
+        "compare", "web", "url", "privacy", "local-first", "tools",
+        "landscape",
+    ):
+        add("web_research")
+        add("browser_capability")
+
+    if has_any("browser", "open ", "screenshot", "page", "click", "type"):
+        add("browser_capability")
+
+    if has_any("vault", "obsidian", "clip", "save this note"):
+        add("vault_capability")
+
+    if has_any(
+        "gmail", "email", "calendar", "drive", "google doc", "google task",
+        "meeting",
+    ):
+        add("workspace_capability")
+        add("calendar")
+
+    if has_any(
+        "struggling", "anxious", "sad", "frustrated", "panic",
+        "can't keep up", "i feel", "burned out", "burnt out",
+    ):
+        add("emotional_support")
+
+    if not active:
+        for name in _CORE_SKILLS_FALLBACK:
+            add(name)
+
+    return active
+
+
+def _format_active_skill_guidance(
+    skill_loader: Any | None,
+    active_skills: list[str],
+) -> str:
+    if skill_loader is None or not active_skills:
+        return ""
+    blocks: list[str] = []
+    for skill_name in active_skills:
+        try:
+            guidance = skill_loader.get_guidance(skill_name)
+        except Exception:
+            guidance = ""
+        if guidance and guidance.strip():
+            blocks.append(guidance.strip())
+    if not blocks:
+        return ""
+    return "# Active Skill Guidance\n\n" + "\n\n".join(blocks)
+
+
+def _forced_in_turn_decompose_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.lower()
+    if not any(signal in text for signal in ("break", "tasks", "steps", "plan")):
+        return None
+    if not any(signal in text for signal in ("this turn", "today", "finish", "implementation")):
+        return None
+    return {
+        "name": "decompose_and_dispatch",
+        "arguments": {
+            "goal": user_text.strip()[:500],
+            "pipeline_name": "in_turn_breakdown",
+            "stages": [
+                "identify implementation steps",
+                "sequence the work",
+                "define verification checks",
+            ],
+            "in_turn": True,
+            "intent_duration": "short",
+        },
+    }
+
+
+def _forced_quick_note_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    markers = ("note to self:", "quick note:", "note:", "remember:")
+    marker = next((m for m in markers if m in lowered), "")
+    if not marker:
+        return None
+    idx = lowered.find(marker)
+    content = text[idx + len(marker):].strip(" -:\n\t")
+    if not content:
+        content = text
+    return {
+        "name": "quick_note",
+        "arguments": {
+            "content": content[:1000],
+            "tags": "acceptance,quick-capture",
+        },
+    }
+
+
+def _forced_medication_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    if not any(
+        signal in lowered
+        for signal in (
+            "took my ",
+            "took the ",
+            "just took",
+            "gonna take",
+            "going to take",
+            "i took",
+        )
+    ):
+        return None
+    med_name = ""
+    if "melatonin" in lowered:
+        med_name = "melatonin"
+    elif "adderall" in lowered:
+        med_name = "Adderall"
+    elif "vyvanse" in lowered:
+        med_name = "Vyvanse"
+    elif "meds" in lowered or "medication" in lowered:
+        med_name = "medication"
+    if not med_name:
+        return None
+    dose_match = re.search(r"\b(\d+(?:\.\d+)?\s*mg)\b", lowered)
+    return {
+        "name": "log_medication",
+        "arguments": {
+            "medication_name": med_name,
+            "dose": dose_match.group(1).replace(" ", "") if dose_match else "",
+            "notes": text[:500],
+        },
+    }
+
+
+_MEAL_WORDS = {
+    "bagel",
+    "breakfast",
+    "burrito",
+    "cereal",
+    "coffee",
+    "dinner",
+    "eggs",
+    "food",
+    "lunch",
+    "meal",
+    "pasta",
+    "protein",
+    "salad",
+    "sandwich",
+    "snack",
+    "soup",
+    "toast",
+}
+
+_CONCRETE_FOOD_WORDS = _MEAL_WORDS - {
+    "breakfast",
+    "dinner",
+    "food",
+    "lunch",
+    "meal",
+    "snack",
+}
+
+
+def _forced_meal_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    meal_match = re.search(
+        r"\b(?:had|ate|grabbed|snacked\s+on)\s+"
+        r"(?:a\s+|some\s+)?([^.;\n]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    coffee_match = re.search(r"\bhad\s+coffee\b", text, flags=re.IGNORECASE)
+    if not meal_match and not coffee_match:
+        return None
+
+    description = (
+        meal_match.group(1).strip(" .")
+        if meal_match
+        else "coffee"
+    )[:500]
+    if not description:
+        return None
+
+    if any(
+        phrase in lowered
+        for phrase in (
+            "did i eat",
+            "don't think i ate",
+            "dont think i ate",
+            "haven't eaten",
+            "havent eaten",
+            "no lunch",
+            "skipped lunch",
+            "asked about dinner",
+            "figure dinner out later",
+            "create a file",
+            "research notes",
+            "acceptance routine",
+            "stretch break",
+        )
+    ):
+        if not any(word in description.lower() for word in _CONCRETE_FOOD_WORDS):
+            return None
+
+    desc_lower = description.lower()
+    meal_type = "meal"
+    for candidate in ("breakfast", "lunch", "dinner", "snack"):
+        if candidate in desc_lower:
+            meal_type = candidate
+            break
+
+    return {
+        "name": "log_meal",
+        "arguments": {
+            "description": description,
+            "meal_type": meal_type,
+            "calories": 0,
+        },
+    }
+
+
+def _forced_reminder_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    if not any(phrase in lowered for phrase in ("remind me", "set a reminder")):
+        return None
+    title = text
+    for marker in ("remind me to ", "remind me about ", "set a reminder to "):
+        idx = lowered.find(marker)
+        if idx >= 0:
+            title = text[idx + len(marker):].strip(" .")
+            break
+    return {
+        "name": "create_reminder",
+        "arguments": {
+            "title": title[:120] or "Reminder",
+            "description": text[:500],
+            "remind_at": "",
+            "recurring": "",
+        },
+    }
+
+
+def _forced_record_decision_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    if not any(
+        signal in lowered
+        for signal in (
+            "can't decide",
+            "cant decide",
+            "can't make yet",
+            "cant make yet",
+            "decision i can't make",
+            "decision i cant make",
+            "weighing",
+            "open question",
+            "decide later",
+            "figure this out later",
+            "unresolved decision",
+        )
+    ):
+        return None
+    return {
+        "name": "record_decision",
+        "arguments": {
+            "prompt": text[:500],
+            "context": "User explicitly left this decision unresolved.",
+            "options": [],
+            "category": "planning",
+        },
+    }
+
+
+def _forced_recall_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    if not any(
+        signal in lowered
+        for signal in (
+            "what do you remember",
+            "what do we remember",
+            "remember from yesterday",
+            "remember from saturday",
+            "where did we land",
+            "what survived restart",
+            "before the restart",
+        )
+    ):
+        return None
+    return {
+        "name": "recall",
+        "arguments": {
+            "query": text[:500],
+            "layer": "all",
+            "max_results": 8,
+        },
+    }
+
+
+def _path_for_directory_listing(user_text: str) -> str:
+    path_match = re.search(r"(/[\w .~@%+=:,/\\-]+)", user_text)
+    if path_match:
+        raw = path_match.group(1).strip(" .,:;)")
+        path = Path(raw).expanduser()
+        if path.suffix:
+            return str(path.parent)
+        return str(path)
+    lowered = user_text.lower()
+    if "dashboard" in lowered or "readme" in lowered or "launch-note" in lowered:
+        return "/tmp/focus-dashboard"
+    return "."
+
+
+def _forced_list_directory_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    file_review = any(
+        phrase in lowered
+        for phrase in (
+            "list what files",
+            "what files",
+            "which files",
+            "files created",
+            "files we created",
+            "files updated",
+            "deliverables",
+            "actual deliverables",
+        )
+    )
+    if not file_review:
+        return None
+    if not any(
+        signal in lowered
+        for signal in (
+            "file",
+            "files",
+            "deliverable",
+            "deliverables",
+            "dashboard",
+            "readme",
+            "launch-note",
+            "research.md",
+        )
+    ):
+        return None
+    return {
+        "name": "list_directory",
+        "arguments": {
+            "path": _path_for_directory_listing(text),
+        },
+    }
+
+
+def _forced_focus_block_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    if any(
+        phrase in lowered
+        for phrase in (
+            "start a focus block",
+            "start focus block",
+            "start a focus session",
+            "let's do a focus session",
+            "begin a focus block",
+        )
+    ):
+        return {
+            "name": "start_focus_block",
+            "arguments": {
+                "label": "Dashboard deep work"
+                if "dashboard" in lowered
+                else "Focus Session",
+                "notes": text[:500],
+            },
+        }
+    if any(
+        phrase in lowered
+        for phrase in (
+            "end the focus block",
+            "end focus block",
+            "end the focus session",
+            "stop the focus block",
+            "finish the focus session",
+        )
+    ):
+        return {
+            "name": "end_focus_block",
+            "arguments": {
+                "notes": text[:500],
+                "completed": True,
+            },
+        }
+    return None
+
+
+def _forced_cancel_task_call(
+    user_text: str,
+    state: SupervisorState,
+) -> dict[str, Any] | None:
+    lowered = user_text.lower()
+    # Treat "cancel" as an imperative only when it appears as a standalone
+    # verb. Task names such as "cancel-probe" should not become cancellation
+    # requests while the user is asking to create/start that task.
+    explicit_stop = re.search(r"\b(?:stop|kill)\b|\bcancel\b(?![-_])", lowered)
+    explicit_pause = any(
+        phrase in lowered
+        for phrase in (
+            "pause that task",
+            "pause this task",
+            "pause the task",
+            "pause that background",
+            "pause this background",
+            "pause the background",
+        )
+    )
+    if not (explicit_stop or explicit_pause):
+        return None
+    if not any(
+        signal in lowered
+        for signal in ("task", "background", "research", "work", "job")
+    ):
+        return None
+
+    exact_task_match = re.search(r"\btask-[a-z0-9]+\b", user_text, re.IGNORECASE)
+    if exact_task_match is not None:
+        return {
+            "name": "cancel_task",
+            "arguments": {
+                "task_id": exact_task_match.group(0),
+                "reason": user_text.strip()[:200] or "user_requested",
+            },
+        }
+
+    tasks = state.get("_orchestration_tasks") or []
+    candidates: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = task.get("task_id")
+        task_state = str(task.get("state") or "").lower()
+        if not task_id or task_state in {"completed", "failed", "cancelled"}:
+            continue
+        candidates.append(task)
+    if not candidates:
+        return None
+
+    preserving_research = _reason_preserves_research(lowered)
+
+    words = _target_words_from_cancel_request(lowered)
+
+    def score(task: dict[str, Any]) -> int:
+        pipeline_name = str(task.get("pipeline_name") or "")
+        if (
+            pipeline_name in _PROTECTED_SYSTEM_PIPELINES
+            and not _explicitly_mentions_protected_pipeline(
+                lowered,
+                pipeline_name,
+            )
+        ):
+            return -1
+        haystack = " ".join(
+            str(task.get(key) or "").lower()
+            for key in (
+                "stage",
+                "goal",
+                "pipeline_name",
+                "pipeline_goal",
+                "result_summary",
+                "error_message",
+            )
+        ).replace("_", " ").replace("-", " ")
+        semantic_haystack = haystack.replace("proactive research", "")
+        word_score = sum(1 for word in words if word and word in haystack)
+        if (
+            preserving_research
+            and word_score == 0
+            and "research" in semantic_haystack
+        ):
+            return -1
+        return word_score
+
+    scored = [(candidate, score(candidate)) for candidate in candidates]
+    selected_by_exclusion = False
+    if preserving_research:
+        non_preserved = [
+            candidate for candidate, candidate_score in scored
+            if candidate_score >= 0
+        ]
+        if len(non_preserved) == 1:
+            selected = non_preserved[0]
+            selected_score = score(selected)
+            selected_by_exclusion = True
+        else:
+            selected, selected_score = max(scored, key=lambda item: item[1])
+    else:
+        selected, selected_score = max(scored, key=lambda item: item[1])
+    if selected_score < 0:
+        return None
+    if words and selected_score == 0 and not selected_by_exclusion:
+        return None
+    if not words and len(candidates) > 1:
+        return None
+    return {
+        "name": "cancel_task",
+        "arguments": {
+            "task_id": str(selected["task_id"]),
+            "reason": user_text.strip()[:200] or "user_requested",
+        },
+    }
+
+
+def _forced_tool_call_for_turn(
+    user_text: str,
+    state: SupervisorState,
+) -> dict[str, Any] | None:
+    calls = _forced_tool_calls_for_turn(user_text, state)
+    return calls[0] if calls else None
+
+
+def _forced_tool_calls_for_turn(
+    user_text: str,
+    state: SupervisorState,
+) -> list[dict[str, Any]]:
+    in_turn = _forced_in_turn_decompose_call(user_text)
+    if in_turn:
+        return [in_turn]
+
+    calls: list[dict[str, Any]] = []
+    for factory in (
+        _forced_meal_call,
+        _forced_medication_call,
+        _forced_reminder_call,
+        _forced_quick_note_call,
+        _forced_focus_block_call,
+        _forced_record_decision_call,
+        _forced_list_directory_call,
+        _forced_recall_call,
+    ):
+        call = factory(user_text)
+        if call:
+            calls.append(call)
+
+    if calls:
+        seen: set[tuple[str, str]] = set()
+        deduped: list[dict[str, Any]] = []
+        for call in calls:
+            name = str(call.get("name") or "")
+            args = call.get("arguments") or {}
+            key = (name, json.dumps(args, sort_keys=True, default=str))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(call)
+        return deduped
+
+    cancel_call = _forced_cancel_task_call(user_text, state)
+    return [cancel_call] if cancel_call else []
+
+
+def _infer_energy_self_report(user_text: str) -> dict[str, Any] | None:
+    lowered = user_text.lower()
+    if any(
+        signal in lowered
+        for signal in (
+            "focus is shot",
+            "meds wearing off",
+            "brain is mush",
+            "scattered",
+            "dragging",
+            "wiped",
+            "exhausted",
+            "can't focus",
+            "cant focus",
+        )
+    ):
+        return {
+            "level": "low",
+            "focus": "scattered",
+            "confidence": 0.9,
+            "source": "self_report",
+            "signals": ["low energy self-report", user_text[:160]],
+            "is_guess": False,
+        }
+    if any(
+        signal in lowered
+        for signal in (
+            "feeling sharp",
+            "focused",
+            "good window",
+            "locked in",
+            "slept well",
+        )
+    ):
+        return {
+            "level": "high",
+            "focus": "locked_in",
+            "confidence": 0.85,
+            "source": "self_report",
+            "signals": ["high energy self-report", user_text[:160]],
+            "is_guess": False,
+        }
+    if any(
+        signal in lowered
+        for signal in ("better now", "recovering", "settling down")
+    ):
+        return {
+            "level": "medium",
+            "focus": "moderate",
+            "confidence": 0.75,
+            "source": "self_report",
+            "signals": ["medium energy self-report", user_text[:160]],
+            "is_guess": False,
+        }
+    return None
+
+
+async def _record_energy_self_report(
+    container: Any,
+    estimate_data: dict[str, Any],
+    *,
+    user_text: str,
+) -> dict[str, Any]:
+    from kora_v2.core.models import EnergyEstimate
+
+    estimate = EnergyEstimate(**estimate_data)
+    settings = getattr(container, "settings", None)
+    data_dir = getattr(settings, "data_dir", None)
+    if data_dir is not None:
+        try:
+            import aiosqlite
+
+            async with aiosqlite.connect(str(data_dir / "operational.db")) as db:
+                await db.execute(
+                    "INSERT INTO energy_log "
+                    "(id, level, focus, source, notes, logged_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        f"energy-{uuid.uuid4().hex[:12]}",
+                        estimate.level,
+                        estimate.focus,
+                        estimate.source,
+                        user_text[:500],
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+                await db.commit()
+        except Exception:
+            log.debug("energy_self_report_persist_skipped", exc_info=True)
+
+    session_mgr = getattr(container, "session_manager", None)
+    session = getattr(session_mgr, "active_session", None)
+    if session is not None:
+        try:
+            session.energy_estimate = estimate
+        except Exception:
+            log.debug("energy_self_report_session_update_skipped", exc_info=True)
+    emitter = getattr(container, "event_emitter", None)
+    if emitter is not None:
+        try:
+            from kora_v2.core.events import EventType
+
+            await emitter.emit(
+                EventType.INSIGHT_AVAILABLE,
+                insight_type="energy_self_report",
+                insight_title=f"Energy self-report: {estimate.level}/{estimate.focus}",
+                confidence=estimate.confidence,
+                domain="emotional",
+            )
+        except Exception:
+            log.debug("energy_self_report_insight_emit_skipped", exc_info=True)
+    orchestration = getattr(container, "orchestration_engine", None)
+    ledger = getattr(orchestration, "ledger", None)
+    if ledger is not None:
+        try:
+            from kora_v2.runtime.orchestration.ledger import LedgerEventType
+
+            await ledger.record(
+                LedgerEventType.TRIGGER_FIRED,
+                trigger_name="INSIGHT_AVAILABLE",
+                reason="energy_self_report",
+                metadata={
+                    "event_type": "INSIGHT_AVAILABLE",
+                    "insight_type": "energy_self_report",
+                    "level": estimate.level,
+                    "focus": estimate.focus,
+                    "confidence": estimate.confidence,
+                },
+            )
+        except Exception:
+            log.debug("energy_self_report_ledger_skipped", exc_info=True)
+    return estimate.model_dump()
 
 
 # =====================================================================
@@ -116,6 +994,7 @@ async def receive(state: SupervisorState) -> dict[str, Any]:
         # Reset per-turn overlap detection state
         "_overlap_score": 0.0,
         "_overlap_action": "",
+        "_short_circuit_response": False,
     }
 
 
@@ -167,7 +1046,7 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
             user_model_snapshot=user_snapshot,
             skill_index=skill_names,
             skill_loader=skill_loader,
-            active_skills=skill_names,
+            active_skills=None,
             adhd_output_guidance=adhd_guidance,
             user_triggers=user_triggers,
         )
@@ -201,6 +1080,10 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
         suffix_state["_unread_autonomous_updates"] = unread
     if day_context_dict is not None:
         suffix_state["day_context"] = day_context_dict
+    active_skills = list(state.get("_active_skills") or [])
+    skill_loader = getattr(container, "skill_loader", None) if container else None
+    active_guidance = _format_active_skill_guidance(skill_loader, active_skills)
+    suffix_state["_active_skill_guidance"] = active_guidance
 
     suffix = build_dynamic_suffix(suffix_state)
 
@@ -218,6 +1101,7 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
         update["day_context"] = day_context_dict
     if unread:
         update["_unread_autonomous_updates"] = unread
+    update["_active_skill_guidance"] = active_guidance
 
     # Check budget tier and run compaction if needed
     messages = state.get("messages", [])
@@ -225,23 +1109,43 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
         from kora_v2.context.budget import BudgetTier, ContextBudgetMonitor
 
         monitor = ContextBudgetMonitor()
-        # Convert messages to dicts for token counting
+        # Convert messages to dicts for token counting. Preserve content
+        # BLOCK STRUCTURE — a LangGraph AIMessage with thinking / tool_use
+        # blocks stores content as a list; flattening with ``str()`` both
+        # corrupts the shape and loses per-block overhead, leading to a
+        # large (3×+) undercount that hides real compaction pressure.
         msg_dicts = []
         for msg in messages:
             if isinstance(msg, dict):
                 msg_dicts.append(msg)
-            else:
-                msg_dicts.append({
-                    "role": getattr(msg, "type", "user"),
-                    "content": getattr(msg, "content", ""),
-                })
+                continue
+            msg_type = getattr(msg, "type", "user")
+            role = {
+                "human": "user",
+                "ai": "assistant",
+                "tool": "tool",
+                "system": "system",
+            }.get(msg_type, msg_type or "user")
+            raw_content = getattr(msg, "content", "")
+            # Keep list-shape content (thinking / tool_use / tool_result
+            # blocks) so count_message_tokens walks the blocks correctly.
+            msg_dicts.append({"role": role, "content": raw_content})
+
+        # Include the active supervisor tool schemas in the monitor's
+        # estimate. The MiniMax pre-call safety check counts them, so
+        # excluding them here is the root cause of the monitor vs
+        # provider divergence that lets context overflow past PRUNE.
+        try:
+            from kora_v2.graph.dispatch import SUPERVISOR_TOOLS as _tools
+        except Exception:
+            _tools = None
 
         # Compute usage once and cache both the tier and the raw token
         # estimate so the daemon can forward token_count in the response_complete
         # WebSocket metadata. Without this, observers only see tier names and
         # cannot track how close to the next escalation the conversation is.
-        estimated_tokens = monitor.estimate_current_usage(msg_dicts, frozen)
-        tier = monitor.get_tier(msg_dicts, frozen)
+        estimated_tokens = monitor.estimate_current_usage(msg_dicts, frozen, tools=_tools)
+        tier = monitor.get_tier(msg_dicts, frozen, tools=_tools)
         update["compaction_tier"] = tier.name
         update["compaction_tokens"] = estimated_tokens
 
@@ -473,6 +1377,7 @@ async def tool_loop(
 
     tool_results: list[dict[str, Any]] = []
     tool_records: list[dict[str, Any]] = []
+    short_circuit_response = ""
 
     for tc in pending:
         tool_name = tc["name"]
@@ -517,6 +1422,32 @@ async def tool_loop(
             "success": success,
         })
 
+        if tool_name == "decompose_and_dispatch" and success:
+            try:
+                parsed_result = json.loads(result_str)
+            except json.JSONDecodeError:
+                parsed_result = {}
+            intent_duration = str(
+                tool_args.get("intent_duration")
+                or ("short" if tool_args.get("in_turn") else "long")
+            )
+            if (
+                isinstance(parsed_result, dict)
+                and parsed_result.get("status") == "ok"
+                and not bool(tool_args.get("in_turn", False))
+                and intent_duration in {"long", "indefinite"}
+            ):
+                doc_path = parsed_result.get("working_doc_path") or ""
+                if doc_path:
+                    short_circuit_response = (
+                        "I'll keep that running in the background. "
+                        f"The working doc is {doc_path}."
+                    )
+                else:
+                    short_circuit_response = (
+                        "I'll keep that running in the background."
+                    )
+
     # Append existing records
     existing_records = list(state.get("tool_call_records", []))
     existing_records.extend(tool_records)
@@ -525,12 +1456,22 @@ async def tool_loop(
     # Tool-footprint heuristic — see §4.4 of the life engine spec.
     topic_update = _update_topic_tracker(state, tool_records)
 
-    return {
+    messages_out = list(tool_results)
+    update: dict[str, Any] = {
         "messages": tool_results,
         "tool_call_records": existing_records,
         "_pending_tool_calls": [],  # Clear pending
         **topic_update,
     }
+    if short_circuit_response:
+        messages_out.append({
+            "role": "assistant",
+            "content": short_circuit_response,
+        })
+        update["messages"] = messages_out
+        update["response_content"] = short_circuit_response
+        update["_short_circuit_response"] = True
+    return update
 
 
 _PRONOUN_RE = None  # lazy-compiled, see _update_topic_tracker
@@ -868,7 +1809,8 @@ def build_supervisor_graph(container: Any) -> Any:
         START -> receive -> build_suffix -> think -> [tool_loop | synthesize] -> END
                                                       tool_loop -> think (loop)
     """
-    # Gather active skills for tool gating
+    # Gather loaded skills for prompt indexing. Per-turn tool gating happens
+    # in _receive/_think from the latest user message.
     skill_loader = getattr(container, "skill_loader", None)
     skill_names: list[str] | None = None
     if skill_loader is not None:
@@ -886,12 +1828,15 @@ def build_supervisor_graph(container: Any) -> Any:
         )
         skill_names = list(_CORE_SKILLS_FALLBACK)
 
-    # Build tools list based on what's actually available + skill gating
-    available_tools = get_available_tools(container, active_skills=skill_names)
+    # Log the cold-start baseline without making it the permanent tool list.
+    startup_tools = get_available_tools(
+        container,
+        active_skills=list(_CORE_SKILLS_FALLBACK),
+    )
     log.info(
         "supervisor_tools_resolved",
-        tool_count=len(available_tools),
-        tools=[t["name"] for t in available_tools],
+        tool_count=len(startup_tools),
+        tools=[t["name"] for t in startup_tools],
     )
 
     # Track iterations to prevent infinite tool loops
@@ -903,6 +1848,22 @@ def build_supervisor_graph(container: Any) -> Any:
         container._turn_start_time = time.monotonic()  # Track for quality metrics
         base = await receive(state)
         turn = base["turn_count"]
+
+        latest_user_text = _latest_user_text(state)
+        active_skills = _infer_active_skills(latest_user_text, skill_loader)
+        base["_active_skills"] = active_skills
+        base["_latest_user_text"] = latest_user_text
+        forced_calls = _forced_tool_calls_for_turn(latest_user_text, state)
+        forced_call = forced_calls[0] if forced_calls else None
+        base["_forced_tool_calls"] = forced_calls
+        base["_forced_tool_call"] = forced_call or {}
+        log.debug(
+            "active_skills_inferred",
+            turn=turn,
+            active_skills=active_skills,
+            forced_tool=forced_call.get("name") if forced_call else "",
+            forced_tools=[call.get("name") for call in forced_calls],
+        )
 
         # --- Gap 1 & 2: Populate emotion / energy / pending / bridge ---
         session_mgr = getattr(container, "session_manager", None)
@@ -1005,6 +1966,14 @@ def build_supervisor_graph(container: Any) -> Any:
             energy = estimate_energy()
             base["energy_estimate"] = energy.model_dump()
 
+        energy_self_report = _infer_energy_self_report(latest_user_text)
+        if energy_self_report is not None:
+            base["energy_estimate"] = await _record_energy_self_report(
+                container,
+                energy_self_report,
+                user_text=latest_user_text,
+            )
+
         return base
 
     async def _build_suffix(state: SupervisorState) -> dict[str, Any]:
@@ -1012,6 +1981,51 @@ def build_supervisor_graph(container: Any) -> Any:
 
     async def _think(state: SupervisorState) -> dict[str, Any]:
         iteration_count["value"] += 1
+        forced_calls = state.get("_forced_tool_calls") or []
+        if not forced_calls:
+            legacy_forced_call = state.get("_forced_tool_call") or {}
+            if (
+                isinstance(legacy_forced_call, dict)
+                and legacy_forced_call.get("name")
+            ):
+                forced_calls = [legacy_forced_call]
+        if isinstance(forced_calls, list) and forced_calls:
+            tool_calls: list[dict[str, Any]] = []
+            pending_calls: list[dict[str, Any]] = []
+            for forced_call in forced_calls:
+                if not isinstance(forced_call, dict) or not forced_call.get("name"):
+                    continue
+                tool_id = f"forced-{uuid.uuid4().hex[:10]}"
+                tool_name = str(forced_call["name"])
+                tool_args = dict(forced_call.get("arguments") or {})
+                tool_calls.append(
+                    {
+                        "id": tool_id,
+                        "name": tool_name,
+                        "args": tool_args,
+                    }
+                )
+                pending_calls.append(
+                    {
+                        "id": tool_id,
+                        "name": tool_name,
+                        "arguments": tool_args,
+                    }
+                )
+            if not tool_calls:
+                return {"_forced_tool_calls": [], "_forced_tool_call": {}}
+            return {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": tool_calls,
+                    }
+                ],
+                "_pending_tool_calls": pending_calls,
+                "_forced_tool_calls": [],
+                "_forced_tool_call": {},
+            }
         if iteration_count["value"] > _MAX_TOOL_ITERATIONS:
             log.warning(
                 "max_tool_iterations_reached",
@@ -1050,7 +2064,14 @@ def build_supervisor_graph(container: Any) -> Any:
                     {"role": "assistant", "content": fallback_text}
                 ]
             return clarify_update
-        return await think(state, container, tools=available_tools)
+        active_skills = list(state.get("_active_skills") or _CORE_SKILLS_FALLBACK)
+        turn_tools = get_available_tools(container, active_skills=active_skills)
+        log.debug(
+            "turn_tools_resolved",
+            active_skills=active_skills,
+            tool_count=len(turn_tools),
+        )
+        return await think(state, container, tools=turn_tools)
 
     async def _tool_loop(state: SupervisorState) -> dict[str, Any]:
         on_tool_event = getattr(container, '_on_tool_event', None)
@@ -1085,6 +2106,11 @@ def build_supervisor_graph(container: Any) -> Any:
     def _should_continue(state: SupervisorState) -> str:
         return should_continue(state)
 
+    def _after_tool_loop(state: SupervisorState) -> str:
+        if state.get("_short_circuit_response"):
+            return "synthesize"
+        return "think"
+
     # Build the graph
     graph = StateGraph(SupervisorState)
 
@@ -1103,7 +2129,10 @@ def build_supervisor_graph(container: Any) -> Any:
         "tool_loop": "tool_loop",
         "synthesize": "synthesize",
     })
-    graph.add_edge("tool_loop", "think")  # Loop back for further processing
+    graph.add_conditional_edges("tool_loop", _after_tool_loop, {
+        "think": "think",
+        "synthesize": "synthesize",
+    })
     graph.add_edge("synthesize", END)
 
     # Use the container's persistent checkpointer when one has been wired

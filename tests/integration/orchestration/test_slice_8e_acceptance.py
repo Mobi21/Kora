@@ -218,11 +218,8 @@ class TestAcceptance59_PatternBasedNudge:
         container.notification_gate.send_templated.assert_awaited()
         # The nudge text should reference the insight
         call = container.notification_gate.send_templated.await_args
-        subject = call.kwargs.get("subject", "")
-        assert (
-            "Meetings during crash window" in subject
-            or "I noticed" in subject
-        )
+        assert call.args[0] == "pattern_nudge"
+        assert call.kwargs.get("title") == "Meetings during crash window"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -656,6 +653,33 @@ class TestAcceptance66_RemindersFireViaContinuity:
         assert pending[0].title == "Daily vitamins"
         delta = pending[0].due_at - original_due
         assert abs(delta - timedelta(days=1)) < timedelta(seconds=5)
+
+    async def test_continuity_check_uses_db_reminder_store_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = await _setup_db(tmp_path)
+        container = _make_container(tmp_path)
+        container.reminder_store = None
+        store = ReminderStore(db_path)
+        rid = await store.create_reminder(
+            title="Morning standup",
+            due_at=datetime.now(UTC) - timedelta(minutes=1),
+            source="user",
+        )
+
+        from kora_v2.agents.background.proactive_handlers import (
+            continuity_check_step,
+        )
+
+        task = _make_task()
+        ctx = _make_ctx(task)
+        result = await _run(
+            continuity_check_step, task, ctx, container, db_path
+        )
+
+        assert result.outcome == "complete"
+        pending = await store.get_pending()
+        assert rid not in [r.id for r in pending]
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -24,7 +24,6 @@ except ImportError:
 import aiosqlite
 import pytest
 
-
 # ==================================================================
 # Mock embedding model (deterministic, no real model loaded)
 # ==================================================================
@@ -559,6 +558,39 @@ class TestDeduplicateFiltering:
         for pair in pairs:
             assert pair.record_a.id != "dedup-deleted"
             assert pair.record_b.id != "dedup-deleted"
+
+    async def test_deduplicate_includes_exact_text_rows_without_vectors(
+        self, projection_db
+    ):
+        """Exact active duplicates are found even if vector rows are missing."""
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        duplicate = "same local first dashboard preference"
+        for memory_id in ("text-only-a", "text-only-b"):
+            await projection_db._db.execute(
+                "INSERT INTO memories "
+                "(id, content, summary, importance, memory_type, created_at, "
+                "updated_at, entities, tags, source_path, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    memory_id,
+                    duplicate,
+                    None,
+                    0.5,
+                    "semantic",
+                    now,
+                    now,
+                    None,
+                    None,
+                    f"/tmp/{memory_id}.md",
+                    "active",
+                ),
+            )
+        await projection_db._db.commit()
+
+        pairs = await projection_db.deduplicate(threshold=0.92)
+        pair_ids = {frozenset((p.record_a.id, p.record_b.id)) for p in pairs}
+
+        assert frozenset(("text-only-a", "text-only-b")) in pair_ids
 
 
 # ==================================================================
@@ -1118,3 +1150,12 @@ class TestEntityQueries:
         row = await cursor.fetchone()
         assert row is not None
         assert row[0] == target_id
+
+        cursor = await projection_db._db.execute(
+            "SELECT metadata FROM entities WHERE id = ?", (target_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        metadata = json.loads(row[0])
+        assert metadata["merged_from"][0]["id"] == source_id
+        assert metadata["merged_from"][0]["name"] == "Bob Smith"

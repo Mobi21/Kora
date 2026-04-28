@@ -240,6 +240,17 @@ class SessionManager:
             pending_items=[item.model_dump() for item in pending_items],
         )
 
+        # Notify orchestration engine so SystemStatePhase transitions
+        # to `conversation` and the dispatcher can gate background work
+        # accordingly. Done before SESSION_START so subscribers see the
+        # phase change along with the event.
+        orchestrator = getattr(self.container, "orchestration_engine", None)
+        if orchestrator is not None and hasattr(orchestrator, "note_session_start"):
+            try:
+                await orchestrator.note_session_start()
+            except Exception:
+                log.debug("orchestration_note_session_start_failed", exc_info=True)
+
         # Emit SESSION_START event
         emitter = getattr(self.container, 'event_emitter', None)
         if emitter:
@@ -338,6 +349,18 @@ class SessionManager:
         # Step 5: Save bridge note to filesystem (before SESSION_END event)
         await self._save_bridge(bridge)
 
+        # Notify orchestration engine the session is ending so the state
+        # machine can begin its idle countdown (active_idle -> light_idle
+        # -> deep_idle). Done before SESSION_END so that any trigger
+        # evaluator tick fired by that event already sees the session as
+        # inactive.
+        orchestrator = getattr(self.container, "orchestration_engine", None)
+        if orchestrator is not None and hasattr(orchestrator, "note_session_end"):
+            try:
+                await orchestrator.note_session_end()
+            except Exception:
+                log.debug("orchestration_note_session_end_failed", exc_info=True)
+
         # Step 6: Emit SESSION_END event (after bridge save)
         emitter = getattr(self.container, 'event_emitter', None)
         if emitter:
@@ -345,6 +368,22 @@ class SessionManager:
                 EventType.SESSION_END,
                 session_id=session_id,
             )
+
+        # Step 6b: Synchronously drain the trigger evaluator so the
+        # ``post_session_memory`` pipeline gets a ``pipeline_instance`` row
+        # persisted before this call returns. Without this, the in-memory
+        # ``_pending_event_payloads`` dict held the SESSION_END event, and
+        # a daemon stop before the background evaluator tick would drop
+        # it — the memory pipeline never ran, transcripts + signals piled
+        # up unprocessed, and ``recall`` always came back empty on the
+        # next fresh session.
+        orchestrator = getattr(self.container, "orchestration_engine", None)
+        evaluator = getattr(orchestrator, "trigger_evaluator", None) if orchestrator else None
+        if evaluator is not None:
+            try:
+                await evaluator.tick_once()
+            except Exception:
+                log.debug("trigger_evaluator_tick_on_session_end_failed", exc_info=True)
 
         # Clear active session
         self.active_session = None
@@ -363,6 +402,12 @@ class SessionManager:
         session_id = state.get("session_id", "unknown")
         bridge = build_hard_stop_bridge(messages, session_id)
         await self._save_bridge(bridge)
+        orchestrator = getattr(self.container, "orchestration_engine", None)
+        if orchestrator is not None and hasattr(orchestrator, "note_session_end"):
+            try:
+                await orchestrator.note_session_end()
+            except Exception:
+                log.debug("orchestration_note_session_end_failed", exc_info=True)
         self.active_session = None
         self._thread_id = None
         return bridge
@@ -479,10 +524,16 @@ class SessionManager:
         greeting_config = {
             "configurable": {"thread_id": f"greeting-{self.active_session.session_id}"},
         }
+        # The greeting has to run as a user turn so MiniMax (Anthropic
+        # message format) sees at least one non-system message — a lone
+        # system message gets split into system_blocks by _format_messages
+        # and the API call fails with "message list is empty after
+        # cleanup". Sending the prompt as a user message keeps the
+        # bridge-aware greeting path actually functional on connect.
         try:
             result = await graph.ainvoke(
                 {
-                    "messages": [{"role": "system", "content": greeting_prompt}],
+                    "messages": [{"role": "user", "content": greeting_prompt}],
                     "greeting_sent": True,
                 },
                 greeting_config,

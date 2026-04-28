@@ -9,7 +9,7 @@ The cluster owns five subsystems inside `kora_v2/`:
 
 | Subsystem | Directory | Role |
 |---|---|---|
-| LLM providers | `llm/` | Abstraction layer over MiniMax M2.7 and Claude Code |
+| LLM providers | `llm/` | Abstraction layer over MiniMax M2.7-highspeed and Claude Code |
 | Emotion | `emotion/` | Two-tier PAD affect assessment per turn |
 | CLI | `cli/` | Rich WebSocket chat client and first-run wizard |
 | MCP | `mcp/` | Model Context Protocol subprocess manager |
@@ -33,7 +33,7 @@ Daemon / supervisor graph (kora_v2/graph/)
   │    emotion/llm_assessor.py  ── LLM-based PAD estimate (async, ~30 s timeout)
   │
   ├─ llm/minimax.py  ─────────── generate() / generate_stream()
-  │    MiniMax M2.7 via Anthropic SDK, with thinking blocks and tool calling
+  │    MiniMax M2.7-highspeed via Anthropic SDK, with thinking blocks and tool calling
   │
   ├─ mcp/manager.py  ─────────── call_tool() for external tool servers
   │
@@ -48,7 +48,7 @@ KoraCLI streams back tokens
 
 ## Key design decisions
 
-**Single provider in production.** The active LLM is MiniMax M2.7, accessed
+**Single provider in production.** The active LLM is MiniMax M2.7-highspeed, accessed
 through the Anthropic SDK via MiniMax's Anthropic-compatible endpoint at
 `https://api.minimax.io/anthropic`. `ClaudeCodeDelegate` exists but is a
 subprocess shim for code-heavy autonomous work, not a drop-in provider.
@@ -61,10 +61,9 @@ notification throttling.
 
 **MCP over stdio.** External tool servers (e.g., `brave_search`) are managed as
 long-lived subprocesses communicating over JSON-RPC on stdin/stdout. The manager
-handles lazy startup, handshake, tool discovery, and crash recovery.
+handles lazy startup, handshake, and tool discovery. Older docs overstated automatic crash recovery; the restart helper exists, but normal `call_tool()` failures surface explicitly.
 
-**Quality is automatic.** `QualityCollector` wraps each turn silently — no
-caller opt-in required. Autonomous work additionally flows through
+**Quality collection exists, but persistence is not fully automatic on every path.** The supervisor records turn samples in memory; persistence helpers exist but are not guaranteed after every turn. Autonomous work additionally flows through
 `execute_with_quality_gates()`, which runs a producer–reviewer cycle with
 configurable retry and confidence thresholds.
 

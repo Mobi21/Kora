@@ -124,7 +124,7 @@ Unknown skill names are warned but do not raise.
 
 ### `life_management`
 
-**Tools:** `log_medication`, `log_meal`, `create_reminder`, `query_reminders`, `query_medications`, `query_meals`, `query_focus_blocks`, `quick_note`, `query_quick_notes`, `start_focus_block`, `end_focus_block`, `log_expense`, `query_expenses`  
+**Tools:** `log_medication`, `log_meal`, `create_reminder`, `query_reminders`, `query_medications`, `query_meals`, `query_focus_blocks`, `quick_note`, `query_quick_notes`, `start_focus_block`, `end_focus_block`, `log_expense`, `query_expenses`, `create_routine`, `list_routines`, `start_routine`, `advance_routine`, `routine_progress`
 **Purpose:** ADHD life tracking (meds, meals, focus, quick capture, reminders, finance). The guidance section is the most detailed of any skill — it encodes exact rules for when to log vs. not log (the distinction between a past-tense event and a routine statement), the "never tell the user you logged something unless you actually called the tool" rule, and the "one rule above all" trust principle.
 
 ### `obsidian_vault`
@@ -185,7 +185,7 @@ Skills reference capability action names as strings (e.g., `browser.open`) — t
 
 At the start of each turn, the supervisor queries the `SkillLoader` with the current active skill list to build the tool list for the LLM. Guidance text from active skills is injected into the system prompt. The LLM then names tools from that list in its response; the tool executor resolves the actual callable.
 
-The `agent` field on a skill (e.g., `planning.yaml` would set `agent: planner`) is used by `get_skill_for_agent()` to find which skill activates a given on-demand agent. This is currently used for agent activation routing.
+The `agent` field on a skill can be read by `get_skill_for_agent()` to find which skill would activate a given on-demand agent. Current code search shows the method exists, but no active caller outside the loader itself; do not treat it as proven routing behavior without rechecking call sites.
 
 ---
 

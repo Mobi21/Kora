@@ -20,6 +20,7 @@ Execution flow
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -75,10 +76,113 @@ _FILE_WRITE_PATTERNS: tuple[str, ...] = (
     "mkdir",
 )
 
+_STRUCTURED_ARTIFACT_MARKERS: tuple[str, ...] = (
+    "artifact",
+    "deliverable",
+    "document",
+    "report",
+    "write",
+    "draft",
+    "create",
+    "save",
+    "markdown",
+    ".md",
+)
+
+_STRUCTURE_MARKERS: tuple[str, ...] = (
+    "structured",
+    "section",
+    "sections",
+    "heading",
+    "headings",
+    "bullet",
+    "bullets",
+    "bullet points",
+    "checklist",
+    "outline",
+    "table",
+)
+
 
 def _looks_like_file_task(task_lower: str) -> bool:
     """Return True if task description matches common file-operation patterns."""
     return any(pattern in task_lower for pattern in _FILE_WRITE_PATTERNS)
+
+
+def _normalize_tool_call_records(raw: Any) -> list[dict[str, Any]]:
+    """Coerce loose LLM tool-call bookkeeping into ToolCallRecord dicts."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    now = datetime.now(UTC)
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        tool_name = item.get("tool_name") or item.get("name") or item.get("tool")
+        if not tool_name:
+            continue
+        result_summary = (
+            item.get("result_summary")
+            or item.get("summary")
+            or item.get("result")
+            or item.get("output")
+            or ""
+        )
+        normalized.append(
+            {
+                "tool_name": str(tool_name),
+                "args": item.get("args") if isinstance(item.get("args"), dict) else {},
+                "result_summary": str(result_summary)[:500],
+                "success": bool(item.get("success", True)),
+                "duration_ms": int(item.get("duration_ms") or 0),
+                "timestamp": item.get("timestamp") or now,
+            }
+        )
+    return normalized
+
+
+def _absolute_paths_in_text(text: str) -> list[str]:
+    """Extract absolute file paths mentioned in an executor task."""
+    matches = re.findall(r"(?<![`\\w])/(?:[A-Za-z0-9._-]+/?)+", text)
+    return [
+        path for path in (m.rstrip(".,);:") for m in matches)
+        if path.count("/") >= 2
+    ]
+
+
+def _requires_structured_artifact(task: str, context: str = "") -> bool:
+    """Detect requests where a thin summary is not a valid artifact."""
+    text = f"{task}\n{context}".lower()
+    asks_for_artifact = (
+        any(marker in text for marker in _STRUCTURED_ARTIFACT_MARKERS)
+        or bool(_absolute_paths_in_text(text))
+    )
+    asks_for_structure = any(marker in text for marker in _STRUCTURE_MARKERS)
+    return asks_for_artifact and asks_for_structure
+
+
+def _structured_result_is_too_thin(result_text: str) -> bool:
+    """Reject one-sentence fallback text for structured artifact requests."""
+    stripped = result_text.strip()
+    if not stripped:
+        return True
+
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    word_count = len(re.findall(r"\b\w+\b", stripped))
+    structure_lines = sum(
+        1
+        for line in lines
+        if re.match(r"^(#{1,6}\s+|[-*]\s+|\d+[.)]\s+)", line)
+        or line.endswith(":")
+    )
+
+    return word_count < 60 or len(lines) < 4 or structure_lines < 2
 
 
 # ── Adapter helper ────────────────────────────────────────────────────────────
@@ -352,24 +456,84 @@ class ExecutorWorkerHarness(AgentHarness[ExecutionInput, ExecutionOutput]):
             t.name
             for t in ToolRegistry.get_by_category(ToolCategory.FILESYSTEM)
         ]
+        tools_hint = {
+            t.strip().lower()
+            for t in (input_data.tools_available or [])
+            if isinstance(t, str)
+        }
 
         tool_defs: list[dict[str, Any]] = []
+        seen_tool_names: set[str] = set()
+
+        def _add_tool(tool_def: dict[str, Any]) -> None:
+            name = tool_def.get("name")
+            if not name or name in seen_tool_names:
+                return
+            tool_defs.append(tool_def)
+            seen_tool_names.add(name)
+
         if _looks_like_file_task(task_lower) or any(
             t in task_lower for t in fs_tool_names
-        ):
+        ) or any(t in tools_hint for t in fs_tool_names):
             # Include real filesystem tools so LLM can actually invoke them
-            fs_defs = ToolRegistry.get_anthropic_tools(
+            for fs_def in ToolRegistry.get_anthropic_tools(
                 categories={ToolCategory.FILESYSTEM}
-            )
-            tool_defs.extend(fs_defs)
+            ):
+                _add_tool(fs_def)
             log.debug(
                 "executor_including_filesystem_tools",
-                count=len(fs_defs),
+                count=len(tool_defs),
+                task=input_data.task[:60],
+            )
+
+        # Research-oriented tool surface. Background research pipelines
+        # (e.g. proactive_research) route through the executor and ask for
+        # web/browser work. Without these the LLM reaches for ``browser``
+        # or ``web_search`` and the executor hard-fails with
+        # ``executor_unexpected_tool``. The supervisor dispatch layer
+        # already knows how to run these tools, so we reuse the same
+        # schemas here and route the call back through ``execute_tool``
+        # below.
+        _RESEARCH_KEYWORDS = (
+            "research",
+            "search",
+            "browse",
+            "web",
+            "internet",
+            "article",
+            "news",
+            "find out",
+            "look up",
+            "investigate",
+        )
+        research_signal = (
+            any(kw in task_lower for kw in _RESEARCH_KEYWORDS)
+            or any(
+                t in tools_hint
+                for t in ("search_web", "fetch_url", "browser")
+            )
+            or any(t.startswith("browser.") for t in tools_hint)
+        )
+        if research_signal:
+            from kora_v2.graph.capability_bridge import (
+                collect_capability_tools,
+            )
+            from kora_v2.graph.dispatch import SUPERVISOR_TOOLS
+
+            for tool in SUPERVISOR_TOOLS:
+                if tool["name"] in {"search_web", "fetch_url"}:
+                    _add_tool(dict(tool))
+            for cap_tool in collect_capability_tools(self._container):
+                if cap_tool["name"].startswith("browser."):
+                    _add_tool(dict(cap_tool))
+            log.debug(
+                "executor_including_research_tools",
+                count=len(tool_defs),
                 task=input_data.task[:60],
             )
 
         # Always include structured_execution_output as final reporting tool
-        tool_defs.append(_build_execution_output_tool())
+        _add_tool(_build_execution_output_tool())
 
         # Force the LLM to call one of the tools we offered. This prevents
         # prose responses AND cuts down on tool-name hallucinations: with
@@ -382,6 +546,7 @@ class ExecutorWorkerHarness(AgentHarness[ExecutionInput, ExecutionOutput]):
             messages=messages,
             tools=tool_defs,
             system_prompt=EXECUTOR_SYSTEM_PROMPT,
+            max_tokens=3000,
             thinking_enabled=False,
             tool_choice="any",
         )
@@ -413,8 +578,69 @@ class ExecutorWorkerHarness(AgentHarness[ExecutionInput, ExecutionOutput]):
             data.setdefault("result", "")
             data.setdefault("success", True)
             data.setdefault("confidence", 0.7)
-            data.setdefault("tool_calls_made", [])
+            data["tool_calls_made"] = _normalize_tool_call_records(
+                data.get("tool_calls_made", [])
+            )
             data.setdefault("artifacts", [])
+            if bool(data.get("success", True)):
+                result_text = str(data.get("result") or "").strip()
+                if _requires_structured_artifact(input_data.task, input_data.context) and (
+                    _structured_result_is_too_thin(result_text)
+                ):
+                    raise ValueError(
+                        "Structured output claimed success for a structured "
+                        "artifact request, but the result is too thin. Provide "
+                        "the requested sections/bullets with substantive content "
+                        "or mark success=false."
+                    )
+
+                mentioned_paths = _absolute_paths_in_text(
+                    f"{input_data.task}\n{input_data.context}"
+                )
+                missing_paths = [
+                    path for path in mentioned_paths
+                    if Path(path).suffix and not Path(path).exists()
+                ]
+                if missing_paths:
+                    writable = _resolve_safe(missing_paths[0])
+                    if result_text and writable is not None:
+                        writable.parent.mkdir(parents=True, exist_ok=True)
+                        writable.write_text(result_text + "\n", encoding="utf-8")
+                        data["tool_calls_made"].append(
+                            {
+                                "tool_name": "filesystem.write_file",
+                                "args": {
+                                    "path": str(writable),
+                                    "content": result_text,
+                                },
+                                "result_summary": (
+                                    f"Wrote {writable.stat().st_size} bytes "
+                                    f"to {writable}"
+                                ),
+                                "success": True,
+                                "duration_ms": 0,
+                                "timestamp": datetime.now(UTC),
+                            }
+                        )
+                        data["artifacts"] = list(data.get("artifacts") or [])
+                        data["artifacts"].append(
+                            {
+                                "type": "file",
+                                "uri": str(writable),
+                                "label": writable.name,
+                                "size_bytes": writable.stat().st_size,
+                            }
+                        )
+                        missing_paths = [
+                            path for path in missing_paths
+                            if not Path(path).exists()
+                        ]
+                if missing_paths:
+                    raise ValueError(
+                        "Structured output claimed success, but expected "
+                        f"file(s) do not exist: {', '.join(missing_paths[:3])}. "
+                        "Call write_file/create_directory first, then report."
+                    )
             exec_output = ExecutionOutput.model_validate(data)
             log.info(
                 "executor_structured_output",
@@ -424,7 +650,88 @@ class ExecutorWorkerHarness(AgentHarness[ExecutionInput, ExecutionOutput]):
             )
             return exec_output
 
-        # Step 5: unexpected tool — attempt best-effort structured parse
+        # Step 5: research/capability tool call — route through the
+        # supervisor execute_tool surface which already handles
+        # search_web, fetch_url, and capability-pack actions. Returns a
+        # summarised ExecutionOutput built from the tool's JSON result.
+        if tool_name in {"search_web", "fetch_url"} or "." in tool_name:
+            from kora_v2.graph.dispatch import execute_tool
+
+            timestamp = datetime.now(UTC)
+            try:
+                result_str = await execute_tool(
+                    tool_name,
+                    dict(args),
+                    container=self._container,
+                )
+            except Exception as exc:
+                log.warning(
+                    "executor_research_tool_failed",
+                    tool=tool_name,
+                    error=str(exc),
+                )
+                return ExecutionOutput(
+                    result=f"{tool_name} failed: {exc}",
+                    tool_calls_made=[
+                        ToolCallRecord(
+                            tool_name=tool_name,
+                            args=dict(args),
+                            result_summary=str(exc)[:200],
+                            success=False,
+                            duration_ms=0,
+                            timestamp=timestamp,
+                        )
+                    ],
+                    artifacts=[],
+                    success=False,
+                    confidence=0.0,
+                    error=str(exc),
+                )
+
+            try:
+                payload = json.loads(result_str)
+            except json.JSONDecodeError:
+                payload = {"raw": result_str[:500]}
+
+            success = not (
+                isinstance(payload, dict)
+                and (
+                    payload.get("status") == "error"
+                    or payload.get("error")
+                )
+            )
+            summary = (
+                payload.get("content")
+                or payload.get("message")
+                or payload.get("error")
+                or result_str[:200]
+                if isinstance(payload, dict)
+                else result_str[:200]
+            )
+            log.info(
+                "executor_research_tool_complete",
+                tool=tool_name,
+                success=success,
+            )
+            return ExecutionOutput(
+                result=str(summary)[:2000],
+                tool_calls_made=[
+                    ToolCallRecord(
+                        tool_name=tool_name,
+                        args=dict(args),
+                        result_summary=str(summary)[:200],
+                        success=success,
+                        duration_ms=0,
+                        timestamp=timestamp,
+                    )
+                ],
+                artifacts=[],
+                success=success,
+                confidence=0.8 if success else 0.0,
+                error=None if success else str(summary)[:400],
+            )
+
+        # Step 6: unexpected tool — attempt best-effort structured parse
         log.warning("executor_unexpected_tool", tool=tool_name)
         raise ValueError(
             f"Executor LLM called unexpected tool '{tool_name}'. "

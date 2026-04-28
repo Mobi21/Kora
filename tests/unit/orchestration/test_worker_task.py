@@ -56,6 +56,7 @@ def test_bounded_background_budgets() -> None:
 
 
 def test_long_background_allows_all_idle_phases() -> None:
+    assert SystemStatePhase.ACTIVE_IDLE in LONG_BACKGROUND.allowed_states
     assert SystemStatePhase.LIGHT_IDLE in LONG_BACKGROUND.allowed_states
     assert SystemStatePhase.DEEP_IDLE in LONG_BACKGROUND.allowed_states
     assert SystemStatePhase.WAKE_UP_WINDOW in LONG_BACKGROUND.allowed_states

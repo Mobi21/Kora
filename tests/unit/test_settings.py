@@ -1,6 +1,5 @@
 """Tests for kora_v2.core.settings — Pydantic Settings with nested sections."""
 
-import os
 from pathlib import Path
 
 import pytest
@@ -8,7 +7,6 @@ from pydantic import ValidationError
 
 from kora_v2.core.settings import (
     LLMSettings,
-    MemorySettings,
     Settings,
     get_settings,
 )
@@ -23,7 +21,7 @@ class TestDefaultSettings:
 
         # LLM defaults
         assert s.llm.provider == "minimax"
-        assert s.llm.model == "MiniMax-M2.7"
+        assert s.llm.model == "MiniMax-M2.7-highspeed"
         assert s.llm.background_model == ""
         assert s.llm.api_base == "https://api.minimax.io/anthropic"
         assert s.llm.max_tokens == 16384
@@ -53,7 +51,7 @@ class TestDefaultSettings:
 
         # Daemon defaults
         assert s.daemon.host == "127.0.0.1"
-        assert s.daemon.port == 0
+        assert s.daemon.port == 8765
 
         # Notifications defaults
         assert s.notifications.enabled is True

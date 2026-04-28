@@ -240,6 +240,37 @@ class TestFilesystemMemoryStore:
         result = await memory_store.read_note("nonexistent-id-12345678")
         assert result is None
 
+    async def test_read_note_normalizes_yaml_timestamp_frontmatter(
+        self,
+        memory_store,
+    ):
+        """Unquoted YAML timestamps should not break note reads."""
+        note_dir = memory_store._long_term / "Reflective"
+        note_dir.mkdir(parents=True, exist_ok=True)
+        note_path = note_dir / "timestamp-note.md"
+        note_path.write_text(
+            "---\n"
+            "id: timestamp-note\n"
+            "memory_type: reflective\n"
+            "importance: 0.8\n"
+            "entities:\n"
+            "- Jordan\n"
+            "tags:\n"
+            "- acceptance-fixture\n"
+            "created_at: 2026-04-27T05:02:00+00:00\n"
+            "updated_at: 2026-04-27T05:03:00+00:00\n"
+            "---\n\n"
+            "Jordan prefers local-first tools.\n",
+            encoding="utf-8",
+        )
+
+        note = await memory_store.read_note("timestamp-note")
+
+        assert note is not None
+        assert note.body == "Jordan prefers local-first tools."
+        assert note.metadata.created_at == "2026-04-27T05:02:00+00:00"
+        assert note.metadata.updated_at == "2026-04-27T05:03:00+00:00"
+
     async def test_update_note_preserves_frontmatter(self, memory_store):
         """Updating body text preserves original frontmatter metadata."""
         meta = await memory_store.write_note(
@@ -355,6 +386,45 @@ class TestProjectionDB:
         assert result["content"] == "Sarah loves hiking in the mountains"
         assert result["importance"] == 0.7
 
+    async def test_index_memory_upserts_existing_id(
+        self, projection_db, mock_embedding_model
+    ):
+        """Reindexing an existing file updates projection/vector rows."""
+        vec = mock_embedding_model.embed("first content")
+        first_rowid = await projection_db.index_memory(
+            memory_id="mem-upsert",
+            content="First content",
+            summary="first",
+            importance=0.4,
+            memory_type="episodic",
+            created_at="2025-01-01T00:00:00+00:00",
+            updated_at="2025-01-01T00:00:00+00:00",
+            entities="[]",
+            tags="[]",
+            source_path="/test/mem-upsert.md",
+            embedding=vec,
+        )
+
+        second_rowid = await projection_db.index_memory(
+            memory_id="mem-upsert",
+            content="Second content",
+            summary="second",
+            importance=0.9,
+            memory_type="reflective",
+            created_at="2025-01-01T00:00:00+00:00",
+            updated_at="2025-01-02T00:00:00+00:00",
+            entities='["Alex"]',
+            tags='["updated"]',
+            source_path="/test/mem-upsert.md",
+            embedding=mock_embedding_model.embed("second content"),
+        )
+
+        assert second_rowid == first_rowid
+        result = await projection_db.get_memory_by_id("mem-upsert")
+        assert result is not None
+        assert result["content"] == "Second content"
+        assert result["importance"] == 0.9
+
     async def test_index_user_model_fact(self, projection_db, mock_embedding_model):
         """Insert a user-model fact and retrieve it."""
         vec = mock_embedding_model.embed("user name is Alex")
@@ -376,6 +446,76 @@ class TestProjectionDB:
         assert fact is not None
         assert fact["domain"] == "identity"
         assert fact["content"] == "User's name is Alex"
+
+    async def test_index_user_model_fact_upserts_existing_id(
+        self, projection_db, mock_embedding_model
+    ):
+        """Reindexing an existing fact updates projection/vector rows."""
+        first_rowid = await projection_db.index_user_model_fact(
+            fact_id="fact-upsert",
+            domain="identity",
+            content="Jordan lives in Portland",
+            confidence=0.33,
+            evidence_count=1,
+            contradiction_count=0,
+            created_at="2025-01-01T00:00:00+00:00",
+            updated_at="2025-01-01T00:00:00+00:00",
+            source_path="/test/fact-upsert.md",
+            embedding=mock_embedding_model.embed("Jordan Portland"),
+        )
+
+        second_rowid = await projection_db.index_user_model_fact(
+            fact_id="fact-upsert",
+            domain="living_situation",
+            content="Jordan lives in Portland, Oregon",
+            confidence=0.8,
+            evidence_count=3,
+            contradiction_count=0,
+            created_at="2025-01-01T00:00:00+00:00",
+            updated_at="2025-01-02T00:00:00+00:00",
+            source_path="/test/fact-upsert.md",
+            embedding=mock_embedding_model.embed("Jordan Portland Oregon"),
+        )
+
+        assert second_rowid == first_rowid
+        fact = await projection_db.get_fact_by_id("fact-upsert")
+        assert fact is not None
+        assert fact["domain"] == "living_situation"
+        assert fact["content"] == "Jordan lives in Portland, Oregon"
+
+    async def test_search_returns_memories_and_user_facts(
+        self, projection_db, mock_embedding_model
+    ):
+        await projection_db.index_memory(
+            memory_id="mem-search",
+            content="Jordan compared Obsidian and Logseq for privacy",
+            summary="tool comparison",
+            importance=0.8,
+            memory_type="episodic",
+            created_at="2025-01-01T00:00:00+00:00",
+            updated_at="2025-01-01T00:00:00+00:00",
+            entities="[]",
+            tags="[]",
+            source_path="/test/mem-search.md",
+            embedding=mock_embedding_model.embed("tool comparison"),
+        )
+        await projection_db.index_user_model_fact(
+            fact_id="fact-search",
+            domain="identity",
+            content="Jordan prefers local-first tools",
+            confidence=0.9,
+            evidence_count=1,
+            contradiction_count=0,
+            created_at="2025-01-02T00:00:00+00:00",
+            updated_at="2025-01-02T00:00:00+00:00",
+            source_path="/test/fact-search.md",
+            embedding=mock_embedding_model.embed("local first tools"),
+        )
+
+        results = await projection_db.search("Jordan local first", limit=5)
+
+        assert {r.id for r in results} >= {"mem-search", "fact-search"}
+        assert all(r.content for r in results)
 
     async def test_delete_memory(self, projection_db, mock_embedding_model):
         """Deleting a memory removes it from the base table and vec table."""
@@ -622,7 +762,7 @@ class TestRetrieval:
                 id="old",
                 content="Old memory",
                 score=1.0,
-                source_path=f"/data/2020-01-01/old.md",
+                source_path="/data/2020-01-01/old.md",
             ),
             MemoryResult(
                 id="new",
@@ -720,9 +860,9 @@ class TestDedup:
 
     async def test_dedup_check_no_candidates(self, tmp_path):
         """dedup_check returns NEW when no FTS5 candidates match."""
-        from kora_v2.memory.dedup import DedupAction, dedup_check
-
         import sqlite_vec
+
+        from kora_v2.memory.dedup import DedupAction, dedup_check
 
         db_path = tmp_path / "dedup_no_cand.db"
         async with aiosqlite.connect(str(db_path), check_same_thread=False) as db:
@@ -752,9 +892,9 @@ class TestDedup:
 
     async def test_dedup_check_merge_found(self, tmp_path):
         """dedup_check returns MERGE with merged content when LLM says merge."""
-        from kora_v2.memory.dedup import DedupAction, dedup_check
-
         import sqlite_vec
+
+        from kora_v2.memory.dedup import DedupAction, dedup_check
 
         db_path = tmp_path / "dedup_merge.db"
         async with aiosqlite.connect(str(db_path), check_same_thread=False) as db:
@@ -833,6 +973,40 @@ class TestWritePipeline:
         types = {etype for _, etype in entities}
         assert "Sarah" in names
         assert "person" in types
+
+    async def test_extract_entities_named_relationship_aliases(self):
+        """Extraction links named people and relationship aliases."""
+        from kora_v2.memory.write_pipeline import _extract_entities
+
+        entities = _extract_entities(
+            "Alex is Jordan's roommate/partner who makes coffee."
+        )
+        names = {name for name, etype in entities if etype == "person"}
+
+        assert "Alex" in names
+        assert "roommate" in names
+        assert "partner" in names
+
+        partner_named = _extract_entities("Jordan has a partner named Alex.")
+        partner_names = {name for name, etype in partner_named if etype == "person"}
+        assert {"Alex", "partner"}.issubset(partner_names)
+
+        possessive = _extract_entities("Jordan's partner is named Alex.")
+        possessive_names = {name for name, etype in possessive if etype == "person"}
+        assert {"Alex", "partner"}.issubset(possessive_names)
+
+        first_person = _extract_entities("Alex is my partner.")
+        first_person_names = {name for name, etype in first_person if etype == "person"}
+        assert {"Alex", "partner"}.issubset(first_person_names)
+
+    async def test_extract_entities_lives_with_person(self):
+        """Extraction detects named cohabitants without a relationship word."""
+        from kora_v2.memory.write_pipeline import _extract_entities
+
+        entities = _extract_entities("Jordan lives with Alex in the mornings.")
+        names = {name for name, etype in entities if etype == "person"}
+
+        assert "Alex" in names
 
     async def test_extract_entities_location(self):
         """Regex extraction detects locations after 'I live in'."""
@@ -940,6 +1114,78 @@ class TestWritePipeline:
         note = await memory_store.read_note(result.note_id)
         assert note is not None
         assert note.metadata.memory_type == "user_model"
+
+    async def test_store_uses_extraction_entity_hints(
+        self, memory_store, projection_db, mock_embedding_model,
+    ):
+        """LLM extraction entities are linked even when regex misses them."""
+        from kora_v2.memory.write_pipeline import WritePipeline
+
+        pipeline = WritePipeline(
+            store=memory_store,
+            projection_db=projection_db,
+            embedding_model=mock_embedding_model,
+            llm=None,
+        )
+
+        result = await pipeline.store_user_model_fact(
+            content="Jordan's household includes a named pet.",
+            domain="relationships",
+            importance=0.8,
+            entity_hints=["Mochi"],
+            skip_dedup=True,
+        )
+
+        assert result.action == "created"
+        assert result.entities_extracted == ["Mochi"]
+
+        linked = await projection_db.get_memories_by_entity("Mochi")
+        assert any(record.id == result.note_id for record in linked)
+
+    async def test_duplicate_user_model_fact_links_entities(
+        self,
+        memory_store,
+        projection_db,
+        mock_embedding_model,
+    ):
+        """Duplicate facts still add entity links from the incoming evidence."""
+        from kora_v2.memory.write_pipeline import WritePipeline
+
+        await projection_db.index_user_model_fact(
+            fact_id="fact-existing",
+            domain="relationships",
+            content="Jordan has a partner named Alex.",
+            confidence=0.4,
+            evidence_count=1,
+            contradiction_count=0,
+            created_at="2026-04-26T00:00:00+00:00",
+            updated_at="2026-04-26T00:00:00+00:00",
+            source_path="/test/fact-existing.md",
+            embedding=mock_embedding_model.embed("Jordan has partner Alex"),
+        )
+
+        class DuplicateLLM:
+            async def __call__(self, prompt, **kwargs):
+                return "ACTION: DUPLICATE"
+
+        pipeline = WritePipeline(
+            store=memory_store,
+            projection_db=projection_db,
+            embedding_model=mock_embedding_model,
+            llm=DuplicateLLM(),
+        )
+
+        result = await pipeline.store_user_model_fact(
+            content="Jordan has a partner named Alex.",
+            domain="relationships",
+            importance=0.8,
+        )
+
+        assert result.action == "duplicate"
+        assert {"Alex", "partner"}.issubset(set(result.entities_extracted))
+
+        partner_context = await projection_db.get_memories_by_entity("partner")
+        assert any(record.id == "fact-existing" for record in partner_context)
 
 
 # ==================================================================

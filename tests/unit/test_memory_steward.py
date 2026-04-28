@@ -359,6 +359,36 @@ class TestPickRicherNote:
 class TestExtractStep:
     """Tests for the extract_step handler."""
 
+    async def test_llm_call_uses_generate_provider_contract(self) -> None:
+        """Production MiniMaxProvider exposes generate(), not chat()."""
+        from kora_v2.agents.background.memory_steward_handlers import _llm_call
+
+        class GenerateOnlyLLM:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            async def generate(self, messages, **kwargs):
+                self.calls.append({"messages": messages, "kwargs": kwargs})
+                return "[]"
+
+        llm = GenerateOnlyLLM()
+        container = MagicMock()
+        container.llm = llm
+
+        response = await _llm_call(container, "system prompt", "user prompt")
+
+        assert response == "[]"
+        assert llm.calls == [
+            {
+                "messages": [{"role": "user", "content": "user prompt"}],
+                "kwargs": {
+                    "system_prompt": "system prompt",
+                    "temperature": 0.2,
+                    "max_tokens": 2000,
+                },
+            }
+        ]
+
     async def test_drains_signals_and_transcripts(self, tmp_path: Path) -> None:
         """Extract step processes pending signals and unprocessed transcripts."""
         db_path = tmp_path / "operational.db"
@@ -403,6 +433,13 @@ class TestExtractStep:
 
         assert result.outcome == "complete"
         assert "1 facts extracted" in (result.result_summary or "")
+        container.write_pipeline.store_user_model_fact.assert_awaited_once()
+        assert (
+            container.write_pipeline.store_user_model_fact.await_args.kwargs[
+                "entity_hints"
+            ]
+            == ["Google"]
+        )
 
         # Verify transcript marked processed
         async with aiosqlite.connect(str(db_path)) as db:
@@ -459,6 +496,49 @@ class TestExtractStep:
             row = await cursor.fetchone()
             assert row is not None
             assert row[0] is not None
+
+    async def test_out_of_batch_signal_remains_pending(
+        self, tmp_path: Path
+    ) -> None:
+        """Signals beyond the transcript batch wait for the next pass."""
+        db_path = tmp_path / "operational.db"
+        await _setup_operational_db(db_path)
+
+        for idx in range(6):
+            session_id = f"session-{idx}"
+            await _insert_transcript(
+                db_path,
+                session_id,
+                [{"role": "user", "content": f"fact {idx}"}],
+            )
+            await _insert_signal(db_path, f"sig-{idx}", session_id)
+
+        container = _make_container(tmp_path, llm_response="[]", db_path=db_path)
+
+        with patch(
+            "kora_v2.agents.background.memory_steward_handlers.get_autonomous_context"
+        ) as mock_ctx:
+            mock_ctx.return_value = MagicMock(container=container, db_path=db_path)
+            from kora_v2.agents.background.memory_steward_handlers import (
+                extract_step,
+            )
+
+            task = _make_task(stage_name="extract")
+            ctx = _make_step_context(task)
+            result = await extract_step(task, ctx)
+
+        assert result.outcome == "complete"
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            cursor = await db.execute(
+                "SELECT status, processed_at FROM signal_queue "
+                "WHERE id = 'sig-5'"
+            )
+            row = await cursor.fetchone()
+
+        assert row is not None
+        assert row[0] == "pending"
+        assert row[1] is None
 
     async def test_handles_no_pending_data(self, tmp_path: Path) -> None:
         """Extract step completes cleanly when there's nothing to process."""
@@ -550,8 +630,11 @@ class TestConsolidateStep:
         # Should process at most 3 groups (MAX_CONSOLIDATION_GROUPS)
         assert container.llm.chat.call_count <= 3
 
-    async def test_rejects_excessive_shrinkage(self, tmp_path: Path) -> None:
-        """Consolidation rejects output that is >40% shorter than inputs."""
+    async def test_uses_deterministic_fallback_for_excessive_shrinkage(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Consolidation preserves inputs when LLM output over-shrinks."""
         db_path = tmp_path / "operational.db"
         await _setup_operational_db(db_path)
 
@@ -602,9 +685,11 @@ class TestConsolidateStep:
             result = await consolidate_step(task, ctx)
 
         assert result.outcome == "complete"
-        assert "1 rejected" in (result.result_summary or "")
-        # WritePipeline.store should NOT have been called
-        container.write_pipeline.store.assert_not_called()
+        assert "1 groups merged" in (result.result_summary or "")
+        container.write_pipeline.store.assert_called_once()
+        stored_content = container.write_pipeline.store.await_args.kwargs["content"]
+        assert "Source Note 1" in stored_content
+        assert "A" * 100 in stored_content
 
     async def test_soft_deletes_originals(self, tmp_path: Path) -> None:
         """After successful consolidation, originals are soft-deleted."""
@@ -804,6 +889,163 @@ class TestDedupStep:
         # Soft delete should NOT have been called
         assert container.memory_store.soft_delete_note.call_count == 0
 
+    async def test_exact_duplicate_bodies_skip_llm_confirmation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Exact duplicate note bodies are safe to merge without an LLM call."""
+        db_path = tmp_path / "operational.db"
+        await _setup_operational_db(db_path)
+
+        container = _make_container(tmp_path, db_path=db_path)
+
+        from kora_v2.memory.projection import DuplicatePair, MemoryRecord
+
+        pairs = [
+            DuplicatePair(
+                record_a=MemoryRecord(
+                    id="note-a",
+                    content="same local-first preference",
+                    importance=0.8,
+                    source_table="memories",
+                ),
+                record_b=MemoryRecord(
+                    id="note-b",
+                    content="same local-first preference",
+                    importance=0.5,
+                    source_table="memories",
+                ),
+                similarity=1.0,
+            )
+        ]
+        container.projection_db.deduplicate = AsyncMock(return_value=pairs)
+        container.memory_store = MagicMock()
+        container.memory_store.read_note = AsyncMock(
+            side_effect=[
+                MagicMock(body="Same local-first preference."),
+                MagicMock(body="Same local-first preference."),
+            ]
+        )
+        container.memory_store.soft_delete_note = AsyncMock(return_value=True)
+        container.memory_store.update_frontmatter = AsyncMock(return_value=MagicMock())
+        container.llm.chat = AsyncMock()
+
+        with patch(
+            "kora_v2.agents.background.memory_steward_handlers.get_autonomous_context"
+        ) as mock_ctx:
+            mock_ctx.return_value = MagicMock(container=container, db_path=db_path)
+            from kora_v2.agents.background.memory_steward_handlers import (
+                dedup_step,
+            )
+
+            task = _make_task(stage_name="dedup")
+            ctx = _make_step_context(task)
+            result = await dedup_step(task, ctx)
+
+        assert result.outcome == "complete"
+        assert "1 duplicates removed" in (result.result_summary or "")
+        container.llm.chat.assert_not_called()
+
+    async def test_exact_duplicate_keeps_richer_note_with_real_store(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Dedup keeps the richer fixture note and soft-deletes the poorer one."""
+        db_path = tmp_path / "operational.db"
+        await _setup_operational_db(db_path)
+
+        from kora_v2.memory.projection import ProjectionDB
+
+        container = _make_container(tmp_path, db_path=db_path)
+        projection_db = await ProjectionDB.initialize(tmp_path / "projection.db")
+        container.projection_db = projection_db
+
+        duplicate_body = (
+            "Jordan prefers local-first tools for the dashboard because "
+            "privacy and low maintenance matter more than cloud polish."
+        )
+        richer = await container.memory_store.write_note(
+            duplicate_body,
+            memory_type="reflective",
+            entities=["Jordan", "Alex", "Mochi"],
+            tags=["acceptance-fixture", "dedup"],
+            importance=0.95,
+            note_id="acceptance-dedup-local-first-a",
+        )
+        poorer = await container.memory_store.write_note(
+            duplicate_body,
+            memory_type="reflective",
+            entities=["Jordan"],
+            tags=["acceptance-fixture", "dedup"],
+            importance=0.2,
+            note_id="acceptance-dedup-local-first-b",
+        )
+        zero_embedding = [0.0] * 768
+        await projection_db.index_memory(
+            memory_id=richer.id,
+            content=duplicate_body,
+            summary=None,
+            importance=0.95,
+            memory_type="reflective",
+            created_at=richer.created_at,
+            updated_at=richer.updated_at,
+            entities=json.dumps(["Jordan", "Alex", "Mochi"]),
+            tags=json.dumps(["acceptance-fixture", "dedup"]),
+            source_path=richer.source_path,
+            embedding=zero_embedding,
+        )
+        await projection_db.index_memory(
+            memory_id=poorer.id,
+            content=duplicate_body,
+            summary=None,
+            importance=0.2,
+            memory_type="reflective",
+            created_at=poorer.created_at,
+            updated_at=poorer.updated_at,
+            entities=json.dumps(["Jordan"]),
+            tags=json.dumps(["acceptance-fixture", "dedup"]),
+            source_path=poorer.source_path,
+            embedding=zero_embedding,
+        )
+
+        try:
+            with patch(
+                "kora_v2.agents.background.memory_steward_handlers.get_autonomous_context"
+            ) as mock_ctx:
+                mock_ctx.return_value = MagicMock(container=container, db_path=db_path)
+                from kora_v2.agents.background.memory_steward_handlers import (
+                    dedup_step,
+                )
+
+                task = _make_task(stage_name="dedup")
+                ctx = _make_step_context(task)
+                result = await dedup_step(task, ctx)
+
+            assert result.outcome == "complete"
+            assert "1 duplicates removed" in (result.result_summary or "")
+
+            richer_note = await container.memory_store.read_note(richer.id)
+            poorer_note = await container.memory_store.read_note(poorer.id)
+            assert richer_note is not None
+            assert poorer_note is not None
+            assert richer_note.body == duplicate_body
+            richer_text = Path(richer.source_path).read_text(encoding="utf-8")
+            poorer_text = Path(poorer.source_path).read_text(encoding="utf-8")
+            assert f"- {poorer.id}" in richer_text
+            assert "status: merged" in poorer_text
+            assert f"consolidated_into: {richer.id}" in poorer_text
+
+            poorer_row = await projection_db.get_memory_by_id(
+                poorer.id,
+                include_soft_deleted=True,
+            )
+            assert poorer_row is not None
+            assert poorer_row["status"] == "merged"
+            assert poorer_row["consolidated_into"] == richer.id
+            assert poorer_row["deleted_at"] is not None
+        finally:
+            await projection_db.close()
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # Entity Resolution Step Tests
@@ -872,6 +1114,67 @@ class TestEntitiesStep:
         call_args = container.projection_db.merge_entities.call_args
         assert call_args[1]["source_id"] == "e2"  # Sara (fewer links)
         assert call_args[1]["target_id"] == "e1"  # Sarah (more links)
+
+    async def test_merges_relationship_alias_into_named_person(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Entity resolution merges relationship aliases from shared context."""
+        db_path = tmp_path / "operational.db"
+        await _setup_operational_db(db_path)
+
+        container = _make_container(tmp_path, db_path=db_path)
+
+        from kora_v2.memory.projection import EntityRecord, MemoryRecord
+
+        entities = [
+            EntityRecord(
+                id="e1",
+                name="Alex",
+                canonical_name="alex",
+                entity_type="person",
+                active_link_count=1,
+            ),
+            EntityRecord(
+                id="e2",
+                name="partner",
+                canonical_name="partner",
+                entity_type="person",
+                active_link_count=5,
+            ),
+        ]
+        container.projection_db.get_entities_by_type = AsyncMock(
+            side_effect=lambda t: entities if t == "person" else []
+        )
+        container.projection_db.get_memories_by_entity = AsyncMock(
+            return_value=[
+                MemoryRecord(
+                    id="m1",
+                    content="Alex is Jordan's roommate/partner who makes coffee.",
+                )
+            ]
+        )
+
+        with patch(
+            "kora_v2.agents.background.memory_steward_handlers.get_autonomous_context"
+        ) as mock_ctx:
+            mock_ctx.return_value = MagicMock(container=container, db_path=db_path)
+            from kora_v2.agents.background.memory_steward_handlers import (
+                entities_step,
+            )
+
+            task = _make_task(stage_name="entities")
+            ctx = _make_step_context(task)
+            result = await entities_step(task, ctx)
+
+        assert result.outcome == "complete"
+        assert "1 merged" in (result.result_summary or "")
+        container.llm.chat.assert_not_called()
+
+        container.projection_db.merge_entities.assert_called_once()
+        call_args = container.projection_db.merge_entities.call_args
+        assert call_args[1]["source_id"] == "e2"
+        assert call_args[1]["target_id"] == "e1"
 
     async def test_skips_unconfirmed_pairs(self, tmp_path: Path) -> None:
         """Entity resolution skips pairs the LLM says are distinct."""

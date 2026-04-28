@@ -1,21 +1,85 @@
-# Life Module (`kora_v2/life/`)
+# Life OS Module (`kora_v2/life/`)
 
-The `life/` package is deliberately lean: it owns the domain logic for guided routines and nothing else. Reminders, medication logging, meal tracking, focus blocks, expenses, and quick notes are handled by tools in `kora_v2/tools/life_management.py` — the `life/` package only contains `routines.py`, which provides the richer stateful session model that a simple tool call cannot express. The `ContextEngine` (`kora_v2/context/engine.py`) aggregates all life domains into `DayContext` and `LifeContext`; that file is the real heart of life management and is documented here alongside the life package.
+The `life/` package is now Kora's Life OS runtime. It owns the durable loop:
+
+```text
+Plan Today -> Confirm Reality -> Repair The Day -> Bridge Tomorrow
+```
+
+Guided routines and reminders remain active, but they are no longer the whole life layer. Medication logging, meal tracking, focus blocks, expenses, quick notes, items, calendar entries, support profiles, context packs, nudge policy, stabilization, and future bridges now feed the same Life Event Ledger and operational database. `ContextEngine` still aggregates life state into `DayContext` and `LifeContext`; Life OS services add durable product behavior behind that context.
 
 ## Files in this module
 
 | File | Lines | Role |
 |---|---|---|
 | [`kora_v2/life/__init__.py`](../../kora_v2/life/__init__.py) | 1 | Empty package marker |
+| [`kora_v2/life/models.py`](../../kora_v2/life/models.py) | 400+ | Life OS Pydantic contracts |
+| [`kora_v2/life/domain_events.py`](../../kora_v2/life/domain_events.py) | 100+ | Append-only domain-event writer |
+| [`kora_v2/life/ledger.py`](../../kora_v2/life/ledger.py) | 200+ | Life Event Ledger |
+| [`kora_v2/life/day_plan.py`](../../kora_v2/life/day_plan.py) | 250+ | Versioned day-plan service |
+| [`kora_v2/life/load.py`](../../kora_v2/life/load.py) | 250+ | Life Load Meter |
+| [`kora_v2/life/repair.py`](../../kora_v2/life/repair.py) | 300+ | Repair The Day and energy-aware reshaping |
+| [`kora_v2/life/proactivity_policy.py`](../../kora_v2/life/proactivity_policy.py) | 200+ | Nudge policy and feedback |
+| [`kora_v2/life/stabilization.py`](../../kora_v2/life/stabilization.py) | 200+ | Stabilization Mode |
+| [`kora_v2/life/context_packs.py`](../../kora_v2/life/context_packs.py) | 200+ | Context packs and memory artifacts |
+| [`kora_v2/life/future_bridge.py`](../../kora_v2/life/future_bridge.py) | 200+ | Future Self Bridge |
+| [`kora_v2/life/trusted_support.py`](../../kora_v2/life/trusted_support.py) | 200+ | Social/sensory helpers and trusted-support exports |
 | [`kora_v2/life/routines.py`](../../kora_v2/life/routines.py) | 440 | Models, RoutineManager, progress tracking |
+| [`kora_v2/life/reminders.py`](../../kora_v2/life/reminders.py) | 250+ | ReminderStore, due polling, delivery/reschedule state |
 | [`kora_v2/tools/life_management.py`](../../kora_v2/tools/life_management.py) | 1020 | 11 life-domain write/query tools |
-| [`kora_v2/tools/routines.py`](../../kora_v2/tools/routines.py) | 244 | 4 routine-lifecycle tools |
+| [`kora_v2/tools/life_os.py`](../../kora_v2/tools/life_os.py) | 300+ | 11 Life OS loop tools |
+| [`kora_v2/support/`](../../kora_v2/support/) | package | Support registry, bootstrap, and runtime support modules |
+| [`kora_v2/safety/crisis.py`](../../kora_v2/safety/crisis.py) | 150+ | Crisis safety boundary |
+| [`kora_v2/tools/routines.py`](../../kora_v2/tools/routines.py) | 244+ | 5 routine-lifecycle tools |
 | [`kora_v2/context/engine.py`](../../kora_v2/context/engine.py) | 886 | ContextEngine (aggregation hub) |
 | [`kora_v2/tools/planning.py`](../../kora_v2/tools/planning.py) | ~740 | `day_briefing`, `life_summary`, ADHD time correction |
 
 ---
 
-## Part 1: Routines (`kora_v2/life/routines.py`)
+## Part 1: Life OS Services
+
+Life OS services are container-resolved and all write durable proof to `data/operational.db`.
+
+| Service | Main durable proof |
+|---|---|
+| `DomainEventStore` | `domain_events` rows for product-significant events |
+| `LifeEventLedger` | `life_events` rows for confirmed, inferred, corrected, rejected, tool-generated reality |
+| `DayPlanService` | `day_plans` and `day_plan_entries`, including active/superseded revisions |
+| `LifeLoadEngine` | `load_assessments` with band, score, factors, and assumptions |
+| `DayRepairEngine` | `plan_repair_actions` plus a new day-plan revision when repair is applied |
+| `ProactivityPolicyEngine` | `nudge_decisions` and `nudge_feedback` |
+| `StabilizationModeService` | `support_mode_state` and reduced active plan behavior |
+| `ContextPackService` | `context_packs` rows and markdown artifacts under the memory root |
+| `FutureSelfBridgeService` | `future_self_bridges` rows and markdown artifacts |
+| `TrustedSupportExportService` / `SocialSensorySupportService` | user-reviewed export drafts and social/sensory planning helpers |
+| `SupportProfileBootstrapService` / `SupportRegistry` | `support_profiles` and `support_profile_signals` |
+| `CrisisSafetyRouter` | `safety_boundary_records`, before normal planning/repair/proactivity |
+
+### Life OS tools
+
+`kora_v2/tools/life_os.py` exposes the runtime loop:
+
+- `create_day_plan`
+- `confirm_reality`
+- `correct_reality`
+- `assess_life_load`
+- `repair_day_plan`
+- `decide_life_nudge`
+- `record_nudge_feedback`
+- `create_context_pack`
+- `bridge_tomorrow`
+- `set_support_profile_status`
+- `check_crisis_boundary`
+
+These are not prompt-only instructions. They mutate operational DB state, memory-root artifacts, support profile status, or crisis-boundary records.
+
+### Acceptance status
+
+The Life OS acceptance collector exists in `tests/acceptance/life_os.py` and is rendered by `tests/acceptance/_report.py`. It checks DB rows and artifacts for the Life OS loop. The public docs should still avoid claiming a full week-long Life OS harness is green until the old product-centered acceptance scenario is fully replaced and rerun.
+
+---
+
+## Part 2: Routines (`kora_v2/life/routines.py`)
 
 Routines are Phase 6B. They represent multi-step structured workflows (e.g., "Morning Routine", "Wind-down") that the user can execute step-by-step inside a conversation. They run through the same autonomous graph runtime as other plan types when invoked with `mode='routine'` (referenced in the module docstring), but their partial-completion state is tracked separately in SQLite so progress survives session boundaries.
 
@@ -139,10 +203,11 @@ Indexes: `idx_routine_sessions_routine (routine_id)`, `idx_routine_sessions_sess
 
 ### Routine tools (`kora_v2/tools/routines.py`)
 
-Four tools bridge the `RoutineManager` to the supervisor's tool registry:
+Five tools bridge the `RoutineManager` to the supervisor's tool registry:
 
 | Tool | Auth | Notes |
 |---|---|---|
+| `create_routine(name, steps, tags, ...)` | `ASK_FIRST` | Persists a reusable routine template and can register runtime scheduling metadata |
 | `list_routines(tags)` | `ALWAYS_ALLOWED` (read-only) | Comma-separated tags string → tag list filter |
 | `start_routine(routine_id, session_id, variant)` | `ASK_FIRST` | Creates `routine_sessions` row |
 | `advance_routine(session_id, step_index, skipped)` | `ASK_FIRST` | Returns `RoutineProgress` fields + shame-free message |
@@ -152,9 +217,11 @@ All tools return JSON strings with a `success` boolean.
 
 ---
 
-## Part 2: Life-Management Tools (`kora_v2/tools/life_management.py`)
+## Part 3: Life-Management Tools (`kora_v2/tools/life_management.py`)
 
-These are the direct write and query surface for the life-domain tables. Each is registered with the `@tool` decorator and appears in the supervisor's tool registry. They all accept a `container` argument to resolve `settings.data_dir / "operational.db"`.
+These are the direct write and query surface for the older life-domain tables. Each is registered with the `@tool` decorator and appears in the supervisor's tool registry. They all accept a `container` argument to resolve `settings.data_dir / "operational.db"`.
+
+After the Life OS pivot, successful write tools also emit Life Event Ledger rows so medication, meals, focus blocks, reminders, expenses, and quick notes do not bypass Life OS reality tracking.
 
 ### Medication tracking
 
@@ -191,7 +258,7 @@ The `log_medication` description contains an aggressive instruction: "ALWAYS cal
 | `create_reminder(title, description, remind_at, recurring)` | `ASK_FIRST` | `reminders` | INSERT; `remind_at` is an ISO timestamp string or empty |
 | `query_reminders(status, limit)` | `ALWAYS_ALLOWED` | `reminders` | SELECT WHERE status=? ORDER BY remind_at ASC |
 
-Reminders are currently stored-only: there is no background delivery daemon polling `reminders.remind_at`. The `upcoming_nudges` in `DayContext` uses `calendar_entries` (the richer timeline), not this table. Phase 8 is expected to wire `reminders` into a `time_of_day` or `condition` trigger on an `OrchestrationEngine` pipeline so the dispatcher rather than a dedicated poller owns delivery. See "Limitations" below.
+Reminders are no longer stored-only. There is still no dedicated reminder daemon; delivery is owned by orchestration. `create_reminder` writes the legacy columns plus Phase 8e scheduling columns and can kick the `continuity_check` pipeline when the due time is inside its scan window. `continuity_check_step` polls `ReminderStore.get_due_reminders()`, sends through `NotificationGate`, then marks or reschedules via `deliver_and_reschedule()`.
 
 ### Finance / expense tracking
 
@@ -223,6 +290,8 @@ CREATE TABLE IF NOT EXISTS reminders (
     status       TEXT NOT NULL DEFAULT 'pending',
     session_id   TEXT,
     created_at   TEXT NOT NULL
+    -- Startup migrations add Phase 8e columns:
+    -- due_at, repeat_rule, source, delivered_at, dismissed_at, metadata
 );
 
 CREATE TABLE IF NOT EXISTS medication_log (
@@ -282,9 +351,30 @@ CREATE TABLE IF NOT EXISTS energy_log (
 );
 ```
 
+### SQL schema — Life OS tables
+
+`core/db.py` also creates the Life OS product tables:
+
+| Table | Purpose |
+|---|---|
+| `domain_events` | Append-only product event stream |
+| `day_plans` | One active day-plan revision per local day, with superseded revisions preserved |
+| `day_plan_entries` | Entries inside a day-plan revision |
+| `life_events` | Ledger of confirmed, inferred, corrected, rejected, and tool-generated reality |
+| `load_assessments` | Life Load Meter outputs and factors |
+| `plan_repair_actions` | Repair proposals/applied actions |
+| `nudge_decisions` | Proactivity policy decisions |
+| `nudge_feedback` | User feedback on nudges |
+| `support_mode_state` | Quiet/high-support/recovery/stabilization state |
+| `context_packs` | Context pack metadata linked to artifacts |
+| `future_self_bridges` | End-of-day bridge metadata linked to artifacts |
+| `support_profiles` | Baseline and condition-specific profile status/configuration |
+| `support_profile_signals` | User corrections and profile-learning signals |
+| `safety_boundary_records` | Crisis-boundary checks and routing records |
+
 ---
 
-## Part 2.5: Open decisions (Phase 7.5)
+## Part 3.5: Open decisions (Phase 7.5)
 
 Before Phase 7.5 the autonomous graph had its own ad-hoc `DecisionManager` that only tracked decisions a `WorkerTask` was blocked on. There was no general surface for "the user and Kora are in the middle of deciding something" — life-domain decisions like "where do I reroute my dentist" lived only in conversation transcripts.
 
@@ -316,7 +406,7 @@ See [`../01-runtime-core/orchestration.md`](../01-runtime-core/orchestration.md)
 
 ---
 
-## Part 3: Context Engine (`kora_v2/context/engine.py`)
+## Part 4: Context Engine (`kora_v2/context/engine.py`)
 
 `ContextEngine` is the aggregation hub. It does not own any data; it queries every life-domain table and synthesizes two output types.
 
@@ -478,7 +568,7 @@ Note: All insight strings are written to avoid blame framing ("no judgment" is e
 
 ## Known limitations and stubs
 
-- **Reminders have no delivery mechanism**: the `reminders` table is populated by `create_reminder` but no background process polls `remind_at`. The `DayContext.upcoming_nudges` comes from `calendar_entries`, not `reminders`.
+- **Reminder acceptance is not fully proven in the latest short run**: code has `ReminderStore` and `continuity_check` delivery, but the 2026-04-28 short acceptance report had `Reminders: 0` and left routine-created reminder delivery red.
 - **`energy_log` write tool is absent**: `energy_log` is read by `ContextEngine` and the `_aggregate_energy_trend` aggregator, but there is no `log_energy` tool in `life_management.py`. Self-reported energy must currently come from the supervisor or a direct DB insert. This is likely intended for Phase 8.
 - **`checkpoint_state` and `last_nudge_at` in `routine_sessions`**: both columns exist in the schema but are never written by `RoutineManager`. They are reserved for future autonomous routine execution and proactive nudging.
 - **`finance_summary` insight**: the 4-rule insights generator does not include a finance rule despite the `finance_summary` field being present in `LifeContext`.

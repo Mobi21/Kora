@@ -1,10 +1,7 @@
 """Tests for kora_v2/autonomous/graph.py — Phase 6A node functions."""
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -13,6 +10,7 @@ from kora_v2.autonomous.graph import (
     classify_request,
     complete,
     decision_request,
+    execute_step,
     failed,
     paused_for_overlap,
     persist_plan,
@@ -20,7 +18,7 @@ from kora_v2.autonomous.graph import (
     route_next_node,
 )
 from kora_v2.autonomous.state import AutonomousState
-
+from kora_v2.core.exceptions import LLMTimeoutError
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -37,6 +35,17 @@ def _make_state(**kwargs) -> AutonomousState:
     )
     defaults.update(kwargs)
     return AutonomousState(**defaults)
+
+
+class _TimeoutExecutor:
+    async def execute(self, _input_data):
+        raise LLMTimeoutError("MiniMax request timed out after 120s")
+
+
+class _ContainerWithExecutor:
+    def resolve_worker(self, name: str):
+        assert name == "executor"
+        return _TimeoutExecutor()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,6 +175,62 @@ class TestReflect:
         original_status = state.status
         reflect(state)
         assert state.status == original_status
+
+
+@pytest.mark.asyncio
+async def test_execute_step_checkpoints_and_retries_transient_minimax_timeout():
+    state = _make_state(
+        status="planned",
+        pending_step_ids=["s1"],
+        metadata={
+            "goal": "Research a topic",
+            "steps": {
+                "s1": {
+                    "id": "s1",
+                    "title": "Research",
+                    "description": "Research the topic",
+                    "worker": "executor",
+                }
+            },
+        },
+    )
+
+    updated = await execute_step(state, _ContainerWithExecutor())
+
+    assert updated.status == "checkpointing"
+    assert updated.pending_step_ids == ["s1"]
+    assert updated.completed_step_ids == []
+    assert updated.metadata["step_retry_counts"]["s1"] == 1
+    assert updated.metadata["retry_pending_step_id"] == "s1"
+    assert "MiniMax request timed out" in updated.metadata["last_transient_error"]
+    assert updated.safe_resume_token
+
+
+@pytest.mark.asyncio
+async def test_execute_step_fails_after_transient_timeout_retry_limit():
+    state = _make_state(
+        status="planned",
+        pending_step_ids=["s1"],
+        metadata={
+            "goal": "Research a topic",
+            "step_retry_counts": {"s1": 3},
+            "steps": {
+                "s1": {
+                    "id": "s1",
+                    "title": "Research",
+                    "description": "Research the topic",
+                    "worker": "executor",
+                }
+            },
+        },
+    )
+
+    updated = await execute_step(state, _ContainerWithExecutor())
+
+    assert updated.status == "failed"
+    assert updated.metadata["failed_step_id"] == "s1"
+    assert updated.metadata["step_retry_counts"]["s1"] == 4
+    assert "Step execution failed" in updated.metadata["failure_reason"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -98,6 +98,7 @@ from kora_v2.runtime.orchestration.templates import (
     TemplatePriority,
     TemplateRegistry,
 )
+from kora_v2.runtime.orchestration.trigger_evaluator import TriggerEvaluator
 from kora_v2.runtime.orchestration.triggers import (
     ConditionFn,
     Trigger,
@@ -172,6 +173,7 @@ __all__ = [
     "TriggerKind",
     "TriggerContext",
     "ConditionFn",
+    "TriggerEvaluator",
     "interval",
     "event",
     "condition",

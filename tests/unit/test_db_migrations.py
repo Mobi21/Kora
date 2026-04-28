@@ -127,3 +127,62 @@ class TestPermissionGrantMigrations:
         assert row[1] == "personal"
         assert row[2] == "gmail.send"
         assert row[3] is None
+
+
+class TestLifeOSSchema:
+    """Verify the Life OS durable proof tables are initialized."""
+
+    @pytest.mark.asyncio
+    async def test_life_os_tables_exist_and_init_is_idempotent(self, tmp_path):
+        db_path = tmp_path / "life_os.db"
+        await init_operational_db(db_path)
+        await init_operational_db(db_path)
+
+        expected = {
+            "day_plans",
+            "day_plan_entries",
+            "life_events",
+            "domain_events",
+            "load_assessments",
+            "plan_repair_actions",
+            "nudge_decisions",
+            "nudge_feedback",
+            "support_mode_state",
+            "context_packs",
+            "future_self_bridges",
+            "support_profiles",
+            "support_profile_signals",
+            "safety_boundary_records",
+        }
+        async with aiosqlite.connect(str(db_path)) as db:
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        assert expected.issubset({row[0] for row in rows})
+
+    @pytest.mark.asyncio
+    async def test_life_os_active_day_plan_uniqueness(self, tmp_path):
+        db_path = tmp_path / "life_os_unique.db"
+        await init_operational_db(db_path)
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            now = "2026-04-28T12:00:00+00:00"
+            await db.execute(
+                """
+                INSERT INTO day_plans
+                    (id, plan_date, revision, status, generated_from, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("plan-1", "2026-04-28", 1, "active", "test", now, now),
+            )
+            with pytest.raises(aiosqlite.IntegrityError):
+                await db.execute(
+                    """
+                    INSERT INTO day_plans
+                        (id, plan_date, revision, status, generated_from, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("plan-2", "2026-04-28", 2, "active", "test", now, now),
+                )

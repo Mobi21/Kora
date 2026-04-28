@@ -185,7 +185,7 @@ Tracks cumulative `_call_count`, `_total_prompt_tokens`,
 `_select_model(tier: ModelTier) -> str`:
 
 - `BACKGROUND` → `settings.background_model` if set, otherwise `settings.model`.
-- `CONVERSATION` → `settings.model` (default `"MiniMax-M2.7"`).
+- `CONVERSATION` → `settings.model` (default `"MiniMax-M2.7-highspeed"`).
 
 ### Pre-call safety check
 

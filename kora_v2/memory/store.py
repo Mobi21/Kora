@@ -98,6 +98,15 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     return meta, body
 
 
+def _frontmatter_str(value: object) -> str:
+    """Normalize YAML scalar values that Pydantic stores as strings."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
 def _render_note(meta: dict, body: str) -> str:
     """Render a note with YAML frontmatter + body content."""
     frontmatter = yaml.dump(
@@ -265,8 +274,8 @@ class FilesystemMemoryStore:
             importance=meta_dict.get("importance", 0.5),
             entities=meta_dict.get("entities", []),
             tags=meta_dict.get("tags", []),
-            created_at=meta_dict.get("created_at", ""),
-            updated_at=meta_dict.get("updated_at", ""),
+            created_at=_frontmatter_str(meta_dict.get("created_at", "")),
+            updated_at=_frontmatter_str(meta_dict.get("updated_at", "")),
             source_path=str(file_path),
         )
 
@@ -312,8 +321,8 @@ class FilesystemMemoryStore:
             importance=meta_dict.get("importance", 0.5),
             entities=meta_dict.get("entities", []),
             tags=meta_dict.get("tags", []),
-            created_at=meta_dict.get("created_at", ""),
-            updated_at=meta_dict["updated_at"],
+            created_at=_frontmatter_str(meta_dict.get("created_at", "")),
+            updated_at=_frontmatter_str(meta_dict["updated_at"]),
             source_path=str(file_path),
         )
 
@@ -359,8 +368,8 @@ class FilesystemMemoryStore:
                         importance=meta_dict.get("importance", 0.5),
                         entities=meta_dict.get("entities", []),
                         tags=meta_dict.get("tags", []),
-                        created_at=meta_dict.get("created_at", ""),
-                        updated_at=meta_dict.get("updated_at", ""),
+                        created_at=_frontmatter_str(meta_dict.get("created_at", "")),
+                        updated_at=_frontmatter_str(meta_dict.get("updated_at", "")),
                         source_path=str(md_file),
                     ))
                 except Exception:
@@ -444,8 +453,8 @@ class FilesystemMemoryStore:
             importance=meta_dict.get("importance", 0.5),
             entities=meta_dict.get("entities", []),
             tags=meta_dict.get("tags", []),
-            created_at=meta_dict.get("created_at", ""),
-            updated_at=meta_dict["updated_at"],
+            created_at=_frontmatter_str(meta_dict.get("created_at", "")),
+            updated_at=_frontmatter_str(meta_dict["updated_at"]),
             source_path=str(file_path),
         )
 
@@ -566,8 +575,8 @@ class FilesystemMemoryStore:
             importance=meta_dict.get("importance", 0.5),
             entities=meta_dict.get("entities", []),
             tags=meta_dict.get("tags", []),
-            created_at=meta_dict.get("created_at", ""),
-            updated_at=meta_dict["updated_at"],
+            created_at=_frontmatter_str(meta_dict.get("created_at", "")),
+            updated_at=_frontmatter_str(meta_dict["updated_at"]),
             source_path=str(file_path),
         )
 
@@ -643,8 +652,8 @@ class FilesystemMemoryStore:
             importance=meta_dict.get("importance", 0.5),
             entities=meta_dict.get("entities", []),
             tags=meta_dict.get("tags", []),
-            created_at=meta_dict.get("created_at", ""),
-            updated_at=meta_dict.get("updated_at", ""),
+            created_at=_frontmatter_str(meta_dict.get("created_at", "")),
+            updated_at=_frontmatter_str(meta_dict.get("updated_at", "")),
             source_path=str(new_path),
         )
 
@@ -674,6 +683,9 @@ class FilesystemMemoryStore:
         candidate = self._long_term / f"{note_id}.md"
         if candidate.is_file():
             return candidate
+
+        for md_file in self._long_term.rglob(f"{note_id}.md"):
+            return md_file
 
         # Recursive search in User Model (subdirectories)
         for md_file in self._user_model.rglob(f"{note_id}.md"):

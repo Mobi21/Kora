@@ -12,7 +12,9 @@ go through this module to keep indexes consistent.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import struct
 import uuid
 from datetime import UTC, datetime
@@ -25,8 +27,10 @@ from pydantic import BaseModel, Field
 from kora_v2.core.migrations import MigrationRunner
 
 log = structlog.get_logger(__name__)
+_TOKEN_RE = re.compile(r"[a-z0-9]{4,}", re.IGNORECASE)
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+_SEARCH_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
 # ------------------------------------------------------------------
@@ -127,6 +131,87 @@ class ProjectionDB:
         """Report available search capabilities."""
         return {"vector_search": self._vector_available, "fts5": True}
 
+    async def search(self, query: str, limit: int = 5) -> list[MemoryRecord]:
+        """Lightweight FTS5 search used by background proactive handlers.
+
+        The full retrieval module owns vector/hybrid ranking, but several
+        background handlers need a small provider-free lookup surface while
+        running inside orchestration tasks. Return ``MemoryRecord`` values
+        so callers can read ``.content`` and ``.created_at`` consistently.
+        """
+        terms = _SEARCH_TOKEN_RE.findall(query or "")
+        if not terms:
+            return []
+        match = " OR ".join(terms[:8])
+        rows: list[MemoryRecord] = []
+
+        try:
+            cur = await self._db.execute(
+                """
+                SELECT m.id, m.content, m.summary, m.importance,
+                       m.memory_type, m.source_path, m.created_at,
+                       m.updated_at, m.entities, m.tags
+                FROM memories_fts f
+                JOIN memories m ON m.rowid = f.rowid
+                WHERE memories_fts MATCH ? AND m.status = 'active'
+                LIMIT ?
+                """,
+                (match, limit),
+            )
+            for row in await cur.fetchall():
+                rd = dict(row)
+                rows.append(
+                    MemoryRecord(
+                        id=rd.get("id", ""),
+                        content=rd.get("content", ""),
+                        summary=rd.get("summary"),
+                        importance=rd.get("importance", 0.5),
+                        memory_type=rd.get("memory_type", "episodic"),
+                        source_path=rd.get("source_path", ""),
+                        source_table="memories",
+                        created_at=rd.get("created_at", ""),
+                        updated_at=rd.get("updated_at", ""),
+                        entities=rd.get("entities"),
+                        tags=rd.get("tags"),
+                    )
+                )
+        except Exception:
+            log.debug("projection_search_memories_failed", exc_info=True)
+
+        remaining = max(0, limit - len(rows))
+        if remaining:
+            try:
+                cur = await self._db.execute(
+                    """
+                    SELECT f.id, f.content, f.domain, f.confidence,
+                           f.source_path, f.created_at, f.updated_at
+                    FROM user_model_fts u
+                    JOIN user_model_facts f ON f.rowid = u.rowid
+                    WHERE user_model_fts MATCH ? AND f.status = 'active'
+                    LIMIT ?
+                    """,
+                    (match, remaining),
+                )
+                for row in await cur.fetchall():
+                    rd = dict(row)
+                    rows.append(
+                        MemoryRecord(
+                            id=rd.get("id", ""),
+                            content=rd.get("content", ""),
+                            summary=rd.get("domain"),
+                            importance=rd.get("confidence", 0.5),
+                            memory_type="user_model",
+                            source_path=rd.get("source_path", ""),
+                            source_table="user_model_facts",
+                            created_at=rd.get("created_at", ""),
+                            updated_at=rd.get("updated_at", ""),
+                        )
+                    )
+            except Exception:
+                log.debug("projection_search_user_model_failed", exc_info=True)
+
+        return rows[:limit]
+
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
@@ -208,25 +293,45 @@ class ProjectionDB:
         Returns:
             The rowid of the inserted memory.
         """
-        cursor = await self._db.execute(
-            "INSERT INTO memories "
-            "(id, content, summary, importance, memory_type, "
-            " created_at, updated_at, entities, tags, source_path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                memory_id, content, summary, importance, memory_type,
-                created_at, updated_at, entities, tags, source_path,
-            ),
-        )
-        rowid = cursor.lastrowid
-
-        if self._vector_available:
-            await self._db.execute(
-                "INSERT INTO memories_vec (rowid, embedding) VALUES (?, ?)",
-                (rowid, serialize_float32(embedding)),
+        try:
+            cursor = await self._db.execute(
+                "INSERT INTO memories "
+                "(id, content, summary, importance, memory_type, "
+                " created_at, updated_at, entities, tags, source_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "content = excluded.content, "
+                "summary = excluded.summary, "
+                "importance = excluded.importance, "
+                "memory_type = excluded.memory_type, "
+                "updated_at = excluded.updated_at, "
+                "entities = excluded.entities, "
+                "tags = excluded.tags, "
+                "source_path = excluded.source_path",
+                (
+                    memory_id, content, summary, importance, memory_type,
+                    created_at, updated_at, entities, tags, source_path,
+                ),
             )
+            cursor = await self._db.execute(
+                "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
+            )
+            row = await cursor.fetchone()
+            rowid = row[0] if row is not None else None
 
-        await self._db.commit()
+            if self._vector_available and rowid is not None:
+                await self._db.execute(
+                    "DELETE FROM memories_vec WHERE rowid = ?", (rowid,)
+                )
+                await self._db.execute(
+                    "INSERT INTO memories_vec (rowid, embedding) VALUES (?, ?)",
+                    (rowid, serialize_float32(embedding)),
+                )
+
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
 
         log.debug("memory_indexed", id=memory_id, rowid=rowid, vector=self._vector_available)
         return rowid  # type: ignore[return-value]
@@ -249,25 +354,44 @@ class ProjectionDB:
         Returns:
             The rowid of the inserted fact.
         """
-        cursor = await self._db.execute(
-            "INSERT INTO user_model_facts "
-            "(id, domain, content, confidence, evidence_count, "
-            " contradiction_count, created_at, updated_at, source_path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                fact_id, domain, content, confidence, evidence_count,
-                contradiction_count, created_at, updated_at, source_path,
-            ),
-        )
-        rowid = cursor.lastrowid
-
-        if self._vector_available:
-            await self._db.execute(
-                "INSERT INTO user_model_vec (rowid, embedding) VALUES (?, ?)",
-                (rowid, serialize_float32(embedding)),
+        try:
+            cursor = await self._db.execute(
+                "INSERT INTO user_model_facts "
+                "(id, domain, content, confidence, evidence_count, "
+                " contradiction_count, created_at, updated_at, source_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "domain = excluded.domain, "
+                "content = excluded.content, "
+                "confidence = excluded.confidence, "
+                "evidence_count = excluded.evidence_count, "
+                "contradiction_count = excluded.contradiction_count, "
+                "updated_at = excluded.updated_at, "
+                "source_path = excluded.source_path",
+                (
+                    fact_id, domain, content, confidence, evidence_count,
+                    contradiction_count, created_at, updated_at, source_path,
+                ),
             )
+            cursor = await self._db.execute(
+                "SELECT rowid FROM user_model_facts WHERE id = ?", (fact_id,)
+            )
+            row = await cursor.fetchone()
+            rowid = row[0] if row is not None else None
 
-        await self._db.commit()
+            if self._vector_available and rowid is not None:
+                await self._db.execute(
+                    "DELETE FROM user_model_vec WHERE rowid = ?", (rowid,)
+                )
+                await self._db.execute(
+                    "INSERT INTO user_model_vec (rowid, embedding) VALUES (?, ?)",
+                    (rowid, serialize_float32(embedding)),
+                )
+
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
 
         log.debug("user_model_fact_indexed", id=fact_id, rowid=rowid, vector=self._vector_available)
         return rowid  # type: ignore[return-value]
@@ -556,6 +680,106 @@ class ProjectionDB:
     # Consolidation & deduplication
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _row_to_memory_record(row: aiosqlite.Row, table: str) -> MemoryRecord:
+        rd = dict(row)
+        return MemoryRecord(
+            id=rd.get("id", ""),
+            content=rd.get("content", ""),
+            summary=rd.get("summary"),
+            memory_type=rd.get("memory_type", "semantic"),
+            importance=rd.get("importance", rd.get("confidence", 0.5)),
+            source_path=rd.get("source_path", ""),
+            source_table=table,
+            created_at=rd.get("created_at", ""),
+            updated_at=rd.get("updated_at", ""),
+            entities=rd.get("entities"),
+            tags=rd.get("tags"),
+        )
+
+    @staticmethod
+    def _text_similarity(a: str, b: str) -> float:
+        a_tokens = set(_TOKEN_RE.findall(a.lower()))
+        b_tokens = set(_TOKEN_RE.findall(b.lower()))
+        if not a_tokens or not b_tokens:
+            return 0.0
+        return len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
+
+    async def _active_records_for_table(self, table: str) -> list[MemoryRecord]:
+        cursor = await self._db.execute(
+            f"SELECT * FROM {table} WHERE status = 'active'"  # noqa: S608
+        )
+        return [
+            self._row_to_memory_record(row, table)
+            for row in await cursor.fetchall()
+        ]
+
+    async def _fallback_consolidation_groups(
+        self,
+        threshold: float,
+    ) -> list[MergeCandidateGroup]:
+        groups: list[MergeCandidateGroup] = []
+        seen: set[str] = set()
+        for table in ("memories", "user_model_facts"):
+            records = await self._active_records_for_table(table)
+            for idx, rec in enumerate(records):
+                if rec.id in seen:
+                    continue
+                related = [rec]
+                for other in records[idx + 1:]:
+                    if other.id in seen:
+                        continue
+                    similarity = self._text_similarity(rec.content, other.content)
+                    # Exact duplicates are left for the stricter dedup stage.
+                    if threshold <= similarity < 0.96:
+                        related.append(other)
+                if len(related) >= 2:
+                    seen.update(r.id for r in related)
+                    groups.append(
+                        MergeCandidateGroup(
+                            records=related,
+                            avg_similarity=threshold,
+                        )
+                    )
+        return groups
+
+    async def _fallback_duplicate_pairs(
+        self,
+        threshold: float,
+        excluded_pairs: set[tuple[str, str]],
+    ) -> list[DuplicatePair]:
+        pairs: list[DuplicatePair] = []
+        for table in ("memories", "user_model_facts"):
+            records = await self._active_records_for_table(table)
+            for idx, rec in enumerate(records):
+                for other in records[idx + 1:]:
+                    pair_key = tuple(sorted([rec.id, other.id]))
+                    if pair_key in excluded_pairs:
+                        continue
+                    similarity = self._text_similarity(rec.content, other.content)
+                    if similarity >= threshold:
+                        excluded_pairs.add(pair_key)
+                        pairs.append(
+                            DuplicatePair(
+                                record_a=rec,
+                                record_b=other,
+                                similarity=similarity,
+                            )
+                        )
+        return pairs
+
+    @staticmethod
+    def _append_unique_duplicate_pair(
+        pairs: list[DuplicatePair],
+        seen_pairs: set[tuple[str, str]],
+        pair: DuplicatePair,
+    ) -> None:
+        pair_key = tuple(sorted([pair.record_a.id, pair.record_b.id]))
+        if pair_key in seen_pairs:
+            return
+        seen_pairs.add(pair_key)
+        pairs.append(pair)
+
     async def consolidate(
         self,
         threshold: float = 0.82,
@@ -574,7 +798,7 @@ class ProjectionDB:
         """
         if not self._vector_available:
             log.warning("consolidate_skipped_no_vector")
-            return []
+            return await self._fallback_consolidation_groups(threshold)
 
         groups: list[MergeCandidateGroup] = []
 
@@ -696,6 +920,8 @@ class ProjectionDB:
                         )
                     )
 
+        if not groups:
+            groups = await self._fallback_consolidation_groups(threshold)
         return groups
 
     async def deduplicate(
@@ -718,10 +944,17 @@ class ProjectionDB:
         """
         if not self._vector_available:
             log.warning("deduplicate_skipped_no_vector")
-            return []
+            return await self._fallback_duplicate_pairs(
+                threshold,
+                set(excluded_pairs or set()),
+            )
 
-        pairs: list[DuplicatePair] = []
+        # Always include deterministic text matches first. Vector rows can lag
+        # behind projection rows during acceptance/startup cleanup, and exact
+        # duplicates should not be missed just because another vector pair was
+        # found earlier in the same pass.
         seen_pairs: set[tuple[str, str]] = set(excluded_pairs or set())
+        pairs = await self._fallback_duplicate_pairs(threshold, seen_pairs)
 
         for table, vec_table in [
             ("memories", "memories_vec"),
@@ -776,7 +1009,6 @@ class ProjectionDB:
                     pair_key = tuple(sorted([record_id, other_id]))
                     if pair_key in seen_pairs:
                         continue
-                    seen_pairs.add(pair_key)
 
                     # Build both records
                     rec_a_cursor = await self._db.execute(
@@ -790,7 +1022,9 @@ class ProjectionDB:
                     rd_a = dict(rec_a_row)
                     rd_b = dict(id_row)
 
-                    pairs.append(
+                    self._append_unique_duplicate_pair(
+                        pairs,
+                        seen_pairs,
                         DuplicatePair(
                             record_a=MemoryRecord(
                                 id=rd_a.get("id", ""),
@@ -815,7 +1049,7 @@ class ProjectionDB:
                                 updated_at=rd_b.get("updated_at", ""),
                             ),
                             similarity=similarity,
-                        )
+                        ),
                     )
 
         return pairs
@@ -1050,13 +1284,49 @@ class ProjectionDB:
             source_id: Entity to merge away (will be deleted).
             target_id: Entity to merge into (preserved).
         """
+        source_cur = await self._db.execute(
+            "SELECT id, name, canonical_name, entity_type FROM entities WHERE id = ?",
+            (source_id,),
+        )
+        source_row = await source_cur.fetchone()
+        target_cur = await self._db.execute(
+            "SELECT metadata FROM entities WHERE id = ?", (target_id,)
+        )
+        target_row = await target_cur.fetchone()
+
+        metadata: dict[str, object] = {}
+        if target_row is not None and target_row[0]:
+            try:
+                parsed = json.loads(target_row[0])
+                if isinstance(parsed, dict):
+                    metadata = parsed
+            except json.JSONDecodeError:
+                metadata = {}
+
+        merged_from = metadata.get("merged_from")
+        if not isinstance(merged_from, list):
+            merged_from = []
+        if source_row is not None:
+            merged_from.append(
+                {
+                    "id": source_row["id"],
+                    "name": source_row["name"],
+                    "canonical_name": source_row["canonical_name"],
+                    "entity_type": source_row["entity_type"],
+                    "merged_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                }
+            )
+        metadata["merged_from"] = merged_from
+
         await self._db.execute(
             "UPDATE entity_links SET entity_id = ? WHERE entity_id = ?",
             (target_id, source_id),
         )
         await self._db.execute(
-            "DELETE FROM entities WHERE id = ?", (source_id,)
+            "UPDATE entities SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata, sort_keys=True), target_id),
         )
+        await self._db.execute("DELETE FROM entities WHERE id = ?", (source_id,))
         await self._db.commit()
         log.debug("entities_merged", source=source_id, target=target_id)
 

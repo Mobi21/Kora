@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import aiosqlite
 import pytest
 
 from kora_v2.core.db import init_operational_db
-from kora_v2.runtime.turn_runner import CompactionCircuitBreaker, GraphTurnRunner
-
+from kora_v2.runtime.turn_runner import (
+    CompactionCircuitBreaker,
+    GraphTurnRunner,
+    _extract_open_decision_topics,
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -120,6 +124,280 @@ class TestGraphTurnRunnerRunTurn:
             cursor = await db.execute("SELECT * FROM turn_traces")
             rows = await cursor.fetchall()
         assert len(rows) == 1
+
+    async def test_prefetched_task_summary_reaches_graph_input(self, tmp_path) -> None:
+        container = _make_container(tmp_path)
+        await _init_db(tmp_path)
+        task = SimpleNamespace(
+            id="task-1",
+            stage_name="research",
+            state=SimpleNamespace(value="completed"),
+            goal="local-first productivity tools",
+            result_summary="report written with 5 sources",
+            error_message=None,
+            completed_at=datetime(2026, 4, 25, tzinfo=UTC),
+            pipeline_instance_id="pipe-1",
+        )
+        instance = SimpleNamespace(
+            pipeline_name="proactive_research",
+            goal="Research local-first productivity tools",
+        )
+        engine = SimpleNamespace(
+            list_tasks=AsyncMock(return_value=[task]),
+            acknowledge_task=AsyncMock(return_value=True),
+            instance_registry=SimpleNamespace(
+                load=AsyncMock(return_value=instance),
+            ),
+        )
+        container.orchestration_engine = engine
+        runner = GraphTurnRunner(container)
+        graph_input = _make_graph_input("what did you finish?")
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke.return_value = {
+            "response_content": "The research finished.",
+            "tool_call_records": [],
+            "messages": [],
+        }
+
+        await runner.run_turn(
+            mock_graph,
+            graph_input,
+            {"configurable": {"thread_id": "t1"}},
+        )
+
+        shaped = graph_input["_orchestration_tasks"][0]
+        assert shaped["state"] == "completed"
+        assert shaped["goal"] == "local-first productivity tools"
+        assert shaped["pipeline_name"] == "proactive_research"
+        assert shaped["pipeline_goal"] == "Research local-first productivity tools"
+        assert shaped["result_summary"] == "report written with 5 sources"
+        engine.acknowledge_task.assert_awaited_once_with("task-1")
+
+    async def test_prefetched_running_task_is_not_acknowledged_before_result(
+        self,
+        tmp_path,
+    ) -> None:
+        container = _make_container(tmp_path)
+        await _init_db(tmp_path)
+        task = SimpleNamespace(
+            id="task-1",
+            stage_name="research",
+            state=SimpleNamespace(value="running"),
+            goal="local-first productivity tools",
+            result_summary=None,
+            error_message=None,
+            completed_at=None,
+            pipeline_instance_id="pipe-1",
+        )
+        instance = SimpleNamespace(
+            pipeline_name="proactive_research",
+            goal="Research local-first productivity tools",
+        )
+        engine = SimpleNamespace(
+            list_tasks=AsyncMock(return_value=[task]),
+            acknowledge_task=AsyncMock(return_value=True),
+            instance_registry=SimpleNamespace(
+                load=AsyncMock(return_value=instance),
+            ),
+        )
+        container.orchestration_engine = engine
+        runner = GraphTurnRunner(container)
+        graph_input = _make_graph_input("how is the research going?")
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke.return_value = {
+            "response_content": "The research is still running.",
+            "tool_call_records": [],
+            "messages": [],
+        }
+
+        await runner.run_turn(
+            mock_graph,
+            graph_input,
+            {"configurable": {"thread_id": "t1"}},
+        )
+
+        assert graph_input["_orchestration_tasks"][0]["state"] == "running"
+        assert graph_input.get("_orchestration_seen_task_ids") == []
+        engine.acknowledge_task.assert_not_awaited()
+
+    async def test_response_open_decision_is_persisted(self, tmp_path) -> None:
+        container = _make_container(tmp_path)
+        await _init_db(tmp_path)
+        engine = SimpleNamespace(
+            record_open_decision=AsyncMock(),
+        )
+        container.orchestration_engine = engine
+        runner = GraphTurnRunner(container)
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke.return_value = {
+            "response_content": (
+                "One open decision: plain CSS vs. inline styles "
+                "(never resolved)."
+            ),
+            "tool_call_records": [],
+            "messages": [],
+        }
+
+        await runner.run_turn(
+            mock_graph,
+            _make_graph_input("what do you remember?"),
+            {"configurable": {"thread_id": "t1"}},
+        )
+
+        engine.record_open_decision.assert_awaited_once()
+        kwargs = engine.record_open_decision.await_args.kwargs
+        assert kwargs["topic"] == "plain CSS vs. inline styles"
+        assert kwargs["posed_in_session"] == "sess-1"
+
+    async def test_response_decision_prompts_are_persisted(self, tmp_path) -> None:
+        container = _make_container(tmp_path)
+        await _init_db(tmp_path)
+        engine = SimpleNamespace(
+            record_open_decision=AsyncMock(),
+        )
+        container.orchestration_engine = engine
+        runner = GraphTurnRunner(container)
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke.return_value = {
+            "response_content": (
+                "One thing to decide: start with TaskRow or schema.sql.\n"
+                "Pick one: TaskRow component or db.ts setup."
+            ),
+            "tool_call_records": [],
+            "messages": [],
+        }
+
+        await runner.run_turn(
+            mock_graph,
+            _make_graph_input("what should i do first?"),
+            {"configurable": {"thread_id": "t1"}},
+        )
+
+        topics = [
+            call.kwargs["topic"]
+            for call in engine.record_open_decision.await_args_list
+        ]
+        assert topics == [
+            "start with TaskRow or schema.sql",
+            "TaskRow component or db.ts setup",
+        ]
+
+    async def test_response_unlocked_decision_language_is_persisted(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        container = _make_container(tmp_path)
+        await _init_db(tmp_path)
+        monkeypatch.setenv("KORA_OPEN_DECISION_AGING_DAYS", "0")
+        engine = SimpleNamespace(
+            record_open_decision=AsyncMock(),
+            record_pending_decision_aging=AsyncMock(),
+        )
+        container.orchestration_engine = engine
+        runner = GraphTurnRunner(container)
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke.return_value = {
+            "response_content": (
+                "The **brief topic was never locked in** — still open."
+            ),
+            "tool_call_records": [],
+            "messages": [],
+        }
+
+        await runner.run_turn(
+            mock_graph,
+            _make_graph_input("what do you remember?"),
+            {"configurable": {"thread_id": "t1"}},
+        )
+
+        engine.record_open_decision.assert_awaited_once()
+        assert engine.record_open_decision.await_args.kwargs["topic"] == (
+            "The brief topic"
+        )
+        engine.record_pending_decision_aging.assert_awaited_once_with(
+            older_than_days=0,
+            limit=10,
+        )
+
+
+    def test_extract_open_decisions_from_acceptance_phrasing(self) -> None:
+        response = """
+## One decision to make now
+
+**Storage granularity:** Do you want tasks to live per day or globally?
+
+| **Topic** | Still not decided — brief is blocked |
+
+**SQLite + Markdown per day vs Dexie only?** — this is the only open architectural question that matters right now.
+"""
+
+        assert _extract_open_decision_topics(response) == [
+            "Storage granularity: Do you want tasks to live per day or globally?",
+            "Topic: Still not decided",
+            "SQLite + Markdown per day vs Dexie only?",
+        ]
+
+    def test_extract_open_decisions_from_latest_acceptance_phrasing(self) -> None:
+        response = """
+## One Open Question for You
+
+Do you want to **create blocks in the UI** or keep markdown-only?
+
+| **Open** | Runtime (Bun/Node/Deno), blank slate vs existing repo, CRUD authorship surface |
+
+**Still open (your tomorrow priorities):**
+1. Decide reset time for the dashboard.
+2. Confirm whether Alex gets the brief.
+"""
+
+        assert _extract_open_decision_topics(response) == [
+            "Do you want to create blocks in the UI or keep markdown-only?",
+            "Runtime (Bun/Node/Deno), blank slate vs existing repo, CRUD authorship surface",
+            "Decide reset time for the dashboard",
+            "Confirm whether Alex gets the brief",
+        ]
+
+    def test_extract_open_decisions_from_unresolved_status_table(self) -> None:
+        response = """
+| | Status |
+|---|---|
+| Dashboard direction | **Unresolved** — two specs, no pick |
+
+## What to Decide First
+
+The dashboard direction. Everything else can flow once that's locked.
+"""
+
+        assert _extract_open_decision_topics(response) == [
+            "Dashboard direction: Unresolved",
+            "The dashboard direction. Everything else can flow once that's locked",
+        ]
+
+    def test_extract_open_decisions_from_acceptance_status_summary(self) -> None:
+        response = """
+**Open decisions from you:**
+1. Brief audience + purpose
+2. Track priority order this week
+3. Brief deadline
+
+**Still unresolved from yesterday:**
+- Dashboard reset time?
+- Confirm whether Alex gets the brief.
+"""
+
+        assert _extract_open_decision_topics(response) == [
+            "Brief audience + purpose",
+            "Track priority order this week",
+            "Brief deadline",
+            "Dashboard reset time?",
+            "Confirm whether Alex gets the brief",
+        ]
 
     async def test_error_path_records_trace(self, tmp_path) -> None:
         container = _make_container(tmp_path)

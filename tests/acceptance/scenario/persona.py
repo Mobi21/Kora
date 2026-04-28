@@ -1,20 +1,39 @@
-"""Jordan persona — acceptance test character profile.
+"""Jordan persona for the Life OS acceptance run.
 
-Jordan is a 30-year-old software engineer with ADHD living in Portland.
-Used as the test persona throughout the 3-day acceptance test run.
-
-The persona is designed to naturally trigger Kora's ADHD-specific features:
-- Life management tools (medication, meals, reminders, focus blocks)
-- Emotion/energy assessment (scattered afternoons, focused mornings)
-- Skill activation (code_work, web_research, life_management)
+Jordan is a test character, not a scripted checklist.  The acceptance
+operator should use this profile to create a realistic week of ordinary life
+friction around Kora's internal calendar, support profiles, reminders, and
+durable state.  Coding, research, and writing can appear as optional practical
+needs, but they are no longer the acceptance center.
 """
 
 PERSONA = {
     "name": "Jordan",
     "age": 30,
     "city": "Portland",
-    "job": "software engineer",
-    "conditions": ["ADHD"],
+    "job": "operations coordinator at a small nonprofit",
+    "product_focus": "local-first Life OS support",
+    "conditions": ["ADHD", "anxiety", "burnout risk"],
+    "separate_support_tracks": {
+        "adhd": [
+            "time blindness",
+            "task initiation friction",
+            "avoidance loops",
+            "forgotten meals and routines",
+        ],
+        "autism_sensory": [
+            "sensory overload",
+            "transition difficulty",
+            "routine disruption",
+            "communication fatigue",
+        ],
+        "burnout_anxiety": [
+            "low energy",
+            "spiraling dread",
+            "shame after falling behind",
+            "need to downshift plans",
+        ],
+    },
     "medications": {
         "morning": "Adderall 20mg",
         "evening": "melatonin 3mg",
@@ -22,107 +41,99 @@ PERSONA = {
     "household": {
         "partner": "Alex",
         "pet": "Mochi (cat)",
+        "trusted_support": "Alex can help if Jordan explicitly chooses to ask",
     },
-    "finances": {
-        "monthly_income": 7200,
-        "rent": 2650,
+    "calendar_obligations": {
+        "monday": ["rent/autopay check", "laundry", "message Sam back"],
+        "tuesday": ["doctor portal form", "trash night", "call pharmacy"],
+        "wednesday": ["noisy office day", "landlord email", "sensory recovery block"],
+        "thursday": ["appointment prep", "grocery pickup", "low-energy evening"],
+        "friday": ["bill follow-up", "friend birthday text"],
+        "weekend": ["reset apartment", "prep next week", "protect rest"],
     },
-    "projects": {
-        "coding": "focus-week-dashboard",
-        "research": "developer productivity tool landscape",
-        "writing": "project docs / stakeholder brief",
+    "privacy": {
+        "preference": "local-first, no cloud dependency unless explicitly approved",
+        "support_boundary": "do not contact trusted support automatically",
     },
 }
 
-# Answers for first-run wizard (if applicable in V2)
 FIRST_RUN_ANSWERS = {
     "name": "Jordan",
     "age": "30",
     "location": "Portland, Oregon",
-    "job": "software engineer",
+    "job": "operations coordinator at a small nonprofit",
     "adhd": "yes",
     "meds_morning": "Adderall 20mg in the morning",
     "meds_evening": "melatonin 3mg at night",
     "partner": "Alex",
     "pet": "Mochi, my cat",
-    "income": "about $7,200 a month",
-    "goals": "stay focused, ship the dashboard, do good research this week",
+    "local_first": "yes, I care about local-first and no cloud dependency",
+    "goals": "get through the week, keep my calendar real, and recover when I fall behind",
 }
 
-# Natural opening messages for Day 1
-# These are designed to trigger life management tools (medication logging)
 DAY1_OPENERS = [
-    "hey kora! morning. mochi woke me up way too early again lol. just took my adderall 20mg. ok so i have three things i want to tackle this week — can i walk you through them?",
-    "hi! just took my adderall so i should have a good window. i want to plan out this whole week with you.",
-    "hey kora morning! took my meds, feeling good. so i've got three tracks going this week: a coding project, some research, and a writing thing. can you help me plan it out?",
+    "hey kora, i'm Jordan. i'm 30, in Portland, ADHD, and i need help keeping my actual life together this week. local-first matters a lot to me. Alex is my partner and Mochi is my cat. i took my Adderall 20mg, but i already feel behind. can we build the week around my calendar?",
+    "morning. i need a realistic Life OS kind of week plan, not a productivity fantasy. i took my meds, haven't eaten yet, and i have rent check, laundry, a message to Sam, and a doctor portal form floating around.",
+    "hey. i want you to help me manage the week: calendar, reminders, meals, meds, admin tasks, sensory load, and when i fall behind. i'm Jordan, ADHD, local-first preference, Alex is trusted support but don't contact them unless i ask.",
 ]
 
-# Day 2 openers — naturally trigger life management (meds + meals)
 DAY2_OPENERS = [
-    "morning kora! took my adderall already. had a bagel and coffee. alex asked about dinner but i'll figure that out later. let's get back to it — where did we leave off?",
-    "hey kora! slept great actually. took my meds, had breakfast. feeling focused. what was i working on yesterday?",
-    "hi! morning. popped my adderall 20mg, had some eggs. ok so i remember we were doing three tracks — refresh me on the status?",
+    "morning. i took my Adderall but i lost track of time already. what is actually on my calendar today, and what carried over from yesterday?",
+    "hey kora. i had coffee, maybe not breakfast. i avoided the portal form yesterday. can you help me pick the first tiny action without making this a whole system?",
 ]
 
-# Day 3 openers
 DAY3_OPENERS = [
-    "morning kora! last day of the week. took my adderall. let's make it count — i want to wrap everything up cleanly.",
-    "hey! ok final push. took my meds. let's do the mechanical checks first and then finish strong.",
+    "today is rough sensory-wise. my routine got disrupted and the office is loud. i need predictable steps and fewer decisions.",
+    "i'm overloaded from the change of plans. can you help me transition without pushing me into a bunch of social/admin stuff at once?",
 ]
 
-# Jordan's voice cues — emotional signals for Kora's emotion assessor
+DAY4_OPENERS = [
+    "i'm burned out and anxious. the plan from earlier is too much now. can we protect only the essentials?",
+    "i feel behind and kind of frozen. please don't give me a huge plan. help me stabilize first.",
+]
+
 VOICE_CUES = {
-    "excited": ["ok so", "wait", "actually", "oh also", "ooh"],
-    "scattered": ["hold on", "actually wait", "nvm forget that", "ok new idea", "wait what was i saying"],
-    "frustrated": ["ugh", "this isn't working", "that's not what i meant", "no wait", "my focus is shot"],
-    "focused": ["ok so specifically", "let me be clear", "here's what i need"],
-    "verify": ["what did you actually do", "show me", "prove it", "what tasks did you create"],
-    "energy_low": ["meds wearing off", "i'm dragging", "brain is mush", "can't focus"],
-    "energy_high": ["feeling sharp", "good window", "let's go", "in the zone"],
+    "excited": ["ok so", "wait", "actually", "oh also"],
+    "scattered": ["hold on", "actually wait", "nvm", "what was i doing"],
+    "frustrated": ["ugh", "that's too much", "no wait", "my brain is mush"],
+    "focused": ["specifically", "let me be clear", "here's what i need"],
+    "verify": ["what state backs that", "show me", "what did you actually save"],
+    "energy_low": ["i'm dragging", "low battery", "can't initiate", "too much"],
+    "anxiety": ["spiraling", "dreading", "what if", "i feel behind"],
+    "sensory": ["noise is too much", "transition is hard", "routine got disrupted"],
     "life_management": [
-        "just took my adderall", "took my meds", "did i eat lunch",
-        "i should eat something", "remind me to", "note to self",
-        "need to start a focus block", "ok focus time",
+        "took my Adderall",
+        "did i eat",
+        "remind me",
+        "note to self",
+        "put this on the calendar",
+        "move it to tomorrow",
     ],
 }
 
-# Afternoon scattered messages — naturally trigger emotion assessment
-AFTERNOON_SCATTERED = [
-    "ugh ok my focus is completely shot. meds are wearing off. did i eat lunch? i don't think i ate lunch.",
-    "hold on wait what was i doing. ok right the research. sorry my brain is mush right now.",
-    "nvm forget that approach. actually wait no. ok new idea but i'm too scattered to explain it well.",
+MESSY_MOMENTS = [
+    "i said i would do the portal form but i avoided it. i also forgot lunch.",
+    "you assumed i wanted a phone call, but calls are actually the hard part. i need a message draft first.",
+    "the noise is too much and i can't transition into the next thing yet.",
+    "i'm anxious enough that planning is making it worse. pause the plan and help me stabilize.",
+    "i don't want you to ask Alex automatically. maybe help me decide whether i should ask.",
 ]
 
-# Evening wind-down messages — trigger melatonin logging
-EVENING_MESSAGES = [
-    "ok i'm done for today. gonna take my melatonin and crash. can you give me a quick summary of what we got done?",
-    "alright wrapping up. took my melatonin 3mg. what should i focus on tomorrow morning when i'm fresh?",
+CALENDAR_TRIGGERS = [
+    "put trash night on the calendar for Tuesday evening and remind me before it gets dark",
+    "move the landlord email to tomorrow morning because today is cooked",
+    "what is time-sensitive today versus what can roll forward?",
+    "make me a future-self bridge for tomorrow morning based on what actually happened",
 ]
 
-# Research trigger messages — should naturally invoke search_web or browser.open fallback
-RESEARCH_TRIGGERS = [
-    "hey can you look up what the best developer productivity tools are right now? like what's actually popular in 2025/2026?",
-    "search for local-first productivity apps — i want to know what's out there for privacy-focused tools",
-    "can you research what focus timer apps developers actually use? find me some real options",
+LIFE_ADMIN_TRIGGERS = [
+    "can you break the doctor portal form into steps i can do with low energy?",
+    "help me draft the landlord message, but keep it short and not overexplained",
+    "prepare a checklist for the appointment while i'm away, but keep it practical",
 ]
 
-# Workspace capability trigger messages — naturally invoke calendar or email actions
-WORKSPACE_TRIGGERS = [
-    "hey can you check my calendar for this week? i want to see if i have any conflicts with the project deadlines",
-]
-
-# File operation trigger messages — should naturally invoke filesystem tools
-FILE_TRIGGERS = [
-    "can you create a file with my research notes so far? save it somewhere i can find it later",
-    "write up the dashboard component outline into a file",
-    "read back the notes file you created earlier — i want to check what's in there",
-    "list what files we've created in this project so far",
-]
-
-# Long-background dispatch trigger messages — should invoke decompose_and_dispatch
-# with intent_duration='long' (start_autonomous was retired in Phase 7.5)
-AUTONOMOUS_TRIGGERS = [
-    "ok can you keep researching this in the background while i take a break? dig into the top 3 tools and compare them",
-    "hey work on this research while i'm away — compare the privacy features of the top options",
-    "i need to step away for a bit. can you autonomously research and write up a comparison?",
+OPTIONAL_CAPABILITY_TRIGGERS = [
+    "if you can check local info, find the pharmacy hours; if not, say you can't and give me the fallback",
+    "save the appointment prep note somewhere local so i can find it later",
+    "list what life-admin notes or checklists exist from this week",
 ]

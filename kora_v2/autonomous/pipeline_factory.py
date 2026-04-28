@@ -630,6 +630,207 @@ async def _emit_autonomous_event(
         log.debug("autonomous_event_emit_failed", event=event_name, exc_info=True)
 
 
+def _extract_step_result_summary(step_result_json: str) -> str:
+    """Pull a short, human-readable finding out of a step's ExecutionOutput JSON.
+
+    Returns a paragraph suitable for dropping into the working doc's
+    Findings section. If the JSON cannot be parsed we fall back to the
+    raw string, truncated, so the doc still captures *something* rather
+    than silently dropping the result.
+    """
+    import json as _json
+
+    if not step_result_json:
+        return "_(no output captured)_"
+    try:
+        payload = _json.loads(step_result_json)
+    except Exception:  # noqa: BLE001
+        return step_result_json[:500]
+    if not isinstance(payload, dict):
+        return str(payload)[:500]
+    # Prefer ExecutionOutput.result, fall back to common keys the
+    # stub reviewer / claude code delegate use.
+    text = (
+        payload.get("result")
+        or payload.get("summary")
+        or payload.get("output")
+        or payload.get("error")
+        or ""
+    )
+    if not text:
+        # Degraded / MCP-unavailable responses land here — surface the
+        # disclosed failure in Findings rather than hide it.
+        if payload.get("degraded") or payload.get("status") == "error":
+            text = str(payload)
+    return (text or str(payload))[:1200]
+
+
+async def _sync_working_doc_from_state(
+    *,
+    task: WorkerTask,
+    container: Any,
+    state: AutonomousState,
+    prev_completed_count: int,
+    node_just_ran: str,
+) -> None:
+    """Propagate autonomous state changes onto the working doc on disk.
+
+    This is the single write-back seam from the 12-node graph into the
+    markdown working document. Without it, the graph mutates state and
+    the dispatcher flips ``pipeline_instances`` to ``completed``, but
+    the markdown file stays frozen at its initial seeded contents —
+    unchecked plan items and an empty Findings section — which is the
+    acceptance-test symptom we keep seeing.
+
+    Best-effort: any exception is logged and swallowed so a working doc
+    problem cannot wedge the step loop.
+    """
+    if not task.pipeline_instance_id:
+        return
+    engine = getattr(container, "orchestration_engine", None)
+    if engine is None or getattr(engine, "working_docs", None) is None:
+        return
+
+    try:
+        instance = await engine.instance_registry.load(task.pipeline_instance_id)
+    except Exception:  # noqa: BLE001
+        log.debug(
+            "working_doc_sync_load_instance_failed",
+            task_id=task.id,
+            exc_info=True,
+        )
+        return
+    if instance is None or not instance.working_doc_path:
+        return
+
+    from kora_v2.runtime.orchestration.working_doc import (
+        PlanItem,
+        WorkingDocStatus,
+        WorkingDocUpdate,
+        parse_frontmatter,
+        parse_plan_items,
+        parse_sections,
+    )
+
+    doc_path = Path(instance.working_doc_path)
+    if not doc_path.exists():
+        return
+
+    # ── Terminal transitions first ─────────────────────────────────
+    if state.status == "completed":
+        summary = state.metadata.get("completion_summary") or {}
+        steps_done = summary.get("steps_completed", len(state.completed_step_ids))
+        avg_q = summary.get("avg_quality")
+        parts = [f"Autonomous execution complete. Steps completed: {steps_done}."]
+        if avg_q is not None:
+            parts.append(f"Average quality: {avg_q:.2f}.")
+        try:
+            await engine.working_docs.mark_status(
+                instance_id=task.pipeline_instance_id,
+                path=doc_path,
+                status=WorkingDocStatus.DONE,
+                completion_text=" ".join(parts),
+                reason="autonomous_complete",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("working_doc_mark_done_failed", task_id=task.id)
+        return
+
+    if state.status in ("failed", "cancelled"):
+        reason = state.metadata.get(
+            "failure_reason", f"autonomous_{state.status}"
+        )
+        target = (
+            WorkingDocStatus.CANCELLED
+            if state.status == "cancelled"
+            else WorkingDocStatus.FAILED
+        )
+        try:
+            await engine.working_docs.mark_status(
+                instance_id=task.pipeline_instance_id,
+                path=doc_path,
+                status=target,
+                completion_text=str(reason),
+                reason=f"autonomous_{state.status}",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "working_doc_mark_terminal_failed", task_id=task.id
+            )
+        return
+
+    # ── Only propagate on a freshly-completed step ────────────────
+    if node_just_ran != "execute_step":
+        return
+    new_completed = len(state.completed_step_ids) - prev_completed_count
+    if new_completed <= 0:
+        return
+
+    latest_step_id = state.completed_step_ids[-1]
+    steps_meta = state.metadata.get("steps", {}) or {}
+    step_data = steps_meta.get(latest_step_id, {}) or {}
+    step_title = (step_data.get("title") or latest_step_id).strip()
+    step_result_json = state.metadata.get("last_step_result", "")
+    summary_text = _extract_step_result_summary(step_result_json)
+    finding_block = f"### {step_title}\n\n{summary_text}"
+
+    # Identify the first unchecked seeded plan item so we flip it to
+    # [x] even when the planner's step title doesn't match the seeded
+    # stage name verbatim. This is what makes the doc's Current Plan
+    # actually track progress rather than accumulate a parallel list.
+    seeded_target: str | None = None
+    existing_findings = ""
+    try:
+        current_text = await asyncio.to_thread(
+            doc_path.read_text, encoding="utf-8"
+        )
+        _fm, body = parse_frontmatter(current_text)
+        sections = parse_sections(body)
+        plan_items = parse_plan_items(sections.get("Current Plan", ""))
+        for item in plan_items:
+            if item.marker == " ":
+                seeded_target = item.text
+                break
+        existing_findings = sections.get("Findings", "").strip()
+    except Exception:  # noqa: BLE001
+        log.debug(
+            "working_doc_read_for_sync_failed",
+            task_id=task.id,
+            exc_info=True,
+        )
+
+    mark_done: list[str] = [step_title]
+    if seeded_target and seeded_target != step_title:
+        mark_done.append(seeded_target)
+
+    merged_findings = (
+        (existing_findings + "\n\n" + finding_block)
+        if existing_findings
+        else finding_block
+    )
+
+    try:
+        await engine.working_docs.apply_update(
+            instance_id=task.pipeline_instance_id,
+            path=doc_path,
+            update=WorkingDocUpdate(
+                section_patches={"Findings": merged_findings},
+                append_plan_items=[PlanItem(marker="x", text=step_title)],
+                mark_plan_items_done=mark_done,
+                completed_task_log_entry=(
+                    f"{datetime.now(UTC).isoformat()} — {step_title}"
+                ),
+                reason=f"autonomous_step_done:{latest_step_id}",
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "working_doc_write_back_failed",
+            task_id=task.id,
+            step_id=latest_step_id,
+        )
+
+
 async def _autonomous_step_fn(
     task: WorkerTask, ctx: StepContext
 ) -> StepResult:
@@ -871,6 +1072,7 @@ async def _autonomous_step_fn(
 
     # ── Run the node ──────────────────────────────────────────────
     decision_mgr = DecisionManager()
+    prev_completed_step_count = len(state.completed_step_ids)
     try:
         state = await _run_internal_node(
             node_name=next_node,
@@ -905,6 +1107,26 @@ async def _autonomous_step_fn(
             outcome="failed",
             error_message=fail_reason,
             request_count_delta=1,
+        )
+
+    # ── Propagate state changes onto the working doc (§17.6b) ─────
+    # The graph mutates in-memory state; without this call the on-disk
+    # markdown would stay frozen at its seeded contents (unchecked
+    # items, empty Findings). Errors are swallowed so a doc problem
+    # cannot wedge the step loop.
+    try:
+        await _sync_working_doc_from_state(
+            task=task,
+            container=container,
+            state=state,
+            prev_completed_count=prev_completed_step_count,
+            node_just_ran=next_node,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "working_doc_sync_after_node_failed",
+            task_id=task.id,
+            node=next_node,
         )
 
     # ── Periodic checkpoint (cadence-based) ───────────────────────

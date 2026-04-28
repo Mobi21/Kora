@@ -562,6 +562,26 @@ def test_query_vault_state_shape(tmp_path: Path, harness: HarnessServer) -> None
     assert dens["total_wikilinks"] == 3
 
 
+def test_query_vault_state_counts_priority_folders_when_truncated(
+    tmp_path: Path, harness: HarnessServer
+) -> None:
+    vault = tmp_path / "_KoraMemory"
+    _make_vault(vault)
+
+    noisy = vault / "Long-Term" / "Episodic" / "noise"
+    noisy.mkdir(parents=True)
+    for idx in range(650):
+        (noisy / f"noise-{idx:03d}.md").write_text("# Noise\n")
+
+    result = asyncio.run(harness._query_vault_state(vault))
+    counts = result["counts"]
+
+    assert result["truncated"] is True
+    assert counts["entities_people"] == 1
+    assert counts["sessions"] == 1
+    assert counts["moc_pages"] == 1
+
+
 # ── test_query_proactive_state ───────────────────────────────────────────
 
 

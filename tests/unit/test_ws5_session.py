@@ -368,28 +368,24 @@ class TestCheckFirstRun:
         """If bridges dir has .md files, first-run should do nothing."""
         from kora_v2.cli.app import KoraCLI
 
-        bridges_dir = tmp_path / "_KoraMemory" / ".kora" / "bridges"
+        bridges_dir = tmp_path / "memory" / ".kora" / "bridges"
         bridges_dir.mkdir(parents=True)
         bridge_file = bridges_dir / "20260101_120000_abc123.md"
         bridge_file.write_text("# Session: abc123\nSome summary")
 
         cli = KoraCLI()
 
-        # Patch Path to return our tmp_path version
-        with patch("kora_v2.cli.app.Path") as mock_path_cls:
-            mock_bridges = MagicMock()
-            mock_bridges.exists.return_value = True
-            mock_bridges.glob.return_value = [bridge_file]
-            mock_path_cls.return_value = mock_bridges
-
-            # _send_message should NOT be called
+        fake_settings = MagicMock()
+        fake_settings.memory.kora_memory_path = str(tmp_path / "memory")
+        with patch(
+            "kora_v2.core.settings.get_settings", return_value=fake_settings
+        ):
             cli._send_message = AsyncMock()
             await cli._check_first_run()
-
             cli._send_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_skips_when_dir_does_not_exist(self) -> None:
+    async def test_skips_when_dir_does_not_exist(self, tmp_path: Path) -> None:
         """If bridges dir doesn't exist, the wizard is invoked. When the
         wizard returns an empty ``WizardResult`` (EOFError / cancellation),
         no intro message is sent."""
@@ -399,22 +395,26 @@ class TestCheckFirstRun:
         cli = KoraCLI()
         cli._console = MagicMock()
 
-        with patch("kora_v2.cli.app.Path") as mock_path_cls:
-            mock_bridges = MagicMock()
-            mock_bridges.exists.return_value = False
-            mock_path_cls.return_value = mock_bridges
-
-            with patch.object(
+        fake_settings = MagicMock()
+        fake_settings.memory.kora_memory_path = str(tmp_path / "missing")
+        with (
+            patch(
+                "kora_v2.core.settings.get_settings", return_value=fake_settings
+            ),
+            patch.object(
                 first_run_module,
                 "run_wizard",
                 AsyncMock(return_value=first_run_module.WizardResult()),
-            ):
-                cli._send_message = AsyncMock()
-                await cli._check_first_run()
-                cli._send_message.assert_not_called()
+            ),
+        ):
+            cli._send_message = AsyncMock()
+            await cli._check_first_run()
+            cli._send_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_skips_when_bridges_dir_exists_but_empty(self) -> None:
+    async def test_skips_when_bridges_dir_exists_but_empty(
+        self, tmp_path: Path
+    ) -> None:
         """If bridges dir exists but has no .md files, treat as first run."""
         from kora_v2.cli import first_run as first_run_module
         from kora_v2.cli.app import KoraCLI
@@ -422,20 +422,24 @@ class TestCheckFirstRun:
         cli = KoraCLI()
         cli._console = MagicMock()
 
-        with patch("kora_v2.cli.app.Path") as mock_path_cls:
-            mock_bridges = MagicMock()
-            mock_bridges.exists.return_value = True
-            mock_bridges.glob.return_value = []  # no .md files
-            mock_path_cls.return_value = mock_bridges
+        bridges_dir = tmp_path / "memory" / ".kora" / "bridges"
+        bridges_dir.mkdir(parents=True)
 
-            with patch.object(
+        fake_settings = MagicMock()
+        fake_settings.memory.kora_memory_path = str(tmp_path / "memory")
+        with (
+            patch(
+                "kora_v2.core.settings.get_settings", return_value=fake_settings
+            ),
+            patch.object(
                 first_run_module,
                 "run_wizard",
                 AsyncMock(return_value=first_run_module.WizardResult()),
-            ):
-                cli._send_message = AsyncMock()
-                await cli._check_first_run()
-                cli._send_message.assert_not_called()
+            ),
+        ):
+            cli._send_message = AsyncMock()
+            await cli._check_first_run()
+            cli._send_message.assert_not_called()
 
     def test_check_first_run_method_exists_on_kora_cli(self) -> None:
         """_check_first_run is defined on KoraCLI."""

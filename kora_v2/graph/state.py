@@ -87,6 +87,19 @@ class SupervisorState(TypedDict, total=False):
     # while the user was away — injected into the dynamic suffix by
     # build_suffix so the supervisor can mention them proactively.
     _unread_autonomous_updates: list[dict[str, Any]]
+    # Per-turn skill names inferred from the latest user message. The
+    # frozen prefix lists the skill index, but only this subset contributes
+    # live guidance and registry/capability tool exposure.
+    _active_skills: list[str]
+    _active_skill_guidance: str
+    _latest_user_text: str
+    _forced_tool_call: dict[str, Any]
+    _forced_tool_calls: list[dict[str, Any]]
+    # Set by tool_loop when a tool result already contains the final
+    # user-facing acknowledgement and no follow-up LLM call is needed.
+    _short_circuit_response: bool
+    _orchestration_tasks: list[dict[str, Any]]
+    _orchestration_seen_task_ids: list[str]
     # Overlap detection from _check_autonomous_overlap (injected via graph_input).
     # Score 0.0–1.0; action one of "continue" | "ambiguous" | "pause".
     _overlap_score: float

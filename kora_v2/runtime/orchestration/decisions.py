@@ -27,11 +27,13 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
 import structlog
 from pydantic import BaseModel, Field
+
+from kora_v2.runtime.orchestration.ledger import LedgerEventType, WorkLedger
 
 if TYPE_CHECKING:
     from kora_v2.core.events import EventEmitter
@@ -315,7 +317,12 @@ class OpenDecisionsTracker:
             )
         return expired_ids
 
-    async def get_pending(self, older_than_days: int = 0) -> list[OpenDecision]:
+    async def get_pending(
+        self,
+        older_than_days: int = 0,
+        *,
+        limit: int | None = None,
+    ) -> list[OpenDecision]:
         """Return pending (``status='open'``) decisions older than *older_than_days* days."""
         cutoff = (
             datetime.now(UTC) - timedelta(days=older_than_days)
@@ -323,12 +330,16 @@ class OpenDecisionsTracker:
 
         async with aiosqlite.connect(str(self._db_path)) as db:
             db.row_factory = aiosqlite.Row
+            limit_clause = " LIMIT ?" if limit is not None else ""
+            params: tuple[Any, ...] = (
+                (cutoff, limit) if limit is not None else (cutoff,)
+            )
             cursor = await db.execute(
                 "SELECT id, topic, posed_at, posed_in_session, context, status, "
                 "resolved_at, resolution FROM open_decisions "
                 "WHERE status='open' AND posed_at <= ? "
-                "ORDER BY posed_at ASC",
-                (cutoff,),
+                f"ORDER BY posed_at ASC{limit_clause}",
+                params,
             )
             rows = await cursor.fetchall()
 
@@ -351,6 +362,65 @@ class OpenDecisionsTracker:
                 )
             )
         return results
+
+    async def record_aging_evidence(
+        self,
+        *,
+        older_than_days: int = 3,
+        ledger: WorkLedger,
+        limit: int | None = None,
+        trigger_name: str = "DECISION_PENDING_3D",
+    ) -> list[OpenDecision]:
+        """Record evidence for open decisions pending past the aging window."""
+        pending = await self.get_pending(
+            older_than_days=older_than_days,
+            limit=limit,
+        )
+        for decision in pending:
+            if await self._aging_evidence_exists(
+                decision.id,
+                trigger_name=trigger_name,
+            ):
+                continue
+            await ledger.record(
+                LedgerEventType.TRIGGER_FIRED,
+                trigger_name=trigger_name,
+                reason="open_decision_aged",
+                metadata={
+                    "decision_id": decision.id,
+                    "topic": decision.topic,
+                    "posed_at": decision.posed_at.isoformat(),
+                    "older_than_days": older_than_days,
+                },
+            )
+            if self._event_emitter is not None:
+                from kora_v2.core.events import EventType
+
+                await self._event_emitter.emit(
+                    EventType.TRIGGER_FIRED,
+                    trigger_name=trigger_name,
+                    decision_id=decision.id,
+                    topic=decision.topic,
+                    posed_at=decision.posed_at.isoformat(),
+                    older_than_days=older_than_days,
+                )
+        return pending
+
+    async def _aging_evidence_exists(
+        self,
+        decision_id: str,
+        *,
+        trigger_name: str,
+    ) -> bool:
+        """Return True when this decision already emitted aging evidence."""
+        async with aiosqlite.connect(str(self._db_path)) as db:
+            cursor = await db.execute(
+                "SELECT 1 FROM work_ledger "
+                "WHERE trigger_name = ? AND metadata_json LIKE ? "
+                "LIMIT 1",
+                (trigger_name, f'%"{decision_id}"%'),
+            )
+            return await cursor.fetchone() is not None
 
 
 # Keep an unused import check happy (json is used in callers that extend this);

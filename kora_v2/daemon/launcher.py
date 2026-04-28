@@ -599,7 +599,7 @@ async def _run_daemon(settings: Any) -> None:
     container._failed_subsystems = _failed_subsystems  # type: ignore[attr-defined]
 
     # Choose port
-    port = settings.daemon.api_port if hasattr(settings, "daemon") and hasattr(settings.daemon, "api_port") else 0
+    port = getattr(settings.daemon, "port", 0) if hasattr(settings, "daemon") else 0
 
     if _failed_subsystems:
         logger.warning(

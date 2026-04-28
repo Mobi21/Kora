@@ -119,13 +119,15 @@ Executes concrete tasks with real callable filesystem tools. The design principl
 
 ### Execution paths
 
-The executor has three paths in priority order:
+The executor has four paths in priority order:
 
 **Path 1 — Deterministic fast path** (`_execute_local_filesystem`): If the task name is exactly `"write_file"` or `"create_directory"` and params are well-formed, the executor calls the filesystem directly using Python's `pathlib` without an LLM call. On `write_file`, it verifies the file exists on disk before returning `success=True`. Path safety is enforced via `_resolve_safe()` from `kora_v2/tools/filesystem.py`.
 
 **Path 2 — LLM with real filesystem tools**: If the task description matches file-operation patterns (`_FILE_WRITE_PATTERNS` — e.g., "save to", "write_file", "create a file"), the LLM is called with the real registered filesystem tools plus `structured_execution_output`. The LLM picks which tool to call. `tool_choice="any"` forces a tool call — no prose responses accepted.
 
-**Path 3 — LLM with structured output only**: If the task is not a file operation, the LLM is offered only `structured_execution_output` and must fill in the result object directly.
+**Path 3 — LLM with research/capability tools**: Research-like tasks can expose `search_web`, `fetch_url`, and browser capability tools before falling back to structured output.
+
+**Path 4 — LLM with structured output only**: If the task is not a file operation or research/capability task, the LLM is offered only `structured_execution_output` and must fill in the result object directly.
 
 ### System prompt
 

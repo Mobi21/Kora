@@ -36,6 +36,23 @@ class TestContainerConstruction:
         container = Container(settings)
         assert isinstance(container.event_emitter, EventEmitter)
 
+    def test_life_os_services_resolve_lazily(self, settings: Settings, tmp_path, monkeypatch):
+        """Life OS services are reachable from the runtime container."""
+        monkeypatch.chdir(tmp_path)
+        settings.memory.kora_memory_path = str(tmp_path / "memory")
+        container = Container(settings)
+
+        assert container.life_event_ledger is not None
+        assert container.day_plan_service is not None
+        assert container.support_registry is not None
+        assert container.crisis_safety_router is not None
+        assert container.life_load_engine is not None
+        assert container.day_repair_engine is not None
+        assert container.proactivity_policy_engine is not None
+        assert container.stabilization_mode_service is not None
+        assert container.context_pack_service is not None
+        assert container.future_self_bridge_service is not None
+
 
 class TestSupervisorGraphLazy:
     """Supervisor graph is built lazily on first property access."""
@@ -99,10 +116,10 @@ class TestPhase4Initialization:
 
     def test_initialize_phase4_types(self, settings: Settings):
         """Phase 4 services have correct types."""
+        from kora_v2.daemon.session import SessionManager
         from kora_v2.emotion.fast_assessor import FastEmotionAssessor
         from kora_v2.emotion.llm_assessor import LLMEmotionAssessor
         from kora_v2.quality.tier1 import QualityCollector
-        from kora_v2.daemon.session import SessionManager
 
         container = Container(settings)
         container.initialize_phase4()

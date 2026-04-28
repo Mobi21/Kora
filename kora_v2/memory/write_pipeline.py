@@ -58,6 +58,70 @@ _PERSON_PATTERNS = [
     re.compile(r"\b([A-Z][a-z]+)\s+(?:is|was)\s+my\s+\w+"),
 ]
 
+_RELATION_WORDS = {
+    "wife",
+    "husband",
+    "partner",
+    "mom",
+    "dad",
+    "mother",
+    "father",
+    "brother",
+    "sister",
+    "friend",
+    "boss",
+    "son",
+    "daughter",
+    "child",
+    "uncle",
+    "aunt",
+    "cousin",
+    "grandma",
+    "grandpa",
+    "girlfriend",
+    "boyfriend",
+    "coworker",
+    "colleague",
+    "neighbor",
+    "roommate",
+    "collaborator",
+}
+
+_PERSON_ALIAS_RELATIONS = {"partner", "roommate"}
+
+_NAME_TOKEN = r"[A-Z][a-z]+"
+
+_RELATION_BEFORE_NAME_PATTERNS = [
+    re.compile(
+        r"\b(?:my\s+|(?:Jordan|the user|user)'s\s+)?"
+        r"(?P<relation>partner|roommate)\s+"
+        r"(?P<name>[A-Z][a-z]+)\b",
+    ),
+    re.compile(
+        r"\b(?:my\s+|(?:Jordan|the user|user)'s\s+)?"
+        r"(?P<relation>partner|roommate)\s+"
+        r"(?:is\s+)?(?:named|called)\s+"
+        rf"(?P<name>{_NAME_TOKEN})\b",
+    ),
+    re.compile(
+        r"\b(?:Jordan|the user|user)\s+has\s+(?:a\s+)?"
+        r"(?P<relation>partner|roommate)\s+(?:named|called)\s+"
+        rf"(?P<name>{_NAME_TOKEN})\b",
+    ),
+]
+
+_NAME_IS_RELATION_PATTERN = re.compile(
+    r"\b(?P<name>[A-Z][a-z]+)\s+(?:is|was)\s+"
+    r"(?:(?:Jordan|the user|user)'s|my|a|an)\s+"
+    r"(?P<relations>[a-z]+(?:/[a-z]+)*)\b",
+)
+
+_LIVES_WITH_PERSON_PATTERN = re.compile(
+    r"\b(?:Jordan|the user|user)\s+"
+    r"(?:lives?|resides?|shares\s+(?:a\s+)?home)\s+with\s+"
+    r"(?P<name>[A-Z][a-z]+)\b",
+)
+
 _LOCATION_PATTERN = re.compile(
     r"\b(?:I\s+(?:live|lived|moved)\s+(?:in|to)|I'm\s+from|based\s+in)\s+"
     r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
@@ -68,6 +132,66 @@ _MEDICATION_PATTERN = re.compile(
     r"|wellbutrin|prozac|sertraline|methylphenidate)\b",
     re.IGNORECASE,
 )
+
+
+def _normalise_entity_hint(name: str) -> str:
+    """Return a display name for a model-provided entity hint."""
+    clean = re.sub(r"\s+", " ", name.strip())
+    if not clean:
+        return ""
+    lower = clean.lower()
+    if lower in _PERSON_ALIAS_RELATIONS:
+        return lower
+    if lower in {m.lower() for m in (
+        "adderall", "ritalin", "vyvanse", "concerta", "strattera",
+        "lexapro", "zoloft", "wellbutrin", "prozac", "sertraline",
+        "methylphenidate",
+    )}:
+        return lower.capitalize()
+    if clean.islower() and len(clean.split()) == 1:
+        return clean.capitalize()
+    return clean
+
+
+def _infer_entity_hint_type(name: str, content: str) -> str:
+    """Infer a coarse entity type for extraction-model entity hints."""
+    lower = name.lower()
+    if lower in _PERSON_ALIAS_RELATIONS:
+        return "person"
+    if _MEDICATION_PATTERN.fullmatch(lower):
+        return "medication"
+
+    escaped = re.escape(name)
+    if re.search(
+        rf"\b(?:in|from|to|based in|living in|lives in)\s+{escaped}\b",
+        content,
+        flags=re.IGNORECASE,
+    ):
+        return "place"
+
+    return "person"
+
+
+def _merge_entity_hints(
+    content: str,
+    entity_hints: list[str] | None,
+) -> list[tuple[str, str]]:
+    """Combine regex entities with LLM-supplied entity hints."""
+    pairs = _extract_entities(content)
+    seen = {(name.lower(), entity_type) for name, entity_type in pairs}
+
+    for hint in entity_hints or []:
+        name = _normalise_entity_hint(str(hint))
+        if not name:
+            continue
+        entity_type = _infer_entity_hint_type(name, content)
+        key = (name.lower(), entity_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append((name, entity_type))
+
+    return pairs
 
 
 def _extract_entities(content: str) -> list[tuple[str, str]]:
@@ -84,6 +208,30 @@ def _extract_entities(content: str) -> list[tuple[str, str]]:
             name = match.group(2) if match.lastindex and match.lastindex >= 2 else match.group(1)
             if name and name[0].isupper() and len(name) > 1:
                 entities[name] = "person"
+
+    for pattern in _RELATION_BEFORE_NAME_PATTERNS:
+        for match in pattern.finditer(content):
+            name = match.group("name")
+            relation = match.group("relation").lower()
+            entities[name] = "person"
+            if relation in _PERSON_ALIAS_RELATIONS:
+                entities[relation] = "person"
+
+    for match in _NAME_IS_RELATION_PATTERN.finditer(content):
+        name = match.group("name")
+        relations = [
+            relation.strip().lower()
+            for relation in match.group("relations").split("/")
+            if relation.strip()
+        ]
+        if any(relation in _RELATION_WORDS for relation in relations):
+            entities[name] = "person"
+        for relation in relations:
+            if relation in _PERSON_ALIAS_RELATIONS:
+                entities[relation] = "person"
+
+    for match in _LIVES_WITH_PERSON_PATTERN.finditer(content):
+        entities[match.group("name")] = "person"
 
     # Locations
     for match in _LOCATION_PATTERN.finditer(content):
@@ -130,12 +278,45 @@ class WritePipeline:
         self._llm = llm
         self._emitter = event_emitter
 
+    async def _link_entities(
+        self,
+        entity_pairs: list[tuple[str, str]],
+        *,
+        memory_id: str | None,
+        fact_id: str | None,
+    ) -> list[str]:
+        """Find/create and link entity pairs to an existing memory/fact."""
+        linked: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for name, entity_type in entity_pairs:
+            clean_name = name.strip()
+            clean_type = entity_type.strip()
+            if not clean_name or not clean_type:
+                continue
+            key = (clean_name.lower(), clean_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            entity_id = await self._db.find_or_create_entity(
+                clean_name,
+                clean_type,
+            )
+            await self._db.link_entity(
+                entity_id=entity_id,
+                memory_id=memory_id,
+                fact_id=fact_id,
+                relationship="mentioned_in",
+            )
+            linked.append(clean_name)
+        return linked
+
     async def store(
         self,
         content: str,
         memory_type: str = "episodic",
         importance: float = 0.5,
         tags: list[str] | None = None,
+        entity_hints: list[str] | None = None,
         skip_dedup: bool = False,
     ) -> WriteResult:
         """Store a long-term memory through the full pipeline.
@@ -173,10 +354,20 @@ class WritePipeline:
                 if dedup_result.existing_id:
                     existing = await self._db.get_memory_by_id(dedup_result.existing_id)
                     if existing:
+                        entity_pairs = _extract_entities(content)
+                        entity_pairs.extend(
+                            _extract_entities(existing.get("content", ""))
+                        )
+                        entity_names = await self._link_entities(
+                            entity_pairs,
+                            memory_id=dedup_result.existing_id,
+                            fact_id=None,
+                        )
                         return WriteResult(
                             note_id=dedup_result.existing_id,
                             action="duplicate",
                             source_path=existing.get("source_path", ""),
+                            entities_extracted=entity_names,
                             message="Duplicate detected. Evidence noted.",
                         )
                 return WriteResult(
@@ -192,7 +383,7 @@ class WritePipeline:
                 )
 
         # 2. Extract entities from content
-        entity_pairs = _extract_entities(content)
+        entity_pairs = _merge_entity_hints(content, entity_hints)
         entity_names = [name for name, _ in entity_pairs]
 
         # 3. Write filesystem note
@@ -223,14 +414,11 @@ class WritePipeline:
         )
 
         # 6. Link entities
-        for name, entity_type in entity_pairs:
-            entity_id = await self._db.find_or_create_entity(name, entity_type)
-            await self._db.link_entity(
-                entity_id=entity_id,
-                memory_id=note_meta.id,
-                fact_id=None,
-                relationship="mentioned_in",
-            )
+        await self._link_entities(
+            entity_pairs,
+            memory_id=note_meta.id,
+            fact_id=None,
+        )
 
         log.info(
             "write_pipeline_stored",
@@ -263,6 +451,7 @@ class WritePipeline:
         content: str,
         domain: str,
         importance: float = 0.5,
+        entity_hints: list[str] | None = None,
         skip_dedup: bool = False,
     ) -> WriteResult:
         """Store a User Model fact through the pipeline.
@@ -292,6 +481,15 @@ class WritePipeline:
                 if dedup_result.existing_id:
                     existing = await self._db.get_fact_by_id(dedup_result.existing_id)
                     if existing:
+                        entity_pairs = _extract_entities(content)
+                        entity_pairs.extend(
+                            _extract_entities(existing.get("content", ""))
+                        )
+                        entity_names = await self._link_entities(
+                            entity_pairs,
+                            memory_id=None,
+                            fact_id=dedup_result.existing_id,
+                        )
                         new_evidence = existing.get("evidence_count", 1) + 1
                         new_confidence = new_evidence / (
                             new_evidence + existing.get("contradiction_count", 0) + 2
@@ -313,6 +511,7 @@ class WritePipeline:
                             note_id=dedup_result.existing_id,
                             action="duplicate",
                             source_path=existing.get("source_path", ""),
+                            entities_extracted=entity_names,
                             message=f"Duplicate fact. Evidence count → {new_evidence}.",
                         )
                 return WriteResult(
@@ -329,7 +528,7 @@ class WritePipeline:
                 )
 
         # 2. Extract entities
-        entity_pairs = _extract_entities(content)
+        entity_pairs = _merge_entity_hints(content, entity_hints)
         entity_names = [name for name, _ in entity_pairs]
 
         # 3. Write filesystem note
@@ -360,14 +559,11 @@ class WritePipeline:
         )
 
         # 6. Link entities
-        for name, entity_type in entity_pairs:
-            entity_id = await self._db.find_or_create_entity(name, entity_type)
-            await self._db.link_entity(
-                entity_id=entity_id,
-                memory_id=None,
-                fact_id=note_meta.id,
-                relationship="mentioned_in",
-            )
+        await self._link_entities(
+            entity_pairs,
+            memory_id=None,
+            fact_id=note_meta.id,
+        )
 
         log.info(
             "write_pipeline_fact_stored",
@@ -424,14 +620,11 @@ class WritePipeline:
         # Re-extract and link new entities
         entity_pairs = _extract_entities(merged_content)
         entity_names = [name for name, _ in entity_pairs]
-        for name, entity_type in entity_pairs:
-            entity_id = await self._db.find_or_create_entity(name, entity_type)
-            await self._db.link_entity(
-                entity_id=entity_id,
-                memory_id=existing_id,
-                fact_id=None,
-                relationship="mentioned_in",
-            )
+        await self._link_entities(
+            entity_pairs,
+            memory_id=existing_id,
+            fact_id=None,
+        )
 
         log.info("write_pipeline_merged", existing_id=existing_id, entities=entity_names)
 
@@ -478,14 +671,11 @@ class WritePipeline:
         # Re-extract and link new entities
         entity_pairs = _extract_entities(merged_content)
         entity_names = [name for name, _ in entity_pairs]
-        for name, entity_type in entity_pairs:
-            entity_id = await self._db.find_or_create_entity(name, entity_type)
-            await self._db.link_entity(
-                entity_id=entity_id,
-                memory_id=None,
-                fact_id=existing_id,
-                relationship="mentioned_in",
-            )
+        await self._link_entities(
+            entity_pairs,
+            memory_id=None,
+            fact_id=existing_id,
+        )
 
         log.info(
             "write_pipeline_fact_merged",

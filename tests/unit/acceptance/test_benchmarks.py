@@ -76,7 +76,10 @@ def _state_with_pipelines() -> dict[str, Any]:
                 "total": 8, "by_status": {"active": 6, "soft_deleted": 2},
                 "with_consolidated_into": 3, "with_merged_from": 1,
             },
-            "user_model_facts": {"total": 4},
+            "user_model_facts": {
+                "total": 4,
+                "with_consolidated_into": 1,
+            },
             "entities": {"total": 5},
         },
         "vault_state": {
@@ -111,6 +114,7 @@ def _initial_state() -> dict[str, Any]:
     return {
         "memory_lifecycle": {
             "memories": {"total": 2, "by_status": {"active": 2}},
+            "user_model_facts": {"total": 0, "with_consolidated_into": 0},
             "entities": {"total": 1},
         },
     }
@@ -153,7 +157,7 @@ def test_collect_benchmarks_from_state() -> None:
 
     # Memory deltas: current=8, initial=2 -> created=6.
     assert summary.memories_created == 6
-    assert summary.memories_consolidated == 3
+    assert summary.memories_consolidated == 4
     assert summary.memories_dedup_merged == 2
     # Entities: current=5, initial=1 -> created=4.
     assert summary.entities_created == 4
@@ -163,12 +167,72 @@ def test_collect_benchmarks_from_state() -> None:
     assert summary.vault_wikilinks_total == 75
     assert summary.vault_entity_pages == 6  # people+places+projects
     assert summary.vault_moc_pages == 4
+    assert summary.vault_sessions == 0
     assert summary.vault_working_docs_active == 1  # only one is in_progress
 
     # Phase dwell: 5 minutes active_idle (10:00->10:05), 10 min deep_idle.
     assert "active_idle" in summary.phase_dwell_seconds
     assert summary.phase_dwell_seconds["active_idle"] == 300
     assert summary.phase_dwell_seconds["deep_idle"] == 600
+
+
+def test_collect_benchmarks_counts_merged_user_model_facts() -> None:
+    state = {
+        "memory_lifecycle": {
+            "memories": {"total": 0, "by_status": {}},
+            "user_model_facts": {
+                "total": 4,
+                "by_status": {"active": 2, "merged": 2},
+                "with_merged_from": 1,
+            },
+            "entities": {"total": 1},
+        }
+    }
+    initial = {
+        "memory_lifecycle": {
+            "memories": {"total": 0, "by_status": {}},
+            "user_model_facts": {
+                "total": 3,
+                "by_status": {"active": 3},
+                "with_merged_from": 0,
+            },
+            "entities": {"total": 1},
+        }
+    }
+
+    summary = asyncio.run(collect_benchmarks([], state, initial_state=initial))
+
+    assert summary.memories_dedup_merged == 2
+    assert summary.entities_merged == 1
+
+
+def test_collect_benchmarks_counts_consolidated_user_model_facts() -> None:
+    state = {
+        "memory_lifecycle": {
+            "memories": {"total": 0, "by_status": {}},
+            "user_model_facts": {
+                "total": 4,
+                "by_status": {"active": 3, "merged": 1},
+                "with_consolidated_into": 2,
+            },
+            "entities": {"total": 1},
+        }
+    }
+    initial = {
+        "memory_lifecycle": {
+            "memories": {"total": 0, "by_status": {}},
+            "user_model_facts": {
+                "total": 3,
+                "by_status": {"active": 3},
+                "with_consolidated_into": 0,
+            },
+            "entities": {"total": 1},
+        }
+    }
+
+    summary = asyncio.run(collect_benchmarks([], state, initial_state=initial))
+
+    assert summary.memories_consolidated == 2
 
 
 # ── JSON / CSV schemas ───────────────────────────────────────────────────
@@ -194,7 +258,8 @@ def test_benchmarks_to_json_schema() -> None:
         "memories_created", "memories_consolidated", "memories_dedup_merged",
         "entities_created", "entities_merged",
         "vault_notes_total", "vault_wikilinks_total",
-        "vault_entity_pages", "vault_moc_pages", "vault_working_docs_active",
+        "vault_entity_pages", "vault_moc_pages", "vault_sessions",
+        "vault_working_docs_active",
         "insights_persisted",
         "phase_dwell_seconds",
     }
