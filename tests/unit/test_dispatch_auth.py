@@ -1,10 +1,11 @@
 """Tests for auth relay threading in dispatch.execute_tool()."""
 
 import json
-import pytest
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from kora_v2.graph.dispatch import execute_tool, check_tool_auth
+import pytest
+
+from kora_v2.graph.dispatch import check_tool_auth, execute_tool
 
 
 class TestCheckToolAuth:
@@ -34,8 +35,8 @@ class TestCheckToolAuth:
 
     @pytest.mark.asyncio
     async def test_ask_first_calls_relay(self):
-        from kora_v2.tools.types import AuthLevel
         from kora_v2.daemon.auth_relay import AuthRelay
+        from kora_v2.tools.types import AuthLevel
 
         relay = AuthRelay()
         relay.set_broadcast(AsyncMock())
@@ -103,3 +104,45 @@ class TestExecuteToolAuthParam:
         data = json.loads(result)
         # Returns structured result/error JSON even with no container
         assert isinstance(data, dict)
+
+    @pytest.mark.asyncio
+    async def test_capability_action_requires_auth_and_passes_approval(self):
+        from kora_v2.daemon.auth_relay import AuthRelay
+
+        relay = AuthRelay()
+        relay.request_permission = AsyncMock(return_value=True)
+
+        container = MagicMock()
+        container.settings.security.auth_mode = "prompt"
+        container.settings.data_dir = None
+        container.session_manager.active_session.session_id = "sess-1"
+
+        capability_tools = [
+            {
+                "name": "workspace.calendar.create_event",
+                "_requires_approval": True,
+                "_read_only": False,
+            }
+        ]
+
+        with patch(
+            "kora_v2.graph.capability_bridge.collect_capability_tools",
+            return_value=capability_tools,
+        ), patch(
+            "kora_v2.graph.capability_bridge.execute_capability_action",
+            new=AsyncMock(return_value=json.dumps({"ok": True})),
+        ) as execute_cap:
+            result = await execute_tool(
+                "workspace.calendar.create_event",
+                {"title": "Standup"},
+                container=container,
+                auth_relay=relay,
+            )
+
+        assert json.loads(result) == {"ok": True}
+        relay.request_permission.assert_awaited_once()
+        execute_cap.assert_awaited_once_with(
+            "workspace.calendar.create_event",
+            {"title": "Standup", "approved": True},
+            container,
+        )

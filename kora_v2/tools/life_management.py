@@ -11,6 +11,7 @@ and PEP 563 (stringified annotations) breaks issubclass(input_type, BaseModel).
 """
 
 import json
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -56,6 +57,176 @@ def _get_db_path(container: Any):
     return data_dir / "operational.db"
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+_FOOD_WORDS = {
+    "bagel",
+    "breakfast",
+    "burrito",
+    "cereal",
+    "coffee",
+    "dinner",
+    "eggs",
+    "food",
+    "lunch",
+    "meal",
+    "nuts",
+    "pasta",
+    "protein",
+    "salad",
+    "sandwich",
+    "snack",
+    "soup",
+    "toast",
+}
+
+_NON_FOOD_MEAL_PHRASES = (
+    "asked about dinner",
+    "figure dinner out later",
+    "did i eat",
+    "don't think i ate",
+    "dont think i ate",
+    "create a file",
+    "research notes",
+    "set up a tiny",
+    "acceptance routine",
+    "stretch break",
+    "focus block",
+    "read it back",
+)
+
+
+def _looks_like_food_intake(description: str, meal_type: str) -> bool:
+    text = (description or "").strip().lower()
+    normalized_type = (meal_type or "").strip().lower()
+    if not text:
+        return False
+    if any(phrase in text for phrase in _NON_FOOD_MEAL_PHRASES):
+        return False
+    if normalized_type in {"breakfast", "lunch", "dinner", "snack"}:
+        if len(text) <= 80:
+            return True
+        return any(word in text for word in _FOOD_WORDS)
+    if len(text) <= 120 and any(word in text for word in _FOOD_WORDS):
+        return True
+    return any(
+        phrase in text
+        for phrase in (
+            "had a ",
+            "had some ",
+            "ate ",
+            "grabbed ",
+            "snacked on ",
+        )
+    ) and any(word in text for word in _FOOD_WORDS)
+
+
+async def _trigger_continuity_check_after_reminder(
+    container: Any,
+    *,
+    title: str,
+    due_at: datetime,
+) -> None:
+    """Kick continuity_check when a reminder is due within its scan window."""
+    engine = getattr(container, "orchestration_engine", None)
+    if engine is None:
+        return
+    window_hours = _env_float("KORA_CONTINUITY_REMINDER_WINDOW_HOURS", 0.25)
+    if due_at > datetime.now(UTC) + timedelta(hours=window_hours):
+        return
+    try:
+        await engine.start_triggered_pipeline(
+            "continuity_check",
+            goal=f"Reminder created: {title}",
+            trigger_id="create_reminder",
+        )
+    except Exception:  # noqa: BLE001
+        log.debug("create_reminder_continuity_trigger_failed", exc_info=True)
+
+
+async def _record_life_tool_event(
+    container: Any,
+    *,
+    event_type: str,
+    title: str,
+    details: str | None = None,
+    raw_text: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    ledger = getattr(container, "life_event_ledger", None)
+    if ledger is None:
+        return
+    try:
+        from kora_v2.life.models import RecordLifeEventInput
+
+        await ledger.record_event(
+            RecordLifeEventInput(
+                event_type=event_type,
+                source="tool",
+                title=title,
+                details=details,
+                raw_text=raw_text,
+                metadata=metadata or {},
+            )
+        )
+    except Exception:  # noqa: BLE001
+        log.debug("life_tool_ledger_event_failed", event_type=event_type, exc_info=True)
+
+
+def _parse_reminder_due_at(input: "CreateReminderInput") -> datetime:
+    """Resolve reminder due time from ISO input or common natural wording."""
+    raw = (input.remind_at or "").strip()
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC)
+        except ValueError:
+            pass
+
+    now = datetime.now(UTC)
+    text = " ".join(
+        part for part in (input.title, input.description, raw) if part
+    ).lower()
+    if not text:
+        return now
+
+    if "tomorrow" in text:
+        day_offset = 1
+    elif any(word in text for word in ("tonight", "this evening")):
+        day_offset = 0
+    else:
+        day_offset = 0
+
+    if any(word in text for word in ("morning", "standup")):
+        hour = 9
+    elif "afternoon" in text:
+        hour = 14
+    elif any(word in text for word in ("evening", "tonight")):
+        hour = 20
+    else:
+        return now
+
+    due_at = (now + timedelta(days=day_offset)).replace(
+        hour=hour,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if due_at <= now and day_offset == 0:
+        due_at += timedelta(days=1)
+    return due_at
+
+
 # ── Input models ─────────────────────────────────────────────────────────────
 
 
@@ -79,7 +250,10 @@ class CreateReminderInput(BaseModel):
 
 
 class QueryRemindersInput(BaseModel):
-    status: str = Field("pending", description="Filter by status: pending, done, snoozed")
+    status: str = Field(
+        "pending",
+        description="Filter by status: pending, done, snoozed, delivered, or all",
+    )
     limit: int = Field(10, description="Maximum number of reminders to return")
 
 
@@ -173,6 +347,19 @@ async def log_medication(input: LogMedicationInput, container: Any) -> str:
             await db.commit()
 
         log.info("log_medication.ok", medication=input.medication_name, id=row_id)
+        await _record_life_tool_event(
+            container,
+            event_type="medication_taken",
+            title=f"Medication taken: {input.medication_name}",
+            details=input.notes or None,
+            raw_text=f"{input.medication_name} {input.dose}".strip(),
+            metadata={
+                "medication_log_id": row_id,
+                "medication_name": input.medication_name,
+                "dose": input.dose,
+                "taken_at": now,
+            },
+        )
         return _ok({
             "id": row_id,
             "medication_name": input.medication_name,
@@ -202,6 +389,10 @@ async def log_meal(input: LogMealInput, container: Any) -> str:
     db_path = _get_db_path(container)
     if db_path is None:
         return _err("no database available")
+    if not _looks_like_food_intake(input.description, input.meal_type):
+        return _err(
+            "meal log rejected: description does not look like food intake"
+        )
 
     row_id = _new_id()
     now = _now_iso()
@@ -221,6 +412,19 @@ async def log_meal(input: LogMealInput, container: Any) -> str:
             await db.commit()
 
         log.info("log_meal.ok", description=input.description[:60], id=row_id)
+        await _record_life_tool_event(
+            container,
+            event_type="meal_logged",
+            title=f"Meal logged: {input.meal_type}",
+            details=input.description,
+            raw_text=input.description,
+            metadata={
+                "meal_log_id": row_id,
+                "meal_type": input.meal_type,
+                "calories": input.calories,
+                "logged_at": now,
+            },
+        )
         return _ok({
             "id": row_id,
             "description": input.description,
@@ -252,6 +456,10 @@ async def create_reminder(input: CreateReminderInput, container: Any) -> str:
 
     row_id = _new_id()
     now = _now_iso()
+    due_at = _parse_reminder_due_at(input)
+    due_at_iso = due_at.isoformat()
+    remind_at = input.remind_at or due_at_iso
+    repeat_rule = input.recurring or None
 
     try:
         async with aiosqlite.connect(str(db_path)) as db:
@@ -259,26 +467,49 @@ async def create_reminder(input: CreateReminderInput, container: Any) -> str:
             await db.execute(
                 """
                 INSERT INTO reminders
-                    (id, title, description, remind_at, recurring, status, created_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                    (id, title, description, remind_at, recurring, status,
+                     created_at, due_at, repeat_rule, source, metadata)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, 'user', ?)
                 """,
                 (
                     row_id,
                     input.title,
                     input.description or None,
-                    input.remind_at or None,
-                    input.recurring or None,
+                    remind_at,
+                    repeat_rule,
                     now,
+                    due_at_iso,
+                    repeat_rule,
+                    "{}",
                 ),
             )
             await db.commit()
 
         log.info("create_reminder.ok", title=input.title, id=row_id)
+        await _record_life_tool_event(
+            container,
+            event_type="reminder_created",
+            title=input.title,
+            details=input.description or None,
+            raw_text=input.title,
+            metadata={
+                "reminder_id": row_id,
+                "due_at": due_at_iso,
+                "recurring": repeat_rule,
+            },
+        )
+        await _trigger_continuity_check_after_reminder(
+            container,
+            title=input.title,
+            due_at=due_at,
+        )
         return _ok({
             "id": row_id,
             "title": input.title,
-            "remind_at": input.remind_at or None,
-            "recurring": input.recurring or None,
+            "remind_at": remind_at,
+            "due_at": due_at_iso,
+            "recurring": repeat_rule,
+            "repeat_rule": repeat_rule,
             "status": "pending",
             "message": f"Reminder created: {input.title}",
         })
@@ -306,15 +537,24 @@ async def query_reminders(input: QueryRemindersInput, container: Any) -> str:
     try:
         async with aiosqlite.connect(str(db_path)) as db:
             db.row_factory = aiosqlite.Row
+            status = (input.status or "pending").strip().lower()
+            where_clause = ""
+            params: tuple[Any, ...]
+            if status not in {"", "all", "*"}:
+                where_clause = "WHERE status = ?"
+                params = (status, input.limit)
+            else:
+                params = (input.limit,)
             async with db.execute(
-                """
-                SELECT id, title, description, remind_at, recurring, status, created_at
+                f"""
+                SELECT id, title, description, remind_at, recurring, status,
+                       created_at, due_at, repeat_rule, source, delivered_at
                 FROM reminders
-                WHERE status = ?
-                ORDER BY remind_at ASC
+                {where_clause}
+                ORDER BY COALESCE(due_at, remind_at, created_at) ASC
                 LIMIT ?
                 """,
-                (input.status, input.limit),
+                params,
             ) as cursor:
                 rows = await cursor.fetchall()
 
@@ -324,8 +564,12 @@ async def query_reminders(input: QueryRemindersInput, container: Any) -> str:
                 "title": row["title"],
                 "description": row["description"],
                 "remind_at": row["remind_at"],
+                "due_at": row["due_at"],
                 "recurring": row["recurring"],
+                "repeat_rule": row["repeat_rule"],
+                "source": row["source"],
                 "status": row["status"],
+                "delivered_at": row["delivered_at"],
                 "created_at": row["created_at"],
             }
             for row in rows
@@ -342,10 +586,11 @@ async def query_reminders(input: QueryRemindersInput, container: Any) -> str:
     name="quick_note",
     description=(
         "Capture a quick note immediately. Use when the user says 'note: X', "
-        "'remember: X', or similar quick-capture phrases. Does not go through memory pipeline."
+        "'note to self: X', 'remember: X', or similar quick-capture phrases. "
+        "Does not go through memory pipeline."
     ),
     category=ToolCategory.LIFE_MANAGEMENT,
-    auth_level=AuthLevel.ASK_FIRST,
+    auth_level=AuthLevel.ALWAYS_ALLOWED,
     is_read_only=False,
 )
 async def quick_note(input: QuickNoteInput, container: Any) -> str:
@@ -370,6 +615,14 @@ async def quick_note(input: QuickNoteInput, container: Any) -> str:
             await db.commit()
 
         log.info("quick_note.ok", id=row_id, content_len=len(input.content))
+        await _record_life_tool_event(
+            container,
+            event_type="quick_note_captured",
+            title="Quick note captured",
+            details=input.content,
+            raw_text=input.content,
+            metadata={"quick_note_id": row_id, "tags": input.tags or None},
+        )
         return _ok({
             "id": row_id,
             "content": input.content,
@@ -415,6 +668,14 @@ async def start_focus_block(input: StartFocusBlockInput, container: Any) -> str:
             await db.commit()
 
         log.info("start_focus_block.ok", id=row_id, label=input.label)
+        await _record_life_tool_event(
+            container,
+            event_type="focus_block_started",
+            title=f"Focus block started: {input.label}",
+            details=input.notes or None,
+            raw_text=input.label,
+            metadata={"focus_block_id": row_id, "started_at": now},
+        )
         return _ok({
             "id": row_id,
             "label": input.label,
@@ -499,6 +760,20 @@ async def end_focus_block(input: EndFocusBlockInput, container: Any) -> str:
             "end_focus_block.ok",
             id=block_id,
             duration_minutes=duration_minutes,
+        )
+        await _record_life_tool_event(
+            container,
+            event_type="focus_block_ended",
+            title=f"Focus block ended: {label}",
+            details=merged_notes,
+            raw_text=label,
+            metadata={
+                "focus_block_id": block_id,
+                "started_at": started_at,
+                "ended_at": now,
+                "completed": input.completed,
+                "duration_minutes": duration_minutes,
+            },
         )
         return _ok({
             "id": block_id,
@@ -865,6 +1140,20 @@ async def log_expense(input: LogExpenseInput, container: Any) -> str:
         amount=input.amount,
         category=input.category,
         is_impulse=is_impulse,
+    )
+    await _record_life_tool_event(
+        container,
+        event_type="expense_logged",
+        title=f"Expense logged: {input.category}",
+        details=input.description or None,
+        raw_text=f"{input.amount:.2f} {input.category}",
+        metadata={
+            "finance_log_id": row_id,
+            "amount": input.amount,
+            "category": input.category,
+            "is_impulse": is_impulse,
+            "category_avg": category_avg,
+        },
     )
     return _ok(
         {

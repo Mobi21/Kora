@@ -613,6 +613,13 @@ def build_session_note(
         "",
     ]
 
+    summary = bridge.get("summary", "")
+    if summary:
+        lines.append("## Summary")
+        lines.append("")
+        lines.append(str(summary))
+        lines.append("")
+
     if topics:
         lines.append("## Topics")
         lines.append("")
@@ -658,20 +665,31 @@ def build_session_index(sessions: list[dict[str, Any]]) -> str:
         "",
     ]
 
+    def session_date_text(session: dict[str, Any]) -> str:
+        raw = session.get("date", "")
+        if raw is None:
+            return ""
+        if hasattr(raw, "isoformat"):
+            try:
+                return raw.isoformat()
+            except Exception:
+                return str(raw)
+        return str(raw)
+
     if not sessions:
         lines.append("_No sessions recorded yet._")
     else:
         # Group by year/month
         by_month: dict[str, list[dict[str, Any]]] = {}
-        for session in sorted(sessions, key=lambda s: s.get("date", ""), reverse=True):
-            date = session.get("date", "")[:7]  # YYYY-MM
-            by_month.setdefault(date, []).append(session)
+        for session in sorted(sessions, key=session_date_text, reverse=True):
+            month = session_date_text(session)[:7]  # YYYY-MM
+            by_month.setdefault(month, []).append(session)
 
         for month, month_sessions in by_month.items():
             lines.append(f"## {month}")
             lines.append("")
             for session in month_sessions:
-                date = session.get("date", "")
+                date = session_date_text(session)
                 topics = session.get("topics", [])
                 topics_str = ", ".join(topics) if topics else "general"
                 note_name = session.get("note_name", "")

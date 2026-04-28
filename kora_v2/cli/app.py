@@ -259,13 +259,16 @@ class KoraCLI:
         ``run_wizard`` flow. Section 5 owns API key prompts (MiniMax +
         optional Brave), so this method is just a gate + introduction.
         """
-        bridges_dir = Path("_KoraMemory/.kora/bridges")
+        from kora_v2.core.settings import get_settings
+
+        memory_base = Path(
+            get_settings().memory.kora_memory_path
+        ).expanduser()
+        bridges_dir = memory_base / ".kora" / "bridges"
         if bridges_dir.exists() and list(bridges_dir.glob("*.md")):
             return  # Not first run
 
         from kora_v2.cli.first_run import run_wizard
-
-        memory_base = Path("_KoraMemory")
         result = await run_wizard(
             self._console, container=None, memory_base=memory_base
         )
@@ -307,6 +310,9 @@ class KoraCLI:
                     raw = await asyncio.wait_for(self._ws.recv(), timeout=120)
                     data = json.loads(raw)
                     msg_type = data.get("type", "")
+
+                    if msg_type in {"session_ready", "session_greeting"}:
+                        continue
 
                     if msg_type == "token":
                         token = data.get("content", "")

@@ -17,6 +17,8 @@ Usage::
 from __future__ import annotations
 
 import json
+import os
+import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -138,6 +140,10 @@ class GraphTurnRunner:
                     [self._tool_name(tc) for tc in tool_calls],
                 ),
             )
+            await self._record_open_decisions_from_response(
+                response=response,
+                session_id=session_id,
+            )
 
             # Phase 7.5b: turn-end acknowledgement. Any tasks we
             # surfaced at turn start are now "seen" and should not
@@ -220,6 +226,11 @@ class GraphTurnRunner:
                 ),
                 error_text=error_text,
             )
+            if error_text is None:
+                await self._record_open_decisions_from_response(
+                    response=response,
+                    session_id=session_id,
+                )
 
     async def record_trace_event(
         self,
@@ -283,17 +294,42 @@ class GraphTurnRunner:
         for task in tasks[:5]:
             state_obj = getattr(task, "state", None)
             state_val = getattr(state_obj, "value", None) or str(state_obj or "")
+            pipeline_goal = None
+            pipeline_name = None
+            pipeline_instance_id = getattr(task, "pipeline_instance_id", None)
+            if pipeline_instance_id is not None:
+                try:
+                    instance = await engine.instance_registry.load(
+                        pipeline_instance_id
+                    )
+                    pipeline_goal = getattr(instance, "goal", None)
+                    pipeline_name = getattr(instance, "pipeline_name", None)
+                except Exception:  # noqa: BLE001
+                    log.debug(
+                        "orchestration_prefetch_instance_load_failed",
+                        pipeline_instance_id=pipeline_instance_id,
+                        exc_info=True,
+                    )
             shaped.append(
                 {
                     "task_id": getattr(task, "id", None),
                     "stage": getattr(task, "stage_name", None),
                     "state": state_val,
                     "goal": getattr(task, "goal", None),
-                    "pipeline_instance_id": getattr(task, "pipeline_instance_id", None),
+                    "pipeline_name": pipeline_name,
+                    "pipeline_goal": pipeline_goal,
+                    "result_summary": getattr(task, "result_summary", None),
+                    "error_message": getattr(task, "error_message", None),
+                    "completed_at": (
+                        getattr(task, "completed_at", None).isoformat()
+                        if getattr(task, "completed_at", None)
+                        else None
+                    ),
+                    "pipeline_instance_id": pipeline_instance_id,
                 }
             )
             tid = getattr(task, "id", None)
-            if tid:
+            if tid and state_val in {"completed", "failed", "cancelled"}:
                 seen_ids.append(tid)
         if shaped:
             graph_input["_orchestration_tasks"] = shaped
@@ -316,6 +352,68 @@ class GraphTurnRunner:
                     task_id=task_id,
                     exc_info=True,
                 )
+
+    async def _record_open_decisions_from_response(
+        self,
+        *,
+        response: str,
+        session_id: str,
+    ) -> None:
+        """Persist explicit open decisions surfaced in assistant prose.
+
+        The LLM sometimes correctly says "open decision: X" from memory
+        without calling ``record_decision``. Treating that as plain text
+        drops the decision tracker path, so we mirror explicit open-
+        decision lines into the orchestration store.
+        """
+        topics = _extract_open_decision_topics(response)
+        if not topics:
+            return
+        engine = getattr(self._container, "orchestration_engine", None)
+        if engine is None:
+            return
+        recorded_any = False
+        for topic in topics:
+            try:
+                if await self._open_decision_exists(topic):
+                    continue
+                await engine.record_open_decision(
+                    topic=topic,
+                    context="Captured from assistant response that explicitly surfaced an open decision.",
+                    posed_in_session=session_id if session_id != "unknown" else None,
+                )
+                recorded_any = True
+            except Exception:  # noqa: BLE001
+                log.debug(
+                    "open_decision_response_capture_failed",
+                    topic=topic,
+                    exc_info=True,
+                )
+        if recorded_any and hasattr(engine, "record_pending_decision_aging"):
+            try:
+                await engine.record_pending_decision_aging(
+                    older_than_days=_env_nonnegative_int(
+                        "KORA_OPEN_DECISION_AGING_DAYS",
+                        3,
+                    ),
+                    limit=10,
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("open_decision_immediate_aging_failed", exc_info=True)
+
+    async def _open_decision_exists(self, topic: str) -> bool:
+        try:
+            async with aiosqlite.connect(str(self._db_path)) as db:
+                cursor = await db.execute(
+                    "SELECT 1 FROM open_decisions "
+                    "WHERE status = 'open' AND lower(topic) = lower(?) "
+                    "LIMIT 1",
+                    (topic,),
+                )
+                row = await cursor.fetchone()
+                return row is not None
+        except Exception:  # noqa: BLE001
+            return False
 
     # ── Private helpers ─────────────────────────────────────────────────
 
@@ -398,3 +496,156 @@ class GraphTurnRunner:
                 await db.commit()
         except Exception:
             log.warning("trace_complete_write_failed", trace_id=trace_id)
+
+
+def _extract_open_decision_topics(response: str) -> list[str]:
+    """Return explicit open-decision topics from assistant text."""
+    topics: list[str] = []
+    seen: set[str] = set()
+    capture_next = False
+    capture_list = False
+    captured_list_items = 0
+
+    def add_topic(raw: str) -> None:
+        topic = raw.strip()
+        topic = re.sub(r"[*_`#|]+", "", topic).strip()
+        if "|" in topic:
+            cells = [cell.strip() for cell in topic.split("|") if cell.strip()]
+            if len(cells) >= 2:
+                topic = f"{cells[0]}: {cells[1]}"
+        topic = re.split(r"\s+[-\u2013\u2014]\s+", topic, maxsplit=1)[0].strip()
+        topic = topic.rstrip(".;:")
+        topic = re.sub(r"\s*\([^)]*\)\s*$", "", topic).strip()
+        topic = topic.rstrip(".;:")
+        if len(topic) < 5:
+            return
+        key = topic.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        topics.append(topic[:500])
+
+    for raw_line in response.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        line = stripped.lstrip("-* ").strip()
+        if re.fullmatch(r"\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?", line):
+            continue
+        heading_line = re.sub(r"[*_`#]+", "", stripped).strip()
+        if (
+            (stripped.startswith("#") or heading_line.endswith(":"))
+            and re.search(
+                r"\bone\s+open\s+questions?\b"
+                r"|\bopen\s+decisions?\b"
+                r"|\bstill\s+open\b"
+                r"|\bstill\s+unresolved\b",
+                heading_line,
+                flags=re.IGNORECASE,
+            )
+        ):
+            capture_next = True
+            capture_list = bool(
+                re.search(
+                    r"\bstill\s+open\b"
+                    r"|\bopen\s+decisions?\b"
+                    r"|\bstill\s+unresolved\b",
+                    heading_line,
+                    flags=re.IGNORECASE,
+                )
+            )
+            captured_list_items = 0
+            continue
+        if re.search(
+            r"\b(?:one[-\s])?(?:decision|question)\s+to\s+make(?:\s+now)?\b"
+            r"|\bone[-\s]?question\s+decision\b"
+            r"|\bwhat\s+to\s+decide\s+first\b",
+            line,
+            flags=re.IGNORECASE,
+        ):
+            capture_next = True
+            capture_list = False
+            captured_list_items = 0
+            continue
+        if capture_next:
+            is_list_item = bool(
+                re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)", stripped)
+            )
+            if capture_list and captured_list_items and not is_list_item:
+                capture_next = False
+                capture_list = False
+                captured_list_items = 0
+            else:
+                add_topic(
+                    re.sub(r"^\s*(?:[-*]\s+|\d+[.)]\s+)", "", stripped)
+                )
+                if capture_list and is_list_item:
+                    captured_list_items += 1
+                    continue
+                capture_next = False
+                capture_list = False
+                captured_list_items = 0
+                continue
+        if "|" in stripped:
+            cells = [
+                re.sub(r"[*_`#]+", "", cell).strip()
+                for cell in stripped.strip("|").split("|")
+                if cell.strip()
+            ]
+            if len(cells) >= 2 and re.fullmatch(
+                r"(?:still\s+)?open(?:\s+questions?)?",
+                cells[0],
+                flags=re.IGNORECASE,
+            ):
+                add_topic(cells[1])
+                continue
+            if len(cells) >= 2 and re.search(
+                r"\bunresolved\b|\bno\s+pick\b|\bstill\s+needs?\s+to\s+happen\b",
+                cells[1],
+                flags=re.IGNORECASE,
+            ):
+                add_topic(f"{cells[0]}: {cells[1]}")
+                continue
+        if "|" in line and re.search(
+            r"\bstill\s+(?:not\s+)?(?:open|decided)\b"
+            r"|\bnot\s+decided\b"
+            r"|\bblocked\b",
+            line,
+            flags=re.IGNORECASE,
+        ):
+            cells = [cell.strip() for cell in line.split("|") if cell.strip()]
+            if len(cells) >= 2:
+                add_topic(f"{cells[0]}: {cells[1]}")
+                continue
+        match = re.search(
+            (
+                r"\b(?:one\s+)?(?:unresolved\s+)?open\s+"
+                r"(?:decision|question)\s*:\s*(.+)"
+                r"|\b(?:one\s+)?thing\s+to\s+decide\s*:\s*(.+)"
+                r"|\bpick\s+one\s*:\s*(.+)"
+                r"|\bchoose\s+between\s*:\s*(.+)"
+                r"|\b(.+?)\s+(?:was\s+)?never\s+locked\s+in\b.*\bstill\s+open\b"
+                r"|\b(.+?)\s+still\s+not\s+decided\b"
+                r"|\b(.+?)\s+not\s+decided\b.*\bblocked\b"
+                r"|\b(.+?)\s+.*\bstill\s+the\s+open\s+question\b"
+                r"|\b(.+?)\s+is\s+the\s+only\s+open\s+.+?question\b"
+            ),
+            line,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        add_topic(next(
+            group.strip() for group in match.groups() if group and group.strip()
+        ))
+    return topics
+
+
+def _env_nonnegative_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default

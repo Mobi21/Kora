@@ -3,8 +3,9 @@
 The MCP (Model Context Protocol) subsystem manages long-lived subprocesses that
 expose external tools to the Kora runtime. Each configured MCP server is a
 child process communicating over stdin/stdout using JSON-RPC 2.0. The manager
-handles lazy startup, protocol handshake, tool discovery, call routing, and
-crash recovery — all transparently to callers, which only see
+handles lazy startup, protocol handshake, tool discovery, and call routing.
+Failures surface explicitly to callers; older docs overstated transparent crash
+recovery because the restart helper is not the normal `call_tool()` path. Callers see
 `call_tool(server, tool, args)`.
 
 ## Files in this module
@@ -274,8 +275,9 @@ All defined in `mcp/manager.py`, inheriting from `kora_v2.core.exceptions.KoraEr
   as part of daemon lifecycle; may call `_restart_with_backoff` in health checks.
 - **Tool verb resolver** (`kora_v2/tools/verb_resolver.py`): looks up MCP
   tools by name and routes `call_tool` invocations.
-- **Settings** (`kora_v2/core/settings.py`): `MCPSettings.servers` is populated
-  from `data/mcp_servers.json` at startup (path is implementation detail of the
-  settings loader).
+- **Settings** (`kora_v2/core/settings.py`): `MCPSettings.servers` comes from
+  the settings system. The first-run wizard can write `data/mcp_servers.json`,
+  but current `Settings` loading does not treat that file as an automatic
+  public source of truth.
 - **First-run wizard** (`kora_v2/cli/first_run.py`): writes `data/mcp_servers.json`
   when the user provides a Brave API key.

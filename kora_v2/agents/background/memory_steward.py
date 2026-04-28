@@ -403,6 +403,12 @@ def pick_richer_note(
     score_a = _score(note_a)
     score_b = _score(note_b)
 
+    if abs(score_a - score_b) < 1e-9:
+        recency_a = str(note_a.get("updated_at") or note_a.get("created_at") or "")
+        recency_b = str(note_b.get("updated_at") or note_b.get("created_at") or "")
+        if recency_a != recency_b:
+            return (note_a, note_b) if recency_a > recency_b else (note_b, note_a)
+
     if score_a >= score_b:
         return note_a, note_b
     return note_b, note_a

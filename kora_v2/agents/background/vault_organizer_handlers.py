@@ -132,6 +132,25 @@ def _get_memory_store(container: Any) -> FilesystemMemoryStore:
     return store
 
 
+def _get_runtime_memory_root(container: Any, memory_store: Any) -> Path:
+    """Return the canonical runtime memory root.
+
+    The daemon writes bridge/session material under
+    ``settings.memory.kora_memory_path``. Use that when available so vault
+    organization follows the live runtime root instead of a legacy fallback.
+    """
+    settings = vars(container).get("settings")
+    memory_settings = getattr(settings, "memory", None) if settings is not None else None
+    configured_root = (
+        getattr(memory_settings, "kora_memory_path", None)
+        if memory_settings is not None
+        else None
+    )
+    if isinstance(configured_root, str) and configured_root:
+        return Path(configured_root).expanduser()
+    return Path(memory_store._base)
+
+
 def _get_event_emitter(container: Any) -> EventEmitter | None:
     return getattr(container, "event_emitter", None)
 
@@ -147,7 +166,15 @@ async def _llm_call(container: Any, system: str, user: str) -> str:
         {"role": "user", "content": user},
     ]
 
-    response = await llm.chat(messages)
+    if hasattr(llm, "chat"):
+        response = await llm.chat(messages)
+    else:
+        response = await llm.generate(
+            messages,
+            system_prompt=system,
+            temperature=0.2,
+            max_tokens=2000,
+        )
 
     if isinstance(response, str):
         return response
@@ -406,6 +433,61 @@ def _infer_domain(file_path: Path, base_path: Path) -> str:
     return "identity"
 
 
+async def _write_entity_page(
+    projection_db: ProjectionDB,
+    base_path: Path,
+    entity_info: dict[str, Any],
+) -> bool:
+    """Write one generated entity page from projection DB data."""
+    entity_name = entity_info["name"]
+    entity_type = entity_info["type"]
+    entity_id = entity_info["id"]
+
+    memories = await projection_db.get_memories_by_entity(entity_name)
+    backlinks = [
+        {
+            "id": m.id,
+            "content": m.content,
+            "created_at": m.created_at,
+        }
+        for m in memories
+    ]
+
+    relationships_raw = await projection_db.get_entity_relationships(entity_id)
+    relationships = [
+        {
+            "entity_name": r.entity_name,
+            "co_occurrence_count": r.co_occurrence_count,
+        }
+        for r in relationships_raw
+    ]
+
+    page_data = EntityPageData(
+        name=entity_name,
+        entity_type=entity_type,
+        backlinks=backlinks,
+        relationships=relationships,
+        first_mention=entity_info.get("first_mention"),
+        last_mention=entity_info.get("last_mention"),
+    )
+    page_content = build_entity_page(page_data)
+
+    folder_name = ENTITY_TYPE_FOLDER.get(entity_type, "Projects")
+    entity_dir = base_path / "Entities" / folder_name
+    entity_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = re.sub(r"[^\w\s-]", "", entity_name).strip()
+    safe_name = re.sub(r"\s+", "_", safe_name)
+    if not safe_name:
+        return False
+
+    entity_file = entity_dir / f"{safe_name}.md"
+    existing = entity_file.read_text(encoding="utf-8") if entity_file.exists() else None
+    if existing != page_content:
+        entity_file.write_text(page_content, encoding="utf-8")
+    return True
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Stage 2: Structure
 # ══════════════════════════════════════════════════════════════════════════
@@ -454,11 +536,19 @@ async def structure_step(
                 session_dir.mkdir(parents=True, exist_ok=True)
 
         # 2. Check for misplaced notes
-        for table in ("memories", "user_model_facts"):
-            cursor = await projection_db._db.execute(
-                f"SELECT id, source_path, memory_type FROM {table} "  # noqa: S608
-                f"WHERE status = 'active' AND source_path != ''"
-            )
+        table_queries = {
+            "memories": (
+                "SELECT id, source_path, memory_type FROM memories "
+                "WHERE status = 'active' AND source_path != ''"
+            ),
+            "user_model_facts": (
+                "SELECT id, source_path, 'user_model' AS memory_type "
+                "FROM user_model_facts "
+                "WHERE status = 'active' AND source_path != ''"
+            ),
+        }
+        for table, query in table_queries.items():
+            cursor = await projection_db._db.execute(query)
             for row in await cursor.fetchall():
                 record_id = row[0]
                 source_path = row[1]
@@ -655,6 +745,7 @@ async def links_step(
                     "id": entity.id,
                     "name": entity.name,
                     "type": entity.entity_type,
+                    "active_link_count": entity.active_link_count,
                     "first_mention": entity.first_mention,
                     "last_mention": entity.last_mention,
                 }
@@ -689,62 +780,23 @@ async def links_step(
             except Exception:
                 log.exception("links_note_failed", note_id=note_id)
 
-        # 4. Generate/update entity pages for entities that appeared in processed notes
-        base_path = memory_store._base
-        for entity_name in updated_entities:
+        # 4. Generate/update entity pages for all active projection entities.
+        # The pending queue only tells us what to wikilink this invocation;
+        # entity pages need to backfill existing projection rows too.
+        base_path = _get_runtime_memory_root(container, memory_store)
+        entities_to_render = [
+            name
+            for name, entity_info in entities_by_name.items()
+            if entity_info.get("active_link_count", 1) > 0 or name in updated_entities
+        ]
+        for entity_name in entities_to_render:
             try:
                 entity_info = entities_by_name.get(entity_name)
                 if entity_info is None:
                     continue
 
-                entity_type = entity_info["type"]
-                entity_id = entity_info["id"]
-
-                # Get backlinks
-                memories = await projection_db.get_memories_by_entity(entity_name)
-                backlinks = [
-                    {
-                        "id": m.id,
-                        "content": m.content,
-                        "created_at": m.created_at,
-                    }
-                    for m in memories
-                ]
-
-                # Get relationships
-                relationships_raw = await projection_db.get_entity_relationships(entity_id)
-                relationships = [
-                    {
-                        "entity_name": r.entity_name,
-                        "co_occurrence_count": r.co_occurrence_count,
-                    }
-                    for r in relationships_raw
-                ]
-
-                # Build entity page
-                page_data = EntityPageData(
-                    name=entity_name,
-                    entity_type=entity_type,
-                    backlinks=backlinks,
-                    relationships=relationships,
-                    first_mention=entity_info.get("first_mention"),
-                    last_mention=entity_info.get("last_mention"),
-                )
-
-                page_content = build_entity_page(page_data)
-
-                # Write entity page
-                folder_name = ENTITY_TYPE_FOLDER.get(entity_type, "Projects")
-                entity_dir = base_path / "Entities" / folder_name
-                entity_dir.mkdir(parents=True, exist_ok=True)
-
-                # Sanitize filename
-                safe_name = re.sub(r"[^\w\s-]", "", entity_name).strip()
-                safe_name = re.sub(r"\s+", "_", safe_name)
-                entity_file = entity_dir / f"{safe_name}.md"
-
-                entity_file.write_text(page_content, encoding="utf-8")
-                entity_pages_count += 1
+                if await _write_entity_page(projection_db, base_path, entity_info):
+                    entity_pages_count += 1
 
             except Exception:
                 log.exception(
@@ -829,7 +881,7 @@ async def moc_sessions_step(
     sessions_mirrored = 0
 
     try:
-        base_path = memory_store._base
+        base_path = _get_runtime_memory_root(container, memory_store)
 
         # 1. Regenerate MOC pages
         # Query note counts per domain from projection DB
@@ -838,6 +890,7 @@ async def moc_sessions_step(
         domains_to_regen: list[str] = []
 
         # Check which domains have enough changed notes since last regen
+        changed_total = 0
         for table, type_col in [("memories", "memory_type"), ("user_model_facts", None)]:
             if _last_moc_regen_at is not None:
                 since_ts = _last_moc_regen_at.isoformat(timespec="seconds")
@@ -873,8 +926,11 @@ async def moc_sessions_step(
             for row in await cursor.fetchall():
                 domain_name = row[0]
                 count = row[1]
+                changed_total += int(count or 0)
                 if count >= MOC_REGEN_THRESHOLD:
                     domains_to_regen.append(domain_name)
+        if not domains_to_regen and changed_total >= MOC_REGEN_THRESHOLD:
+            domains_to_regen.append("__overview__")
 
         # Generate MOC pages
         moc_dir = base_path / "Maps of Content"
@@ -882,17 +938,28 @@ async def moc_sessions_step(
 
         for domain in domains_to_regen:
             try:
-                # Get notes for this domain
+                # Get notes for this domain. If enough notes changed
+                # across the vault but no single domain crossed the
+                # threshold, generate an overview MOC instead of writing
+                # zero pages after a meaningful structural update.
                 notes_data: list[dict[str, Any]] = []
 
                 # Try memories table first
-                cursor = await projection_db._db.execute(
-                    "SELECT id, content, importance, created_at FROM memories "
-                    "WHERE status = 'active' AND memory_type = ? "
-                    "ORDER BY importance DESC, created_at DESC "
-                    "LIMIT 100",
-                    (domain,),
-                )
+                if domain == "__overview__":
+                    cursor = await projection_db._db.execute(
+                        "SELECT id, content, importance, created_at FROM memories "
+                        "WHERE status = 'active' "
+                        "ORDER BY importance DESC, created_at DESC "
+                        "LIMIT 100"
+                    )
+                else:
+                    cursor = await projection_db._db.execute(
+                        "SELECT id, content, importance, created_at FROM memories "
+                        "WHERE status = 'active' AND memory_type = ? "
+                        "ORDER BY importance DESC, created_at DESC "
+                        "LIMIT 100",
+                        (domain,),
+                    )
                 for row in await cursor.fetchall():
                     notes_data.append({
                         "id": row[0],
@@ -902,13 +969,21 @@ async def moc_sessions_step(
                     })
 
                 # Also try user_model_facts
-                cursor = await projection_db._db.execute(
-                    "SELECT id, content, confidence, created_at FROM user_model_facts "
-                    "WHERE status = 'active' AND domain = ? "
-                    "ORDER BY confidence DESC, created_at DESC "
-                    "LIMIT 100",
-                    (domain,),
-                )
+                if domain == "__overview__":
+                    cursor = await projection_db._db.execute(
+                        "SELECT id, content, confidence, created_at FROM user_model_facts "
+                        "WHERE status = 'active' "
+                        "ORDER BY confidence DESC, created_at DESC "
+                        "LIMIT 100"
+                    )
+                else:
+                    cursor = await projection_db._db.execute(
+                        "SELECT id, content, confidence, created_at FROM user_model_facts "
+                        "WHERE status = 'active' AND domain = ? "
+                        "ORDER BY confidence DESC, created_at DESC "
+                        "LIMIT 100",
+                        (domain,),
+                    )
                 for row in await cursor.fetchall():
                     notes_data.append({
                         "id": row[0],
@@ -920,10 +995,11 @@ async def moc_sessions_step(
                 if not notes_data:
                     continue
 
-                moc_content = build_moc_page(domain, notes_data)
+                moc_domain = "overview" if domain == "__overview__" else domain
+                moc_content = build_moc_page(moc_domain, notes_data)
 
                 # Write MOC file
-                safe_domain = domain.replace("_", " ").title()
+                safe_domain = moc_domain.replace("_", " ").title()
                 moc_file = moc_dir / f"MOC - {safe_domain}.md"
                 moc_file.write_text(moc_content, encoding="utf-8")
                 mocs_regenerated += 1
@@ -935,17 +1011,32 @@ async def moc_sessions_step(
         if mocs_regenerated > 0:
             _last_moc_regen_at = datetime.now(UTC)
 
-        # 2. Mirror session bridges from .kora/bridges/
+        # 2. Mirror canonical session bridges from the runtime memory root.
         bridges_dir = base_path / ".kora" / "bridges"
         sessions_dir = base_path / "Sessions"
         session_records: list[dict[str, Any]] = []
 
         if bridges_dir.is_dir():
-            for bridge_file in sorted(bridges_dir.glob("*.json")):
+            bridge_files = [
+                path
+                for path in sorted(
+                    [*bridges_dir.glob("*.json"), *bridges_dir.glob("*.md")]
+                )
+                if not path.name.endswith("-snapshot.json")
+            ]
+            for bridge_file in bridge_files:
                 try:
-                    bridge_data = json.loads(
-                        bridge_file.read_text(encoding="utf-8")
-                    )
+                    bridge_text = bridge_file.read_text(encoding="utf-8")
+                    if bridge_file.suffix == ".json":
+                        bridge_data = json.loads(bridge_text)
+                    else:
+                        meta, body = _parse_frontmatter(bridge_text)
+                        bridge_data = dict(meta)
+                        if body.strip():
+                            bridge_data.setdefault("summary", body.strip())
+                        open_threads = bridge_data.get("open_threads")
+                        if isinstance(open_threads, list):
+                            bridge_data.setdefault("topics", open_threads[:3])
 
                     session_id = bridge_data.get("session_id", bridge_file.stem)
                     session_date = bridge_data.get(

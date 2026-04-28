@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 import pytest
 
-from kora_v2.runtime.orchestration import init_orchestration_schema
+from kora_v2.runtime.orchestration import (
+    OrchestrationEngine,
+    UserScheduleProfile,
+    init_orchestration_schema,
+)
 from kora_v2.runtime.orchestration.decisions import (
     DecisionManager,
     OpenDecision,
     OpenDecisionsTracker,
     PendingDecision,
 )
+from kora_v2.runtime.orchestration.ledger import LedgerEventType
 
 
 @pytest.fixture
@@ -55,6 +61,22 @@ async def test_get_pending_returns_open_decisions(
     ids = {p.id for p in pending}
     assert d1.id in ids
     assert d2.id in ids
+
+
+async def test_get_pending_accepts_limit_and_aging_filter(
+    tracker: OpenDecisionsTracker,
+) -> None:
+    old = await tracker.record(topic="old", context="ctx")
+    await tracker.record(topic="fresh", context="ctx")
+    async with aiosqlite.connect(str(tracker._db_path)) as db:
+        await db.execute(
+            "UPDATE open_decisions SET posed_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(days=4)).isoformat(), old.id),
+        )
+        await db.commit()
+
+    pending = await tracker.get_pending(older_than_days=3, limit=1)
+    assert [decision.id for decision in pending] == [old.id]
 
 
 async def test_resolve_flips_status(tracker: OpenDecisionsTracker) -> None:
@@ -133,6 +155,110 @@ async def test_expire_older_than_hides_stale_decisions(
     pending_ids = {p.id for p in pending}
     assert fresh.id in pending_ids
     assert stale.id not in pending_ids
+
+
+async def test_decision_pending_3d_records_ledger_evidence(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "operational.db"
+    await init_orchestration_schema(db_path)
+    engine = OrchestrationEngine(
+        db_path,
+        schedule_profile=UserScheduleProfile(timezone="UTC"),
+    )
+    fresh = await engine.record_open_decision(topic="fresh", context="ctx")
+    stale = await engine.record_open_decision(topic="stale", context="ctx")
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(
+            "UPDATE open_decisions SET posed_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(days=4)).isoformat(), stale.id),
+        )
+        await db.commit()
+
+    aged = await engine.record_pending_decision_aging(older_than_days=3)
+    assert [decision.id for decision in aged] == [stale.id]
+    assert fresh.id not in {decision.id for decision in aged}
+
+    async with aiosqlite.connect(str(db_path)) as db:
+        cursor = await db.execute(
+            "SELECT event_type, trigger_name, reason, metadata_json "
+            "FROM work_ledger WHERE trigger_name = ?",
+            ("DECISION_PENDING_3D",),
+        )
+        rows = await cursor.fetchall()
+
+    assert len(rows) == 1
+    event_type, trigger_name, reason, metadata_json = rows[0]
+    assert event_type == LedgerEventType.TRIGGER_FIRED
+    assert trigger_name == "DECISION_PENDING_3D"
+    assert reason == "open_decision_aged"
+    assert stale.id in metadata_json
+
+
+async def test_tick_once_records_pending_decision_aging_once(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "operational.db"
+    await init_orchestration_schema(db_path)
+    engine = OrchestrationEngine(
+        db_path,
+        schedule_profile=UserScheduleProfile(timezone="UTC"),
+    )
+    stale = await engine.record_open_decision(topic="stale", context="ctx")
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(
+            "UPDATE open_decisions SET posed_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(days=4)).isoformat(), stale.id),
+        )
+        await db.commit()
+
+    await engine.tick_once()
+    await engine.tick_once()
+
+    async with aiosqlite.connect(str(db_path)) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM work_ledger "
+            "WHERE trigger_name = ? AND metadata_json LIKE ?",
+            ("DECISION_PENDING_3D", f'%"{stale.id}"%'),
+        )
+        row = await cursor.fetchone()
+
+    assert row == (1,)
+
+
+async def test_started_engine_ages_open_decisions_without_manual_tick(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "operational.db"
+    await init_orchestration_schema(db_path)
+    engine = OrchestrationEngine(
+        db_path,
+        schedule_profile=UserScheduleProfile(timezone="UTC"),
+        tick_interval=0.01,
+    )
+    stale = await engine.record_open_decision(topic="stale", context="ctx")
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(
+            "UPDATE open_decisions SET posed_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(days=4)).isoformat(), stale.id),
+        )
+        await db.commit()
+
+    await engine.start()
+    try:
+        await asyncio.sleep(0.25)
+    finally:
+        await engine.stop()
+
+    async with aiosqlite.connect(str(db_path)) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM work_ledger "
+            "WHERE trigger_name = ? AND metadata_json LIKE ?",
+            ("DECISION_PENDING_3D", f'%"{stale.id}"%'),
+        )
+        row = await cursor.fetchone()
+
+    assert row == (1,)
 
 
 # ── DecisionManager (in-memory, spec §17.7a relocation) ─────────────────

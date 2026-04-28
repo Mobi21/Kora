@@ -16,7 +16,10 @@ Phase 6:    autonomous dispatch originally lived here as the
 from __future__ import annotations
 
 import json
+import re
 import time
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -30,6 +33,207 @@ _TOOL_RISK_LEVELS: dict[str, str] = {
     "search_web": "low",
     "fetch_url": "low",
 }
+
+_PROTECTED_SYSTEM_PIPELINES: set[str] = {
+    "post_session_memory",
+    "post_memory_vault",
+    "session_bridge_pruning",
+    "skill_refinement",
+    "weekly_adhd_profile",
+    "wake_up_preparation",
+    "continuity_check",
+    "contextual_engagement",
+    "proactive_pattern_scan",
+    "anticipatory_prep",
+    "commitment_tracking",
+    "stuck_detection",
+    "connection_making",
+}
+
+_PROTECTED_PIPELINE_ALIASES: dict[str, tuple[str, ...]] = {
+    "post_session_memory": (
+        "post session memory",
+        "post_session_memory",
+        "memory steward",
+        "memory chain",
+        "memory pipeline",
+    ),
+    "post_memory_vault": (
+        "post memory vault",
+        "post_memory_vault",
+        "vault organizer",
+        "vault pipeline",
+    ),
+    "session_bridge_pruning": (
+        "session bridge pruning",
+        "session_bridge_pruning",
+    ),
+    "skill_refinement": ("skill refinement", "skill_refinement"),
+    "weekly_adhd_profile": ("weekly adhd profile", "weekly_adhd_profile"),
+    "wake_up_preparation": ("wake up preparation", "wake_up_preparation"),
+    "continuity_check": ("continuity check", "continuity_check"),
+    "contextual_engagement": ("contextual engagement", "contextual_engagement"),
+    "proactive_pattern_scan": (
+        "proactive pattern scan",
+        "proactive_pattern_scan",
+    ),
+    "anticipatory_prep": ("anticipatory prep", "anticipatory_prep"),
+    "commitment_tracking": ("commitment tracking", "commitment_tracking"),
+    "stuck_detection": ("stuck detection", "stuck_detection"),
+    "connection_making": ("connection making", "connection_making"),
+}
+
+_CANCEL_CONTROL_WORDS = {
+    "actually",
+    "background",
+    "cancel",
+    "cancelled",
+    "canceling",
+    "cancelling",
+    "don't",
+    "extra",
+    "keep",
+    "pause",
+    "paused",
+    "right",
+    "running",
+    "stop",
+    "stopped",
+    "task",
+    "tasks",
+    "there",
+    "waste",
+    "work",
+}
+
+
+def _cancel_target_words(text: str) -> list[str]:
+    normalized = text.lower().replace("_", " ").replace("-", " ")
+    words: list[str] = []
+    for raw in normalized.split():
+        word = raw.strip(".,;:!?()[]{}\"'")
+        if len(word) < 5 or word in _CANCEL_CONTROL_WORDS:
+            continue
+        words.append(word)
+    return words
+
+
+def _reason_preserves_research(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "research" in lowered
+        and any(
+            phrase in lowered
+            for phrase in (
+                "keep",
+                "preserve",
+                "do not cancel",
+                "don't cancel",
+                "dont cancel",
+                "do not disturb",
+                "don't disturb",
+                "dont disturb",
+                "do not touch",
+                "don't touch",
+                "dont touch",
+                "leave",
+            )
+        )
+    )
+
+
+def _reason_explicitly_cancels_research(text: str) -> bool:
+    lowered = text.lower().replace("_", " ")
+    if not re.search(r"\b(?:cancel|stop|pause|kill)\b", lowered):
+        return False
+    positive = re.split(
+        r"\b(?:do not|don't|dont|keep|preserve|leave)\b",
+        lowered,
+        maxsplit=1,
+    )[0]
+    return "research" in positive or "proactive research" in positive
+
+
+def _target_words_from_cancel_request(text: str) -> list[str]:
+    lowered = text.lower()
+    if not re.search(r"\b(?:cancel|stop|pause|kill)\b(?![-_])", lowered):
+        return []
+    first_sentence = re.split(r"[.;\n]", lowered, maxsplit=1)[0]
+    only_match = re.search(
+        r"\b(?:cancel|stop|pause|kill)\s+only\s+(.+?)(?:\s+right\s+now|\s+now|$)",
+        first_sentence,
+    )
+    if only_match:
+        return _cancel_target_words(only_match.group(1))
+    positive = re.split(
+        r"\b(?:do not|don't|dont|keep|preserve)\b",
+        lowered,
+        maxsplit=1,
+    )[0]
+    return _cancel_target_words(positive)
+
+
+def _explicitly_mentions_protected_pipeline(reason: str, pipeline_name: str) -> bool:
+    """Return True only when the user names a protected system pipeline."""
+    lowered = reason.lower()
+    aliases = _PROTECTED_PIPELINE_ALIASES.get(
+        pipeline_name,
+        (pipeline_name, pipeline_name.replace("_", " ")),
+    )
+    return any(alias.lower() in lowered for alias in aliases)
+
+
+# =====================================================================
+# Permission Grant Recording
+# =====================================================================
+
+
+def _record_permission_grant(
+    tool_name: str,
+    auth_level: AuthLevel,
+    decision: str,
+    risk_level: str,
+    session_id: str | None,
+    container: Any,
+) -> None:
+    """Fire-and-forget write to permission_grants for auth audit trail."""
+    import asyncio
+
+    async def _write() -> None:
+        try:
+            settings = getattr(container, "settings", None)
+            if settings is None:
+                return
+            db_path = getattr(settings, "data_dir", None)
+            if db_path is None:
+                return
+            op_db = db_path / "operational.db"
+            import aiosqlite
+
+            async with aiosqlite.connect(str(op_db)) as db:
+                await db.execute(
+                    "INSERT INTO permission_grants "
+                    "(id, tool_name, scope, risk_level, decision, granted_at, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        uuid.uuid4().hex[:12],
+                        tool_name,
+                        auth_level.value,
+                        risk_level,
+                        decision,
+                        datetime.now(UTC).isoformat(),
+                        session_id,
+                    ),
+                )
+                await db.commit()
+        except Exception:
+            log.debug("permission_grant_write_failed", tool=tool_name)
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_write())
+    except RuntimeError:
+        pass
 
 
 # =====================================================================
@@ -107,6 +311,31 @@ def _resolve_auth_context(
 
     if tool_name in {"search_web", "fetch_url"}:
         return AuthLevel.ALWAYS_ALLOWED, "low"
+
+    if "." in tool_name:
+        try:
+            from kora_v2.graph.capability_bridge import collect_capability_tools
+
+            for tool in collect_capability_tools():
+                if tool.get("name") != tool_name:
+                    continue
+                read_only = bool(tool.get("_read_only", True))
+                requires_approval = bool(
+                    tool.get("_requires_approval", False)
+                )
+                risk = "low" if read_only else "high"
+                return (
+                    AuthLevel.ASK_FIRST
+                    if requires_approval
+                    else AuthLevel.ALWAYS_ALLOWED,
+                    risk,
+                )
+        except Exception:  # noqa: BLE001
+            log.debug(
+                "capability_auth_context_lookup_failed",
+                tool=tool_name,
+                exc_info=True,
+            )
 
     # Check ToolRegistry for auth context (filesystem, life-management, etc.)
     from kora_v2.tools.registry import ToolRegistry
@@ -248,7 +477,10 @@ SUPERVISOR_TOOLS: list[dict[str, Any]] = [
             "hand the resulting pipeline to the orchestration engine. "
             "Use this when the work is multi-step but does not need the "
             "full plan-execute-review autonomous loop. Returns the "
-            "pipeline instance id and working-doc path."
+            "pipeline instance id and working-doc path. For open-ended "
+            "background/rabbit-hole research, use "
+            "pipeline_name='proactive_research' even when the topic is "
+            "privacy, local-first tooling, or another specific domain."
         ),
         "input_schema": {
             "type": "object",
@@ -266,7 +498,10 @@ SUPERVISOR_TOOLS: list[dict[str, Any]] = [
                     "description": (
                         "Machine name for the pipeline. Used as the "
                         "registry key and working-doc filename. Keep it "
-                        "snake_case and unique-ish."
+                        "snake_case and unique-ish. For background research "
+                        "requests, prefer the registered core pipeline name "
+                        "'proactive_research' instead of inventing topic "
+                        "names like 'privacy_research'."
                     ),
                 },
                 "stages": {
@@ -316,6 +551,17 @@ SUPERVISOR_TOOLS: list[dict[str, Any]] = [
                         "When true, stages are dispatched with the "
                         "in_turn preset (must return within the current "
                         "turn budget). Default false = background."
+                    ),
+                },
+                "intent_duration": {
+                    "type": "string",
+                    "enum": ["short", "indefinite", "long"],
+                    "description": (
+                        "How long the pipeline is expected to run. "
+                        "'short' — completes within minutes (default for in_turn). "
+                        "'long' — overnight / multi-hour background work "
+                        "(default for non-in_turn dispatches). "
+                        "'indefinite' — system pipelines without a clear end."
                     ),
                 },
             },
@@ -465,8 +711,9 @@ SUPERVISOR_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Record an open decision the user has posed but not yet "
             "answered. The tracker will resurface it in later turns. "
-            "Use when the user says 'I'll figure this out later' or "
-            "asks Kora to remind them to decide."
+            "Use when the user says 'I'll figure this out later', asks "
+            "Kora to remind them to decide, says they are weighing two "
+            "options, or leaves a decision/open question unresolved."
         ),
         "input_schema": {
             "type": "object",
@@ -562,13 +809,16 @@ def get_available_tools(
         log.debug("get_available_tools_registry_skip")
 
     # Merge in capability-pack actions (workspace, browser, vault, ...).
-    # These are always included; the model's skill guidance controls when to
-    # invoke them.  Duplicates are skipped to keep the list clean.
+    # Capability names are skill-gated too; otherwise every turn exposes
+    # personal-account/browser/vault actions even when the active skill set
+    # has nothing to do with them.
     try:
         from kora_v2.graph.capability_bridge import collect_capability_tools
 
         for cap_tool in collect_capability_tools(container):
             if cap_tool["name"] in seen_names:
+                continue
+            if allowed_names is not None and cap_tool["name"] not in allowed_names:
                 continue
             tools.append(cap_tool)
             seen_names.add(cap_tool["name"])
@@ -655,6 +905,18 @@ async def execute_tool(
         session_id=session_id,
         risk_level=risk_level,
     ) if auth_level != AuthLevel.ALWAYS_ALLOWED else True
+
+    # Persist the auth decision to permission_grants for audit.
+    if auth_level != AuthLevel.ALWAYS_ALLOWED:
+        _record_permission_grant(
+            tool_name=tool_name,
+            auth_level=auth_level,
+            decision="approved" if approved else "denied",
+            risk_level=risk_level,
+            session_id=session_id,
+            container=container,
+        )
+
     if not approved:
         log.info(
             "tool_auth_denied",
@@ -697,7 +959,10 @@ async def execute_tool(
     if "." in tool_name:
         from kora_v2.graph.capability_bridge import execute_capability_action
 
-        cap_result = await execute_capability_action(tool_name, tool_args, container)
+        cap_args = dict(tool_args)
+        if auth_level != AuthLevel.ALWAYS_ALLOWED:
+            cap_args.setdefault("approved", approved)
+        cap_result = await execute_capability_action(tool_name, cap_args, container)
         if cap_result is not None:
             return cap_result
 
@@ -1148,6 +1413,12 @@ async def _orch_decompose_and_dispatch(
     pipeline_name = str(tool_args.get("pipeline_name", "")).strip()
     stages_in = tool_args.get("stages") or []
     in_turn = bool(tool_args.get("in_turn", False))
+    intent_duration = str(tool_args.get("intent_duration") or "").strip()
+    if intent_duration not in {"short", "indefinite", "long"}:
+        # Default: in_turn → "short", non-in_turn background → "long"
+        # so the supervisor contract (item 46) lines up: background
+        # dispatches are long-lived by default and persist that fact.
+        intent_duration = "short" if in_turn else "long"
     if not goal or not pipeline_name or not stages_in:
         return json.dumps(
             {
@@ -1224,6 +1495,42 @@ async def _orch_decompose_and_dispatch(
             }
         )
 
+    if _is_cancel_probe_request(pipeline_name, goal):
+        pipeline_name = "cancel_probe"
+
+    if _routes_to_registered_proactive_research(
+        pipeline_name=pipeline_name,
+        goal=goal,
+        intent_duration=intent_duration,
+        stages=normalized,
+    ):
+        from kora_v2.runtime.orchestration.core_pipelines import (
+            register_core_pipelines,
+        )
+
+        registered_name = "proactive_research"
+        if registered_name not in engine.pipelines:
+            register_core_pipelines(engine)
+
+        instance = await engine.start_triggered_pipeline(
+            registered_name,
+            goal=goal,
+            parent_session_id=session_id,
+            trigger_id="decompose_and_dispatch",
+        )
+        pipeline = engine.pipelines.get(registered_name)
+        return json.dumps(
+            {
+                "status": "ok",
+                "pipeline_instance_id": instance.id,
+                "pipeline_name": instance.pipeline_name,
+                "working_doc_path": instance.working_doc_path,
+                "stage_count": len(pipeline.stages),
+                "routing": "registered_pipeline",
+                "requested_pipeline_name": pipeline_name,
+            }
+        )
+
     stages: list[PipelineStage] = []
     for item in normalized:
         stages.append(
@@ -1243,28 +1550,33 @@ async def _orch_decompose_and_dispatch(
         triggers=[],
         interruption_policy=InterruptionPolicy.PAUSE_ON_CONVERSATION,
         failure_policy=FailurePolicy.FAIL_PIPELINE,
-        intent_duration="short" if in_turn else "indefinite",
+        intent_duration=intent_duration,
     )
 
     await engine.register_runtime_pipeline(
         pipeline, created_by_session=session_id
     )
 
-    # Compute the doc path deterministically from the pipeline so we
-    # can thread it into both the instance row and the working doc
-    # create call — the store's `doc_path` helper uses the same
-    # algorithm the create helper does internally.
-    working_doc_path_obj = engine.working_docs.doc_path(
-        pipeline_name=pipeline_name,
-        instance_id=pipeline_name,
-        goal=goal,
-    )
+    # Create the pipeline instance first so we know its real id, then
+    # compute the working-doc path from that id. Previously this was
+    # computed with ``instance_id=pipeline_name`` before the instance
+    # existed, which baked a stale path into ``pipeline_instances`` and
+    # the tool return value — the file actually written to disk used
+    # the real instance id, so downstream ``get_working_doc`` calls
+    # pointed at a non-existent file.
     instance = await engine.start_pipeline_instance(
         pipeline_name,
         goal=goal,
-        working_doc_path=str(working_doc_path_obj),
+        working_doc_path="",
         parent_session_id=session_id,
     )
+    working_doc_path_obj = engine.working_docs.doc_path(
+        pipeline_name=pipeline_name,
+        instance_id=instance.id,
+        goal=goal,
+    )
+    instance.working_doc_path = str(working_doc_path_obj)
+    await engine.instance_registry.save(instance)
 
     # Now seed the working doc on disk so the user can peek at it
     # before the first stage runs. Best-effort — a missing doc does
@@ -1281,6 +1593,90 @@ async def _orch_decompose_and_dispatch(
     except Exception:  # noqa: BLE001
         log.debug("working_doc_create_failed", exc_info=True)
 
+    seeded_task_count = 0
+
+    # Seed in-turn runtime pipelines with one runnable task per stage. The
+    # previous path registered the PipelineInstance/working doc but left the
+    # dispatcher with no WorkerTasks, so item 8 could only prove that Kora
+    # acknowledged the request, not that it actually delegated anything.
+    if in_turn:
+        from kora_v2.runtime.orchestration.worker_task import StepResult
+
+        async def _in_turn_stage_step(task: Any, ctx: Any) -> StepResult:
+            return StepResult(
+                outcome="complete",
+                result_summary=f"completed:{task.stage_name or 'stage'}",
+            )
+
+        for stage in stages:
+            await engine.dispatch_task(
+                goal=stage.goal_template,
+                system_prompt=pipeline.description,
+                step_fn=_in_turn_stage_step,
+                preset="in_turn",
+                stage_name=stage.name,
+                pipeline_instance_id=instance.id,
+                depends_on=list(stage.depends_on),
+                tool_scope=list(stage.tool_scope) or None,
+            )
+            seeded_task_count += 1
+
+    # Seed the dispatcher with a real worker task for background
+    # autonomous work. Without this, the pipeline instance and working
+    # doc exist on disk but the scheduler has nothing to tick, so the
+    # task never progresses beyond ``pipeline_started``.
+    if not in_turn:
+        try:
+            from kora_v2.autonomous.pipeline_factory import (
+                get_autonomous_step_fn,
+            )
+
+            combined_scope: list[str] = []
+            for item in normalized:
+                for tool_name in item["tool_scope"]:
+                    if tool_name not in combined_scope:
+                        combined_scope.append(tool_name)
+
+            stage_names = [item["name"] for item in normalized]
+            stage_hint = ", ".join(stage_names)
+            system_prompt = (
+                "Use the working doc as the source of truth. Work through "
+                f"the requested stages in order: {stage_hint}. Keep the "
+                "Current Plan updated, checkpoint meaningful findings, and "
+                "only claim completion when the working doc reflects real "
+                "progress or an honest blocked state."
+            )
+
+            await engine.dispatch_task(
+                goal=goal,
+                system_prompt=system_prompt,
+                step_fn=get_autonomous_step_fn(),
+                preset="long_background",
+                stage_name=stage_names[0] if stage_names else pipeline_name,
+                pipeline_instance_id=instance.id,
+                tool_scope=combined_scope or None,
+            )
+            seeded_task_count += 1
+        except Exception as exc:  # noqa: BLE001
+            log.exception(
+                "decompose_and_dispatch_seed_task_failed",
+                pipeline_instance_id=instance.id,
+            )
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_category": "dispatch",
+                    "pipeline_instance_id": instance.id,
+                    "pipeline_name": pipeline_name,
+                    "working_doc_path": str(working_doc_path_obj),
+                    "message": (
+                        "Pipeline was declared, but no runnable worker task "
+                        "could be scheduled."
+                    ),
+                    "details": str(exc),
+                }
+            )
+
     return json.dumps(
         {
             "status": "ok",
@@ -1288,8 +1684,64 @@ async def _orch_decompose_and_dispatch(
             "pipeline_name": pipeline_name,
             "working_doc_path": str(working_doc_path_obj),
             "stage_count": len(stages),
+            "seeded_task_count": seeded_task_count,
         }
     )
+
+
+def _routes_to_registered_proactive_research(
+    *,
+    pipeline_name: str,
+    goal: str,
+    intent_duration: str,
+    stages: list[dict[str, Any]],
+) -> bool:
+    """Return True for user-created background research pipelines.
+
+    Acceptance conversations often ask for "privacy/local-first
+    research" and the LLM names the runtime pipeline after the topic
+    (for example ``privacy_research``). That should still use the
+    registered ``proactive_research`` core pipeline instead of creating
+    an ad-hoc autonomous pipeline, because Area C's handler owns the
+    research/reporting semantics.
+    """
+    name = pipeline_name.strip().lower()
+    goal_l = goal.strip().lower()
+    if "cancel-probe" in name or "cancel_probe" in name:
+        return False
+    if "cancel-probe" in goal_l or "cancel_probe" in goal_l:
+        return False
+    if name == "proactive_research":
+        return True
+    if not (name.endswith("_research") or name.endswith("-research")):
+        return False
+    if intent_duration not in {"long", "indefinite", "short"}:
+        return False
+
+    haystack = " ".join(
+        [
+            goal,
+            pipeline_name,
+            " ".join(str(stage.get("name", "")) for stage in stages),
+        ]
+    ).lower()
+    research_signals = (
+        "research",
+        "deep dive",
+        "rabbit-hole",
+        "rabbit hole",
+        "look into",
+        "compare",
+        "privacy",
+        "local-first",
+        "data ownership",
+    )
+    return any(signal in haystack for signal in research_signals)
+
+
+def _is_cancel_probe_request(pipeline_name: str, goal: str) -> bool:
+    haystack = f"{pipeline_name} {goal}".lower()
+    return "cancel-probe" in haystack or "cancel_probe" in haystack
 
 
 async def _orch_get_running_tasks(
@@ -1304,17 +1756,38 @@ async def _orch_get_running_tasks(
         relevant_to_session=session_id if relevant else None,
         user_message=user_message,
     )
-    out = [
-        {
-            "task_id": getattr(t, "id", None),
-            "stage_name": getattr(t, "stage_name", None),
-            "state": getattr(getattr(t, "state", None), "value", None)
-            or str(getattr(t, "state", "")),
-            "goal": getattr(t, "goal", None),
-            "pipeline_instance_id": getattr(t, "pipeline_instance_id", None),
-        }
-        for t in tasks
-    ]
+    out: list[dict[str, Any]] = []
+    terminal_task_ids: list[str] = []
+    for t in tasks:
+        state_value = (
+            getattr(getattr(t, "state", None), "value", None)
+            or str(getattr(t, "state", ""))
+        )
+        task_id = getattr(t, "id", None)
+        out.append(
+            {
+                "task_id": task_id,
+                "stage_name": getattr(t, "stage_name", None),
+                "state": state_value,
+                "goal": getattr(t, "goal", None),
+                "result_summary": getattr(t, "result_summary", None),
+                "error_message": getattr(t, "error_message", None),
+                "pipeline_instance_id": getattr(t, "pipeline_instance_id", None),
+            }
+        )
+        if task_id and state_value in {"completed", "failed", "cancelled"}:
+            terminal_task_ids.append(str(task_id))
+
+    for task_id in terminal_task_ids:
+        try:
+            await engine.acknowledge_task(task_id)
+        except Exception:  # noqa: BLE001
+            log.debug(
+                "orchestration_get_running_tasks_ack_failed",
+                task_id=task_id,
+                exc_info=True,
+            )
+
     return json.dumps({"status": "ok", "tasks": out, "count": len(out)})
 
 
@@ -1397,8 +1870,140 @@ async def _orch_cancel_task(
     reason = str(tool_args.get("reason", "user_requested")).strip() or "user_requested"
     if not task_id:
         return json.dumps({"status": "error", "message": "task_id is required"})
+    reason_lower = reason.lower()
+
+    task = None
+    instance = None
+    pipeline_tasks: list[Any] = []
+    try:
+        task = await engine.get_task(task_id)
+        pipeline_instance_id = getattr(task, "pipeline_instance_id", None)
+        if pipeline_instance_id is not None:
+            instance = await engine.instance_registry.load(pipeline_instance_id)
+    except Exception:  # noqa: BLE001
+        log.debug("cancel_task_context_lookup_failed", exc_info=True)
+
+    if task is None:
+        try:
+            instance = await engine.instance_registry.load(task_id)
+            pipeline_tasks = await engine.task_registry.load_by_pipeline(task_id)
+        except Exception:  # noqa: BLE001
+            instance = None
+            pipeline_tasks = []
+
+    pipeline_name = str(getattr(instance, "pipeline_name", "") or "")
+    if (
+        pipeline_name in _PROTECTED_SYSTEM_PIPELINES
+        and not _explicitly_mentions_protected_pipeline(reason, pipeline_name)
+    ):
+        return json.dumps(
+            {
+                "status": "ok",
+                "task_id": task_id,
+                "cancelled": False,
+                "message": (
+                    f"Preserved protected system pipeline {pipeline_name}; "
+                    "the user did not explicitly name it."
+                ),
+            }
+        )
+
+    target_words = _target_words_from_cancel_request(reason_lower)
+    preserve_research = _reason_preserves_research(reason_lower)
+    if (
+        preserve_research
+        and pipeline_name == "proactive_research"
+        and not _reason_explicitly_cancels_research(reason_lower)
+    ):
+        return json.dumps(
+            {
+                "status": "ok",
+                "task_id": task_id,
+                "cancelled": False,
+                "message": "Preserved because the user asked to keep proactive_research running.",
+            }
+        )
+
+    if preserve_research and task is not None:
+        try:
+            haystack = " ".join(
+                str(value or "").lower()
+                for value in (
+                    getattr(task, "stage_name", None),
+                    getattr(task, "goal", None),
+                    getattr(task, "result_summary", None),
+                    getattr(instance, "goal", None),
+                    pipeline_name,
+                )
+            ).replace("_", " ").replace("-", " ")
+            target_score = sum(
+                1 for word in target_words if word and word in haystack
+            )
+            if target_score == 0 and "research" in haystack:
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "task_id": task_id,
+                        "cancelled": False,
+                        "message": "Preserved because the user asked to keep the research task.",
+                    }
+                )
+        except Exception:  # noqa: BLE001
+            log.debug("cancel_task_preserve_research_check_failed", exc_info=True)
+
+    if target_words and task is not None:
+        task_haystack = " ".join(
+            str(value or "").lower()
+            for value in (
+                getattr(task, "id", None),
+                getattr(task, "stage_name", None),
+                getattr(task, "goal", None),
+                getattr(task, "result_summary", None),
+                getattr(task, "error_message", None),
+                pipeline_name,
+                getattr(instance, "goal", None),
+            )
+        ).replace("_", " ").replace("-", " ")
+        if not any(word in task_haystack for word in target_words):
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "task_id": task_id,
+                    "cancelled": False,
+                    "message": (
+                        "No cancellation applied: the requested target does "
+                        "not match that task."
+                    ),
+                }
+            )
+
+    if task is None and instance is not None and pipeline_tasks:
+        cancellable = [
+            candidate for candidate in pipeline_tasks
+            if str(getattr(candidate, "state", "")).lower().split(".")[-1]
+            not in {"completed", "failed", "cancelled"}
+        ]
+        cancelled_ids: list[str] = []
+        for candidate in cancellable:
+            candidate_id = str(getattr(candidate, "id", "") or "")
+            if not candidate_id:
+                continue
+            if await engine.cancel_task(candidate_id, reason=reason):
+                cancelled_ids.append(candidate_id)
+        return json.dumps(
+            {
+                "status": "ok" if cancelled_ids else "error",
+                "task_id": task_id,
+                "pipeline_instance_id": task_id,
+                "cancelled": bool(cancelled_ids),
+                "cancelled_task_ids": cancelled_ids,
+            }
+        )
+
     ok = await engine.cancel_task(task_id, reason=reason)
-    return json.dumps({"status": "ok" if ok else "error", "task_id": task_id})
+    return json.dumps(
+        {"status": "ok" if ok else "error", "task_id": task_id, "cancelled": ok}
+    )
 
 
 async def _orch_modify_task(
@@ -1458,4 +2063,3 @@ async def _orch_record_decision(
             "topic": getattr(decision, "topic", None),
         }
     )
-

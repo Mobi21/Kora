@@ -147,13 +147,54 @@ def mask_observations(
         msg = result[idx]
         role = msg.get("role", "")
 
-        # Mask large tool results
+        # Mask large tool results (OpenAI-shape: role="tool", flat string).
         if role == "tool":
             content = msg.get("content", "")
             if isinstance(content, str) and len(content) > 200:
                 tool_call_id = msg.get("tool_call_id", "")
                 result[idx] = _mask_single_tool_result(messages, idx, tool_call_id, content)
                 masked_count += 1
+
+        # Mask large tool results (Anthropic-shape: role="user" with
+        # ``type="tool_result"`` content blocks). MiniMax's
+        # ``_format_messages`` normalises to this shape on every call, so
+        # the bulk of tokens in a heavy tool session live here — missing
+        # this path is why PRUNE tier failed to reclaim any real space.
+        elif role == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                new_blocks: list[Any] = []
+                changed = False
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_result"
+                    ):
+                        block_content = block.get("content", "")
+                        # Content may be a string or a list of text/json blocks.
+                        if isinstance(block_content, list):
+                            block_text = " ".join(
+                                (b.get("text", "") if isinstance(b, dict) else str(b))
+                                for b in block_content
+                            )
+                        else:
+                            block_text = str(block_content)
+                        if len(block_text) > 200:
+                            tool_name = _get_tool_name_for_call_id(
+                                messages, idx, block.get("tool_use_id", "")
+                            )
+                            new_blocks.append(
+                                {
+                                    **block,
+                                    "content": f"[result from {tool_name}: {_first_line(block_text)}...]",
+                                }
+                            )
+                            changed = True
+                            continue
+                    new_blocks.append(block)
+                if changed:
+                    result[idx] = {**msg, "content": new_blocks}
+                    masked_count += 1
 
         # Strip thinking blocks from assistant messages
         elif role == "assistant":

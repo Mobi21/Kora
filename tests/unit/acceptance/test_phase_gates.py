@@ -97,17 +97,30 @@ def test_gate_satisfies_items_47_51_on_memory_steward_state() -> None:
     _add_pipeline(state, "weekly_adhd_profile", 1, state_str="completed")
     state["memory_lifecycle"]["memories"]["total"] = 5
     state["memory_lifecycle"]["memories"]["with_consolidated_into"] = 2
-    state["memory_lifecycle"]["memories"]["with_merged_from"] = 1
     state["memory_lifecycle"]["memories"]["by_status"] = {
         "active": 3, "consolidated": 1, "soft_deleted": 1,
     }
     state["memory_lifecycle"]["entities"]["total"] = 2
+    state["memory_lifecycle"]["entities"]["with_merged_from"] = 1
     state["memory_lifecycle"]["user_model_facts"]["total"] = 3
 
     result = run_phase_gate(
         "memory_steward_verification", [47, 48, 49, 50, 51], state,
     )
     assert set(result.items_satisfied) == {47, 48, 49, 50, 51}
+    assert result.items_missing == []
+
+
+def test_gate_satisfies_item_48_on_user_model_fact_consolidation() -> None:
+    state = _base_state()
+    _add_pipeline(state, "post_session_memory", 1, state_str="completed")
+    state["memory_lifecycle"]["memories"]["total"] = 1
+    state["memory_lifecycle"]["user_model_facts"]["total"] = 3
+    state["memory_lifecycle"]["user_model_facts"]["with_consolidated_into"] = 2
+
+    result = run_phase_gate("memory_steward_verification", [48], state)
+
+    assert result.items_satisfied == [48]
     assert result.items_missing == []
 
 

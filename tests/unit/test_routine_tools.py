@@ -17,15 +17,16 @@ from kora_v2.life.routines import (
 )
 from kora_v2.tools.routines import (
     AdvanceRoutineInput,
+    CreateRoutineInput,
     ListRoutinesInput,
     RoutineProgressInput,
     StartRoutineInput,
     advance_routine,
+    create_routine,
     list_routines,
     routine_progress,
     start_routine,
 )
-
 
 # ── Helpers / Fixtures ──────────────────────────────────────────────────────
 
@@ -71,6 +72,8 @@ def _make_session(
 def _mock_container(routine_manager: MagicMock | None = None) -> MagicMock:
     container = MagicMock()
     container.routine_manager = routine_manager
+    container.orchestration_engine = None
+    container.session_manager = None
     return container
 
 
@@ -79,6 +82,34 @@ def _parse(result: str) -> dict:
 
 
 # ── list_routines ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_routine_registers_existing_duplicate() -> None:
+    routine = _make_routine("morning_launch", "Morning Launch")
+    mgr = MagicMock()
+    mgr.create_routine = AsyncMock(side_effect=Exception("UNIQUE constraint failed: routines.id"))
+    mgr.get_routine = AsyncMock(return_value=routine)
+    engine = MagicMock()
+    engine.register_runtime_pipeline = AsyncMock()
+    container = _mock_container(mgr)
+    container.orchestration_engine = engine
+
+    result = _parse(
+        await create_routine(
+            CreateRoutineInput(
+                name="Morning Launch",
+                steps=["Meds", "Breakfast", "One priority"],
+            ),
+            container,
+        )
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "existing"
+    assert result["routine_id"] == "morning_launch"
+    assert result["runtime_pipeline_registered"] is True
+    engine.register_runtime_pipeline.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -171,6 +202,7 @@ async def test_start_routine_low_energy_variant():
         routine_id="morning-1",
         session_id="sess-1",
         variant="low_energy",
+        parent_session_id=None,
     )
 
 

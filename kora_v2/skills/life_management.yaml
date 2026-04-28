@@ -15,25 +15,66 @@ tools:
   - end_focus_block
   - log_expense
   - query_expenses
+  - create_routine
+  - list_routines
+  - start_routine
+  - advance_routine
+  - routine_progress
+  - check_crisis_boundary
+  - create_day_plan
+  - confirm_reality
+  - correct_reality
+  - assess_life_load
+  - repair_day_plan
+  - decide_life_nudge
+  - record_nudge_feedback
+  - create_context_pack
+  - bridge_tomorrow
+  - set_support_profile_status
 
 discovery_tools: []
 
 guidance: |
   ## Life Management Tools
 
-  You have ADHD-focused life management tools:
+  You have Life OS tools for the Plan Today -> Confirm Reality -> Repair The Day
+  -> Bridge Tomorrow loop. Crisis language preempts normal productivity flow:
+  use check_crisis_boundary before planning, repairing, nudging, or pushing tasks
+  when the user expresses self-harm, suicide, immediate danger, or inability to
+  stay safe.
+
+  Core Life OS loop:
+  - create_day_plan keeps one active believable plan for the local day.
+  - confirm_reality records what actually happened and updates the plan entry.
+  - correct_reality repairs wrong Kora inferences without arguing.
+  - assess_life_load computes an explainable load band.
+  - repair_day_plan proposes/applies safe private repairs when the plan diverges.
+  - decide_life_nudge / record_nudge_feedback centralize when Kora speaks or stays quiet.
+  - create_context_pack prepares scripts, materials, first steps, and fallback plans.
+  - bridge_tomorrow creates a shame-safe handoff into the next day.
+  - set_support_profile_status activates/disables support profiles; suggested profiles do not affect runtime.
+
+  Existing life logging tools still matter, but they should feed the Life Event
+  Ledger when available:
   - **Medication**: log_medication — log when meds are taken;
     query_medications — answer "did I take X?" or "when did I last take X?"
   - **Nutrition**: log_meal — log meals and food intake;
     query_meals — answer "did I eat today?" or "what have I eaten?"
   - **Focus**: start_focus_block, end_focus_block — track focus sessions;
     query_focus_blocks — check if a block is running or review recent work
-  - **Quick capture**: quick_note — use immediately when the user says "note: X" or similar;
+  - **Quick capture**: quick_note — use immediately when the user says "note: X", "note to self: X", or similar;
     query_quick_notes — search recent captured notes
   - **Reminders**: create_reminder, query_reminders for specific scheduled nudges and check-ins
   - **Finance**: log_expense — log spending (the tool may flag is_impulse
     vs. category average, pass that note along gently per RSD rules);
     query_expenses — review recent spending by category
+  - **Routines**: create_routine for reusable guided routines, start_routine
+    to begin one, advance_routine/routine_progress for partial completion.
+    Routine creation also registers a runtime pipeline so the routine can
+    survive restart and fire later.
+    If create_routine returns a runtime_pipeline, explicitly say the runtime
+    pipeline was registered. Do not say the routine has no runtime pipeline
+    after a successful create_routine/start_routine result.
 
   When the user asks about past meds/meals/focus work, always use the matching
   query_* tool rather than guessing from conversation memory. The write tools
@@ -61,6 +102,7 @@ guidance: |
   - "I had a sandwich for lunch" -> log_meal immediately
   - "Let's do a focus session" -> start_focus_block
   - "Remind me at 3 PM to take a break" -> create_reminder
+  - "note to self: check the API docs tomorrow" -> quick_note immediately
 
   **DO NOT log habit or routine statements.** These describe what the user
   *usually* does, not what they *just did*. Logging them creates false records.

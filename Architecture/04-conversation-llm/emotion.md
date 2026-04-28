@@ -291,7 +291,7 @@ the two-tier assessor without importing emotion-module internals. See
 - **Life engine** (`kora_v2/life/`): reads `emotional_state.mood_label` and
   `valence` for proactive notification decisions; subscribes to
   `EMOTION_SHIFT_DETECTED` via the event emitter.
-- **Notification gate** (`kora_v2/runtime/orchestration/notification_gate.py`):
+- **Notification gate** (`kora_v2/runtime/orchestration/notifications.py`):
   subscribes to `EMOTION_STATE_ASSESSED` so that hyperfocus detection — which
   relies on sustained high arousal — reacts inside the same turn as the
   assessment that triggered it. See

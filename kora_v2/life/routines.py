@@ -12,7 +12,8 @@ Phase 8e additions:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -519,7 +520,7 @@ async def get_routine_nudges(
 async def register_routine_pipeline(
     routine: Routine,
     engine: Any,
-) -> None:
+) -> Any:
     """Register a runtime pipeline for a routine's schedule.
 
     Creates a single-stage pipeline triggered at a fixed time derived
@@ -535,7 +536,7 @@ async def register_routine_pipeline(
         Pipeline,
         PipelineStage,
     )
-    from kora_v2.runtime.orchestration.triggers import time_of_day
+    from kora_v2.runtime.orchestration.triggers import interval, time_of_day
 
     # Determine trigger time from routine tags
     trigger_time = dtime(8, 0)  # default morning
@@ -548,6 +549,15 @@ async def register_routine_pipeline(
 
     pipeline_name = f"routine_{routine.id}"
 
+    triggers = [time_of_day(pipeline_name, at=trigger_time)]
+    acceptance_interval = os.environ.get("KORA_ACCEPTANCE_ROUTINE_TRIGGER_SECONDS")
+    if acceptance_interval:
+        try:
+            seconds = max(1, int(acceptance_interval))
+            triggers = [interval(pipeline_name, every=timedelta(seconds=seconds))]
+        except ValueError:
+            pass
+
     pipeline = Pipeline(
         name=pipeline_name,
         description=f"Guided routine: {routine.name}",
@@ -558,7 +568,7 @@ async def register_routine_pipeline(
                 goal_template=f"Run routine: {routine.name}",
             )
         ],
-        triggers=[time_of_day(pipeline_name, at=trigger_time)],
+        triggers=triggers,
         interruption_policy=InterruptionPolicy.PAUSE_ON_CONVERSATION,
         failure_policy=FailurePolicy.FAIL_PIPELINE,
         intent_duration="indefinite",
@@ -571,3 +581,4 @@ async def register_routine_pipeline(
         pipeline_name=pipeline_name,
         trigger_time=trigger_time.isoformat(),
     )
+    return pipeline

@@ -53,9 +53,12 @@ class TriggerContext:
     """
 
     now: datetime
+    phase: str | None = None
     last_event_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
     completed_sequences: set[str] = field(default_factory=set)
+    completed_sequence_times: dict[str, datetime] = field(default_factory=dict)
     user_actions: set[str] = field(default_factory=set)
+    user_action_times: dict[str, datetime] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -91,6 +94,9 @@ class Trigger:
 
     # ── Evaluation ───────────────────────────────────────────────
     def should_fire(self, ctx: TriggerContext) -> bool:
+        if self.allowed_phases is not None and ctx.phase is not None:
+            if ctx.phase not in self.allowed_phases:
+                return False
         if self._in_cooldown(ctx.now):
             return False
 
@@ -103,9 +109,9 @@ class Trigger:
         if self.kind is TriggerKind.TIME_OF_DAY:
             return self._eval_time_of_day(ctx.now)
         if self.kind is TriggerKind.SEQUENCE_COMPLETE:
-            return bool(self.sequence_name and self.sequence_name in ctx.completed_sequences)
+            return self._eval_sequence_complete(ctx)
         if self.kind is TriggerKind.USER_ACTION:
-            return bool(self.user_action_name and self.user_action_name in ctx.user_actions)
+            return self._eval_user_action(ctx)
         if self.kind is TriggerKind.ANY_OF:
             return any(child.should_fire(ctx) for child in self.children)
         if self.kind is TriggerKind.ALL_OF:
@@ -154,6 +160,22 @@ class Trigger:
             return False
         # Basic at-least-once: if a new event payload is present, fire.
         return True
+
+    def _eval_sequence_complete(self, ctx: TriggerContext) -> bool:
+        if self.sequence_name is None or self.sequence_name not in ctx.completed_sequences:
+            return False
+        completed_at = ctx.completed_sequence_times.get(self.sequence_name)
+        if completed_at is None:
+            return self.last_fired_at is None
+        return self.last_fired_at is None or completed_at > self.last_fired_at
+
+    def _eval_user_action(self, ctx: TriggerContext) -> bool:
+        if self.user_action_name is None or self.user_action_name not in ctx.user_actions:
+            return False
+        action_at = ctx.user_action_times.get(self.user_action_name)
+        if action_at is None:
+            return self.last_fired_at is None
+        return self.last_fired_at is None or action_at > self.last_fired_at
 
     def _eval_time_of_day(self, now: datetime) -> bool:
         if self.time_of_day_local is None:

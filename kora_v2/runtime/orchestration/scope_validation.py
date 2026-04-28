@@ -65,6 +65,18 @@ _FORBIDDEN_SUBAGENT_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# Write tools that executor sub-tasks are permitted to use even though they
+# are ASK_FIRST in the interactive ToolRegistry. The authorization is implicit:
+# the user approved the dispatch (via decompose_and_dispatch), and the executor
+# pipeline stage is the intended site for file writes. Without these, any
+# autonomous task that needs to persist its output is blocked.
+_ORCHESTRATION_EXECUTOR_TOOLS: frozenset[str] = frozenset(
+    {
+        "write_file",
+        "create_directory",
+    }
+)
+
 # Capability-pack interaction tools that mutate external state (clicks,
 # typing, form fills, etc.). These are NOT registered in the in-process
 # ToolRegistry — they live on the capability-pack ActionRegistry — so the
@@ -180,8 +192,11 @@ def validate_tool_scope(
 
     # ASK_FIRST / NEVER tools require user permission to execute,
     # which is not available inside a background worker. The supervisor
-    # must call them itself.
+    # must call them itself. Exception: executor write tools are permitted
+    # since the user implicitly approved writes when they approved the dispatch.
     for name in scope_list:
+        if name in _ORCHESTRATION_EXECUTOR_TOOLS:
+            continue
         level = auth_lookup(name)
         if level in (AuthLevel.ASK_FIRST, AuthLevel.NEVER):
             raise ScopeValidationError(

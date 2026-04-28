@@ -76,6 +76,7 @@ class BenchmarkSummary:
     vault_wikilinks_total: int = 0
     vault_entity_pages: int = 0
     vault_moc_pages: int = 0
+    vault_sessions: int = 0
     vault_working_docs_active: int = 0
 
     # ── Insights ──
@@ -365,24 +366,51 @@ async def collect_benchmarks(
     initial_total = _int(init_mem.get("memories"), "total", 0)
     summary.memories_created = max(current_total - initial_total, 0)
 
-    summary.memories_consolidated = _int(
+    memory_consolidated = _int(
         mem.get("memories"), "with_consolidated_into", 0
+    ) - _int(init_mem.get("memories"), "with_consolidated_into", 0)
+    fact_consolidated = _int(
+        mem.get("user_model_facts"), "with_consolidated_into", 0
+    ) - _int(init_mem.get("user_model_facts"), "with_consolidated_into", 0)
+    summary.memories_consolidated = max(
+        memory_consolidated + fact_consolidated, 0
     )
 
-    # Soft-deleted (dedup) count from status; operational soft-delete
-    # status is "deleted" or "soft_deleted" depending on migration.
-    dedup_current = _status_count(mem, "memories", "deleted") + _status_count(
-        mem, "memories", "soft_deleted"
+    # Soft-deleted / merged dedup count from memories and user-model facts.
+    # Projection rows use "merged" for consolidated/duplicate facts after the
+    # Phase 8 soft-delete migration.
+    dedup_statuses = ("deleted", "soft_deleted", "merged")
+    dedup_current = sum(
+        _status_count(mem, "memories", status)
+        + _status_count(mem, "user_model_facts", status)
+        for status in dedup_statuses
     )
-    dedup_initial = _status_count(init_mem, "memories", "deleted") + _status_count(
-        init_mem, "memories", "soft_deleted"
+    dedup_initial = sum(
+        _status_count(init_mem, "memories", status)
+        + _status_count(init_mem, "user_model_facts", status)
+        for status in dedup_statuses
     )
     summary.memories_dedup_merged = max(dedup_current - dedup_initial, 0)
 
     ent_cur = _int(mem.get("entities"), "total", 0)
     ent_ini = _int(init_mem.get("entities"), "total", 0)
     summary.entities_created = max(ent_cur - ent_ini, 0)
-    summary.entities_merged = _int(mem.get("memories"), "with_merged_from", 0)
+    entity_merge_provenance = _int(
+        mem.get("entities"), "with_merged_from", 0
+    ) - _int(init_mem.get("entities"), "with_merged_from", 0)
+    memory_entity_merges = _int(mem.get("memories"), "with_merged_from", 0) - _int(
+        init_mem.get("memories"), "with_merged_from", 0
+    )
+    fact_entity_merges = _int(
+        mem.get("user_model_facts"), "with_merged_from", 0
+    ) - _int(init_mem.get("user_model_facts"), "with_merged_from", 0)
+    summary.entities_merged = max(
+        entity_merge_provenance,
+        ent_ini - ent_cur,
+        memory_entity_merges,
+        fact_entity_merges,
+        0,
+    )
 
     # ── Vault ──
     vault = current_state.get("vault_state") or {}
@@ -396,6 +424,7 @@ async def collect_benchmarks(
         + (counts.get("entities_projects", 0) or 0)
     )
     summary.vault_moc_pages = int(counts.get("moc_pages", 0) or 0)
+    summary.vault_sessions = int(counts.get("sessions", 0) or 0)
     wd = vault.get("working_docs") or []
     summary.vault_working_docs_active = len(
         [w for w in wd if isinstance(w, dict) and w.get("status") == "in_progress"]
@@ -463,6 +492,7 @@ def benchmarks_to_csv_row(bench: BenchmarkSummary) -> dict[str, Any]:
         "vault_wikilinks_total": bench.vault_wikilinks_total,
         "vault_entity_pages": bench.vault_entity_pages,
         "vault_moc_pages": bench.vault_moc_pages,
+        "vault_sessions": bench.vault_sessions,
         "vault_working_docs_active": bench.vault_working_docs_active,
         "insights_persisted": (
             bench.insights_persisted if bench.insights_persisted is not None else ""
@@ -501,6 +531,7 @@ CSV_COLUMNS: tuple[str, ...] = (
     "vault_wikilinks_total",
     "vault_entity_pages",
     "vault_moc_pages",
+    "vault_sessions",
     "vault_working_docs_active",
     "insights_persisted",
     "phase_dwell_seconds",

@@ -23,7 +23,7 @@ class DomainVerbResolver:
         "log": ["log_medication", "log_meal"],
         "focus": ["start_focus_block"],
         "note": ["create_quick_note"],
-        "routine": ["list_routines", "start_routine"],
+        "routine": ["create_routine", "list_routines", "start_routine"],
         "search": ["search_web", "recall"],
         "find": ["recall", "search_web"],
         "schedule": ["create_reminder"],

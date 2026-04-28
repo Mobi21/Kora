@@ -12,6 +12,8 @@ Token auth: auto-generated file at ``settings.security.api_token_path``.
 WebSocket envelope protocol::
 
     Client -> Server:  {"type": "chat", "content": "Hello Kora"}
+    Server -> Client:  {"type": "session_ready", "metadata": {...}}
+    Server -> Client:  {"type": "session_greeting", "content": "..."}  # optional
     Server -> Client:  {"type": "token", "content": "Hey!"}
     Server -> Client:  {"type": "response_complete", "metadata": {...}}
     Server -> Client:  {"type": "error", "content": "..."}
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import secrets
 import uuid
 from pathlib import Path
@@ -727,21 +730,40 @@ async def _websocket_handler(ws: WebSocket) -> None:
         except Exception:
             log.warning("session_init_failed_on_connect")
 
-    # --- Gap 4 & 7: Generate and send greeting at session start ---
+    # Bootstrap must be protocol-level, not a normal chat response.
+    # A previous implementation ran the supervisor graph on connect and
+    # streamed the greeting as token/response_complete frames. Clients could
+    # then consume that stale response as the answer to the first real chat,
+    # and the greeting turn itself could invoke tools from bridge context.
     if session_mgr and session_mgr.active_session and _container is not None:
         try:
-            graph = _container.supervisor_graph
-            thread_id = session_mgr.get_thread_id()
-            config = {"configurable": {"thread_id": thread_id}}
-            greeting = await session_mgr.generate_greeting(graph, config)
-            if greeting:
-                await ws.send_json({"type": "token", "content": greeting})
-                await ws.send_json({
-                    "type": "response_complete",
-                    "metadata": {"greeting": True},
-                })
+            await _safe_send_json(
+                ws,
+                {
+                    "type": "session_ready",
+                    "metadata": {
+                        "session_id": getattr(
+                            session_mgr.active_session, "id", None
+                        ),
+                        "thread_id": session_mgr.get_thread_id(),
+                    },
+                },
+            )
+            bridge = await session_mgr.load_last_bridge()
+            open_threads = getattr(bridge, "open_threads", None) if bridge else None
+            if open_threads:
+                await _safe_send_json(
+                    ws,
+                    {
+                        "type": "session_greeting",
+                        "content": (
+                            "Welcome back. I have your previous context "
+                            "ready when you want to continue."
+                        ),
+                    },
+                )
         except Exception:
-            log.debug("greeting_generation_skipped_on_connect")
+            log.debug("session_bootstrap_skipped_on_connect")
 
     # Start heartbeat task
     heartbeat_task = asyncio.create_task(_heartbeat(ws))
@@ -765,7 +787,14 @@ async def _websocket_handler(ws: WebSocket) -> None:
 
     try:
         while True:
-            data = await ws.receive_json()
+            try:
+                data = await ws.receive_json()
+            except (json.JSONDecodeError, ValueError):
+                await _safe_send_json(ws, {
+                    "type": "error",
+                    "content": "Malformed JSON message",
+                })
+                continue
             msg_type = data.get("type", "")
 
             if msg_type == "chat":
@@ -942,6 +971,10 @@ async def _handle_chat(ws: WebSocket, content: str) -> None:
     session_mgr = getattr(_container, 'session_manager', None)
     if session_mgr:
         thread_id = session_mgr.get_thread_id()
+        active_session = getattr(session_mgr, "active_session", None)
+        session_id = getattr(active_session, "session_id", None)
+        if session_id:
+            graph_input["session_id"] = session_id
     else:
         thread_id = uuid.uuid4().hex[:12]
 
@@ -962,9 +995,16 @@ async def _handle_chat(ws: WebSocket, content: str) -> None:
 
         _container._on_tool_event = _on_tool_event  # type: ignore[attr-defined]
 
-        # Use ainvoke() — astream_events() doesn't work with MiniMax
-        # (no on_chat_model_stream events; fallback causes double-run).
-        result = await graph.ainvoke(graph_input, config)
+        # Use the turn runner instead of calling the graph directly so
+        # turn_traces, turn-start task prefetch, and turn-end acknowledgement
+        # are written for every real WebSocket turn.
+        runner = getattr(_container, "_graph_turn_runner", None)
+        if runner is None:
+            from kora_v2.runtime.turn_runner import GraphTurnRunner
+
+            runner = GraphTurnRunner(_container)
+            _container._graph_turn_runner = runner  # type: ignore[attr-defined]
+        result = await runner.run_turn(graph, graph_input, config)
 
         response_content = result.get("response_content", "")
         tool_call_records = result.get("tool_call_records", [])

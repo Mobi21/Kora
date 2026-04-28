@@ -83,7 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_work_ledger_type
 -- Trigger state (persistent last-fire)
 CREATE TABLE IF NOT EXISTS trigger_state (
     trigger_id             TEXT PRIMARY KEY,
-    pipeline_name          TEXT NOT NULL,
+    pipeline_name          TEXT,
     last_fired_at          TEXT NOT NULL,
     last_fire_reason       TEXT,
     next_eligible_at       TEXT

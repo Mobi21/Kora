@@ -13,12 +13,17 @@ from kora_v2.runtime.orchestration import (
     LONG_BACKGROUND,
     LedgerEventType,
     OrchestrationEngine,
+    Pipeline,
+    PipelineStage,
+    RequestClass,
+    RequestLimiter,
     StepContext,
     StepResult,
     SystemStatePhase,
     UserScheduleProfile,
     WorkerTask,
     WorkerTaskState,
+    get_preset,
     init_orchestration_schema,
 )
 from kora_v2.runtime.orchestration.dispatcher import (
@@ -47,7 +52,7 @@ async def bg_engine(tmp_path: Path) -> OrchestrationEngine:
 async def test_tick_runs_a_background_task_to_completion(bg_engine: OrchestrationEngine) -> None:
     call_count = 0
 
-    async def step_fn(task: WorkerTask, ctx: StepContext) -> StepResult:
+    async def step_fn(_task: WorkerTask, _ctx: StepContext) -> StepResult:
         nonlocal call_count
         call_count += 1
         if call_count >= 3:
@@ -107,6 +112,67 @@ async def test_failing_step_transitions_to_failed(
     assert final.error_message == "boom"
 
 
+async def test_failed_stage_cancels_blocked_siblings_and_fails_pipeline(
+    bg_engine: OrchestrationEngine,
+) -> None:
+    pipeline = Pipeline(
+        name="multi_stage_failure",
+        description="multi-stage failure test",
+        stages=[
+            PipelineStage(
+                name="first",
+                task_preset="bounded_background",
+                goal_template="first",
+            ),
+            PipelineStage(
+                name="second",
+                task_preset="bounded_background",
+                goal_template="second",
+                depends_on=["first"],
+            ),
+        ],
+    )
+    bg_engine.register_pipeline(pipeline)
+    instance = await bg_engine.start_pipeline_instance(
+        "multi_stage_failure",
+        goal="test",
+        working_doc_path="",
+    )
+
+    async def fail_step(_task: WorkerTask, _ctx: StepContext) -> StepResult:
+        return StepResult(outcome="failed", error_message="boom")
+
+    async def never_step(_task: WorkerTask, _ctx: StepContext) -> StepResult:
+        raise AssertionError("dependent task should be cancelled, not run")
+
+    first = await bg_engine.dispatch_task(
+        goal="first",
+        system_prompt="prompt",
+        step_fn=fail_step,
+        preset="bounded_background",
+        stage_name="first",
+        pipeline_instance_id=instance.id,
+    )
+    second = await bg_engine.dispatch_task(
+        goal="second",
+        system_prompt="prompt",
+        step_fn=never_step,
+        preset="bounded_background",
+        stage_name="second",
+        pipeline_instance_id=instance.id,
+        depends_on=["first"],
+    )
+
+    await bg_engine.run_task_to_completion(first, max_ticks=3)
+
+    reloaded_second = await bg_engine.task_registry.load(second.id)
+    reloaded_instance = await bg_engine.instance_registry.load(instance.id)
+    assert reloaded_second is not None
+    assert reloaded_second.state is WorkerTaskState.CANCELLED
+    assert reloaded_instance is not None
+    assert reloaded_instance.state.value == "failed"
+
+
 async def test_cancellation_request_transitions_to_cancelled(
     bg_engine: OrchestrationEngine,
 ) -> None:
@@ -122,6 +188,105 @@ async def test_cancellation_request_transitions_to_cancelled(
     await bg_engine.request_cancellation(task.id)
     final = await bg_engine.run_task_to_completion(task, max_ticks=3)
     assert final.state is WorkerTaskState.CANCELLED
+
+
+async def test_pending_cancellation_transitions_to_cancelled_immediately(
+    bg_engine: OrchestrationEngine,
+) -> None:
+    async def step_fn(task: WorkerTask, ctx: StepContext) -> StepResult:
+        return StepResult(outcome="continue")
+
+    task = await bg_engine.dispatch_task(
+        goal="bg",
+        system_prompt="prompt",
+        step_fn=step_fn,
+        preset="bounded_background",
+    )
+    await bg_engine.request_cancellation(task.id)
+
+    reloaded = await bg_engine.task_registry.load(task.id)
+    assert reloaded is not None
+    assert reloaded.state is WorkerTaskState.CANCELLED
+
+
+async def test_inflight_cancellation_wins_over_complete_result(
+    bg_engine: OrchestrationEngine,
+) -> None:
+    async def step_fn(task: WorkerTask, ctx: StepContext) -> StepResult:
+        await bg_engine.request_cancellation(task.id)
+        return StepResult(outcome="complete", result_summary="done anyway")
+
+    task = await bg_engine.dispatch_task(
+        goal="bg",
+        system_prompt="prompt",
+        step_fn=step_fn,
+        preset="bounded_background",
+    )
+
+    final = await bg_engine.run_task_to_completion(task, max_ticks=3)
+
+    assert final.state is WorkerTaskState.CANCELLED
+    assert final.result_summary is None
+
+
+async def test_mixed_cancelled_and_completed_tasks_cancel_pipeline(
+    bg_engine: OrchestrationEngine,
+) -> None:
+    pipeline = Pipeline(
+        name="mixed_terminal",
+        description="mixed terminal state test",
+        stages=[
+            PipelineStage(
+                name="run",
+                task_preset="bounded_background",
+                goal_template="run",
+            ),
+            PipelineStage(
+                name="user_added",
+                task_preset="bounded_background",
+                goal_template="user_added",
+            ),
+        ],
+    )
+    bg_engine.register_pipeline(pipeline)
+    instance = await bg_engine.start_pipeline_instance(
+        "mixed_terminal",
+        goal="test",
+        working_doc_path="",
+    )
+
+    async def complete_step(_task: WorkerTask, _ctx: StepContext) -> StepResult:
+        return StepResult(outcome="complete", result_summary="done")
+
+    async def continue_step(_task: WorkerTask, _ctx: StepContext) -> StepResult:
+        return StepResult(outcome="continue")
+
+    run_task = await bg_engine.dispatch_task(
+        goal="run",
+        system_prompt="prompt",
+        step_fn=continue_step,
+        preset="bounded_background",
+        stage_name="run",
+        pipeline_instance_id=instance.id,
+    )
+    user_added = await bg_engine.dispatch_task(
+        goal="user_added",
+        system_prompt="prompt",
+        step_fn=complete_step,
+        preset="bounded_background",
+        stage_name="user_added",
+        pipeline_instance_id=instance.id,
+    )
+
+    await bg_engine.request_cancellation(run_task.id)
+    await bg_engine.run_task_to_completion(run_task, max_ticks=3)
+    await bg_engine.run_task_to_completion(user_added, max_ticks=3)
+
+    reloaded_instance = await bg_engine.instance_registry.load(instance.id)
+
+    assert reloaded_instance is not None
+    assert reloaded_instance.state.value == "cancelled"
+    assert reloaded_instance.completion_reason == "task_cancelled"
 
 
 async def test_max_requests_budget_enforced(
@@ -140,6 +305,114 @@ async def test_max_requests_budget_enforced(
     final = await bg_engine.run_task_to_completion(task, max_ticks=5)
     assert final.state is WorkerTaskState.FAILED
     assert final.error_message == "max_requests_exceeded"
+
+
+async def test_rate_limit_rejection_pauses_and_resumes_after_window(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "operational.db"
+    await init_orchestration_schema(db)
+    engine = OrchestrationEngine(
+        db,
+        schedule_profile=UserScheduleProfile(timezone="UTC"),
+    )
+    limiter = RequestLimiter(
+        db,
+        capacity=1,
+        conversation_reserve=0,
+        notification_reserve=0,
+        window_seconds=1,
+    )
+    await limiter.replay_from_log()
+    engine.limiter = limiter
+    engine.dispatcher._limiter = limiter
+    engine.state_machine.note_session_end(
+        datetime.now(UTC) - timedelta(hours=2)
+    )
+
+    acquired = await limiter.acquire(
+        RequestClass.BACKGROUND,
+        worker_task_id="saturator",
+    )
+    assert acquired is True
+
+    calls = 0
+
+    async def step_fn(_task: WorkerTask, _ctx: StepContext) -> StepResult:
+        nonlocal calls
+        calls += 1
+        return StepResult(outcome="complete", result_summary="done")
+
+    task = await engine.dispatch_task(
+        goal="rate limited",
+        system_prompt="prompt",
+        step_fn=step_fn,
+        preset="bounded_background",
+    )
+
+    await engine.tick_once()
+    paused = await engine.task_registry.load(task.id)
+    assert paused is not None
+    assert paused.state is WorkerTaskState.PAUSED_FOR_RATE_LIMIT
+    assert calls == 0
+
+    await engine.tick_once()
+    still_paused = await engine.task_registry.load(task.id)
+    assert still_paused is not None
+    assert still_paused.state is WorkerTaskState.PAUSED_FOR_RATE_LIMIT
+    assert calls == 0
+
+    import asyncio
+
+    await asyncio.sleep(1.1)
+    await engine.tick_once()
+    resumed = await engine.task_registry.load(task.id)
+    assert resumed is not None
+    assert resumed.state is WorkerTaskState.COMPLETED
+    assert calls == 1
+
+    events = await engine.ledger.read_task_events(task.id)
+    assert any(
+        event.event_type == LedgerEventType.RATE_LIMIT_REJECTED
+        and event.reason == "rate_limit_paused"
+        for event in events
+    )
+    assert any(
+        event.event_type == LedgerEventType.TASK_PAUSED
+        and event.reason == "rate_limit_paused"
+        for event in events
+    )
+    assert any(
+        event.event_type == LedgerEventType.TASK_RESUMED
+        and event.reason == "rate_limit_retry"
+        for event in events
+    )
+
+
+async def test_list_tasks_surfaces_unacknowledged_cancelled_terminal(
+    bg_engine: OrchestrationEngine,
+) -> None:
+    task = WorkerTask(
+        id="task-unacked-cancelled",
+        pipeline_instance_id=None,
+        stage_name="terminal",
+        config=get_preset("bounded_background"),
+        goal="surface terminal result",
+        system_prompt="prompt",
+        state=WorkerTaskState.CANCELLED,
+        completed_at=datetime.now(UTC),
+        result_acknowledged_at=None,
+    )
+    await bg_engine.task_registry.save(task)
+
+    matches = await bg_engine.list_tasks(relevant_to_session="different-session")
+    assert task.id in {matched.id for matched in matches}
+
+    await bg_engine.acknowledge_task(task.id)
+    after_ack = await bg_engine.list_tasks(
+        relevant_to_session="different-session"
+    )
+    assert task.id not in {matched.id for matched in after_ack}
 
 
 # ── H1: SYSTEM_STATE_CHANGED is published on each tick ────────────────────
@@ -317,6 +590,46 @@ def test_dispatcher_starvation_protection() -> None:
     )
 
 
+def test_memory_finalization_pipelines_outrank_routine_background() -> None:
+    """Conversation finalization should not starve behind routine idle jobs."""
+    now = datetime.now(UTC)
+    old_background = WorkerTask(
+        id="task-old-background",
+        pipeline_instance_id="continuity_check-abc",
+        stage_name="run",
+        config=replace(
+            LONG_BACKGROUND,
+            preset="bounded_background",
+            pause_on_conversation=False,
+            tool_scope=[],
+        ),
+        goal="routine",
+        system_prompt="p",
+        created_at=now - timedelta(seconds=10),
+    )
+    finalization = WorkerTask(
+        id="task-finalization",
+        pipeline_instance_id="post_session_memory-xyz",
+        stage_name="extract",
+        config=replace(
+            LONG_BACKGROUND,
+            preset="bounded_background",
+            pause_on_conversation=False,
+            tool_scope=[],
+        ),
+        goal="memory",
+        system_prompt="p",
+        created_at=now,
+    )
+
+    ordered = sorted(
+        [old_background, finalization],
+        key=lambda t: _task_priority(t, now),
+    )
+
+    assert ordered[0].id == "task-finalization"
+
+
 # ── M4: start/stop lifecycle + crash recovery rehydration ────────────────
 
 
@@ -383,3 +696,43 @@ async def test_engine_start_stop_lifecycle_recovers_running_tasks(
     finally:
         await engine.stop(graceful=True)
     assert engine._started is False
+
+
+async def test_paused_dependency_task_resumes_when_step_fn_resolves(
+    bg_engine: OrchestrationEngine,
+) -> None:
+    async def step_fn(task: WorkerTask, ctx: StepContext) -> StepResult:
+        return StepResult(outcome="complete", result_summary="resumed")
+
+    task = await bg_engine.dispatch_task(
+        goal="recover resolver",
+        system_prompt="prompt",
+        step_fn=step_fn,
+        preset="bounded_background",
+    )
+    task.step_fn = None
+    task.state = WorkerTaskState.PAUSED_FOR_DEPENDENCY
+    await bg_engine.task_registry.update_state(
+        task.id,
+        WorkerTaskState.PAUSED_FOR_DEPENDENCY,
+    )
+
+    async def resolver(candidate: WorkerTask):
+        assert candidate.id == task.id
+        return step_fn
+
+    bg_engine.dispatcher._step_fn_resolver = resolver
+
+    await bg_engine.tick_once()
+
+    reloaded = await bg_engine.task_registry.load(task.id)
+    assert reloaded is not None
+    assert reloaded.state is WorkerTaskState.COMPLETED
+    assert reloaded.result_summary == "resumed"
+
+    events = await bg_engine.ledger.read_task_events(task.id)
+    assert any(
+        event.event_type == LedgerEventType.TASK_RESUMED
+        and event.reason == "dependency_resolved:step_fn"
+        for event in events
+    )

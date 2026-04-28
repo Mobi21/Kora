@@ -30,6 +30,7 @@ class EventType(Enum):
     SESSION_END = auto()
     TURN_START = auto()
     TURN_END = auto()
+    COMPACTION_DETECTED = auto()
 
     # Background worker
     WORKER_DISPATCHED = auto()
@@ -65,6 +66,7 @@ class EventType(Enum):
     TASK_COMPLETED = auto()
     TASK_FAILED = auto()
     PIPELINE_COMPLETE = auto()
+    TRIGGER_FIRED = auto()
     INSIGHT_AVAILABLE = auto()
     DAY_CONTEXT_UPDATED = auto()
     SYSTEM_STATE_CHANGED = auto()
@@ -74,6 +76,7 @@ class EventType(Enum):
     LONG_FOCUS_BLOCK_ENDED = auto()
     USER_STATED_INTENT = auto()
     USER_STATED_NEED = auto()
+    MEDICATION_WINDOW = auto()
 
     # Errors
     ERROR_OCCURRED = auto()

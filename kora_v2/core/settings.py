@@ -59,7 +59,7 @@ class LLMSettings(BaseModel):
     """MiniMax M2.7 provider defaults."""
 
     provider: str = "minimax"
-    model: str = "MiniMax-M2.7"
+    model: str = "MiniMax-M2.7-highspeed"
     background_model: str = ""  # empty = use primary model for background too
     api_base: str = "https://api.minimax.io/anthropic"
     api_key: str = ""  # KORA_LLM__API_KEY or fallback to MINIMAX_API_KEY
@@ -137,7 +137,7 @@ class DaemonSettings(BaseModel):
     """Daemon bind address and background-work pacing."""
 
     host: str = "127.0.0.1"
-    port: int = 0  # 0 = auto-assign
+    port: int = 8765  # fixed port for sandbox compatibility
     idle_check_interval: int = 300
     background_safe_interval: int = 60
 
@@ -208,6 +208,15 @@ class AutonomousSettings(BaseModel):
     overlap_similarity_threshold: float = 0.6
     delegate_to_claude_code: bool = False
     claude_code_binary: str = "claude"
+
+
+# ── Orchestration ─────────────────────────────────────────────────────────
+
+class OrchestrationSettings(BaseModel):
+    """Background orchestration runtime controls."""
+
+    trigger_evaluator_enabled: bool = True
+    trigger_tick_interval_seconds: float = 5.0
 
 
 # ── MCP ──────────────────────────────────────────────────────────────────
@@ -288,6 +297,7 @@ class Settings(BaseSettings):
     daemon: DaemonSettings = DaemonSettings()
     notifications: NotificationSettings = NotificationSettings()
     autonomous: AutonomousSettings = AutonomousSettings()
+    orchestration: OrchestrationSettings = OrchestrationSettings()
     mcp: MCPSettings = MCPSettings()
     security: SecuritySettings = SecuritySettings()
     vault: VaultSettings = VaultSettings()

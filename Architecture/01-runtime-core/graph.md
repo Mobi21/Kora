@@ -228,7 +228,7 @@ Tool schema definitions and execution routing.
 
 ### `SUPERVISOR_TOOLS`
 
-Ten base tools in Anthropic schema format. Phase 7.5 retired `start_autonomous` and added seven orchestration-aware tools that let the supervisor see and steer work running inside the `OrchestrationEngine`.
+Eleven base tools in Anthropic schema format. Phase 7.5 retired `start_autonomous` and added orchestration-aware tools that let the supervisor see and steer work running inside the `OrchestrationEngine`.
 
 **Core + retrieval tools:**
 
@@ -239,14 +239,14 @@ Ten base tools in Anthropic schema format. Phase 7.5 retired `start_autonomous` 
 | `search_web` | ALWAYS_ALLOWED | Brave Search API; returns titles/URLs/snippets |
 | `fetch_url` | ALWAYS_ALLOWED | Fetch URL text content; max 8000 chars default |
 
-**Orchestration tools (Phase 7.5):**
+**Orchestration tools:**
 
 | Tool | Auth | Description |
 |------|------|-------------|
 | `decompose_and_dispatch` | ALWAYS_ALLOWED | Break a user request into pipeline stages and dispatch through `OrchestrationEngine.start_pipeline_instance()`. Replaces the retired `start_autonomous` tool; for autonomous goals pass `pipeline_name="user_autonomous_task"`. Returns the pipeline instance id. |
 | `get_running_tasks` | ALWAYS_ALLOWED | List `WorkerTask` rows with state + progress + topic-overlap score. Default is the four-condition turn-start surfacing rule (session-owned, recent system tasks, unacknowledged terminal states, mid-band topic overlap 0.45–0.70). |
 | `get_task_progress` | ALWAYS_ALLOWED | Fetch live progress for a single task id: state, stage, steps completed, last `result_summary`. |
-| `get_working_doc` | ALWAYS_ALLOWED | Read the per-instance working document from `_KoraMemory/Inbox/<task_id>.md`. Returns the full markdown (YAML frontmatter + sections) so the supervisor can quote pending decisions back to the user. |
+| `get_working_doc` | ALWAYS_ALLOWED | Read the per-instance working document from `<memory_root>/Inbox/<task_id>.md`. Returns the full markdown (YAML frontmatter + sections) so the supervisor can quote pending decisions back to the user. |
 | `cancel_task` | ASK_FIRST | Transition a task to `CANCELLED` with a reason. Dispatcher honours it at the next safe checkpoint. |
 | `modify_task` | ASK_FIRST | Apply in-flight edits to a task (add/remove stages, retarget goal). The engine validates the mutation against the pipeline's `_assert_acyclic` rule. |
 | `record_decision` | ALWAYS_ALLOWED | Append a resolution to an open decision row in the `open_decisions` table. Unblocks any `PAUSED_FOR_DECISION` task waiting on that decision id and emits `OPEN_DECISION_POSED`'s sibling event. |

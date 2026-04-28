@@ -132,6 +132,15 @@ def test_each_pipeline_has_single_stage() -> None:
             assert p.stages[0].name == "run"
 
 
+def test_single_stage_core_pipelines_propagate_trigger_goal() -> None:
+    pipelines = build_core_pipelines()
+    by_name = {p.name: p for p in pipelines}
+
+    assert by_name["proactive_research"].stages[0].goal_template == (
+        "proactive_research: {{goal}}"
+    )
+
+
 async def test_register_core_pipelines_populates_engine(tmp_path: Path) -> None:
     db_path = tmp_path / "operational.db"
     await init_orchestration_schema(db_path)

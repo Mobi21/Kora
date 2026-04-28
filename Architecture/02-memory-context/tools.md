@@ -1,6 +1,6 @@
 # Tools Subsystem (`kora_v2/tools/`)
 
-The tools subsystem provides the LLM's ability to take action. Every tool is an async Python function registered in a global singleton `ToolRegistry`. Tools are exported to the Anthropic API as JSON Schema definitions, invoked by the turn runner when the LLM emits a `tool_use` block, and their results are returned as JSON strings. The subsystem covers memory recall, filesystem I/O, life management (medication, meals, focus blocks, expenses, notes, reminders), calendar operations, planning and task management, and routines.
+The tools subsystem provides the LLM's ability to take action. Every tool is an async Python function registered in a global singleton `ToolRegistry`. Tools are exported to the Anthropic API as JSON Schema definitions, invoked by the turn runner when the LLM emits a `tool_use` block, and their results are returned as JSON strings. The subsystem covers memory recall, filesystem I/O, Life OS, life management (medication, meals, focus blocks, expenses, notes, reminders), calendar operations, planning and task management, and routines.
 
 ---
 
@@ -13,6 +13,7 @@ The tools subsystem provides the LLM's ability to take action. Every tool is an 
 | [`recall.py`](../../kora_v2/tools/recall.py) | `recall()` — fast hybrid memory search, no LLM |
 | [`filesystem.py`](../../kora_v2/tools/filesystem.py) | `write_file`, `read_file`, `create_directory`, `list_directory`, `file_exists` |
 | [`life_management.py`](../../kora_v2/tools/life_management.py) | Medication, meal, reminder, quick note, focus block, expense tools |
+| [`life_os.py`](../../kora_v2/tools/life_os.py) | Life OS tools: day plans, reality confirmation/correction, load, repair, nudges, context packs, future bridges, support profiles, crisis boundary |
 | [`planning.py`](../../kora_v2/tools/planning.py) | `draft_plan`, `update_plan`, `day_briefing`, `create_item`, `complete_item`, `defer_item`, `query_items`, `life_summary` |
 | [`calendar.py`](../../kora_v2/tools/calendar.py) | Calendar entry CRUD, RRULE expansion, Google Calendar sync |
 | [`routines.py`](../../kora_v2/tools/routines.py) | `list_routines`, `start_routine`, `advance_routine`, `routine_progress` |
@@ -208,6 +209,8 @@ Maximum file read size: 1MB (`_MAX_READ_BYTES = 1 * 1024 * 1024`). Files read wi
 
 ADHD-oriented tools that write to and read from `data/operational.db`. All tools get the database path via `container.settings.data_dir / "operational.db"`.
 
+After the Life OS pivot, successful write tools also emit Life Event Ledger entries so medication, meal, focus, reminder, expense, and quick-note events do not bypass the ledger.
+
 ### Medication tools
 
 | Tool | Auth | Table | Description |
@@ -258,6 +261,26 @@ ADHD-oriented tools that write to and read from `data/operational.db`. All tools
 **Impulse detection in `log_expense`**: Queries the past 30 days for existing entries in the same category. Requires at least `IMPULSE_MIN_SAMPLES = 5` prior entries to avoid noisy averages. If `amount > category_avg * 1.5`, `is_impulse=True` is written to the row and a `note` field is returned explaining the comparison. The tool description explicitly warns: "do NOT shame or lecture" — the note is surfaced gently.
 
 Categories: `food`, `transport`, `tech`, `entertainment`, `health`, `other`.
+
+---
+
+## `life_os.py` — Life OS Tools
+
+Life OS tools are the public tool surface for the Plan Today -> Confirm Reality -> Repair The Day -> Bridge Tomorrow loop. They are registered during worker initialization and resolve services from the DI container.
+
+| Tool | Auth | Durable effect |
+|---|---|---|
+| `create_day_plan` | `ASK_FIRST` | Creates a versioned day plan and day-plan entries |
+| `confirm_reality` | `ASK_FIRST` | Writes confirmed/skipped/partial/blocked/done life events and domain events |
+| `correct_reality` | `ASK_FIRST` | Writes correction/rejection rows for wrong Kora inferences |
+| `assess_life_load` | `ALWAYS_ALLOWED` | Records a load assessment with explainable factors |
+| `repair_day_plan` | `ASK_FIRST` | Writes repair actions and can activate a new day-plan revision |
+| `decide_life_nudge` | `ALWAYS_ALLOWED` | Records send/defer/suppress/queue nudge policy decisions |
+| `record_nudge_feedback` | `ASK_FIRST` | Records helpful/wrong/too-much feedback for future policy |
+| `create_context_pack` | `ASK_FIRST` | Writes context-pack metadata and a memory-root artifact |
+| `bridge_tomorrow` | `ASK_FIRST` | Writes a Future Self Bridge row and artifact |
+| `set_support_profile_status` | `ASK_FIRST` | Activates, disables, or suggests support profiles |
+| `check_crisis_boundary` | `ALWAYS_ALLOWED` | Routes crisis language before normal productivity flows and records boundary checks |
 
 ---
 
@@ -340,10 +363,11 @@ Synthetic IDs for expanded recurring occurrences use `::` as a separator (`base_
 
 ## `routines.py` — Routine Tools
 
-Four tools for guided routine lifecycle. All delegate to `container.routine_manager` (a `RoutineManager` instance from `kora_v2/life/`).
+Five tools for guided routine lifecycle. All delegate to `container.routine_manager` (a `RoutineManager` instance from `kora_v2/life/`).
 
 | Tool | Auth | Description |
 |---|---|---|
+| `create_routine` | `ASK_FIRST` | Persist a reusable routine template |
 | `list_routines(tags)` | `ALWAYS_ALLOWED` | List available routine templates; optional tag filter |
 | `start_routine(routine_id, session_id, variant)` | `ASK_FIRST` | Begin a new session; `variant` is `"standard"` or `"low_energy"` |
 | `advance_routine(session_id, step_index, skipped)` | `ASK_FIRST` | Complete or skip a step; returns progress percentage |
@@ -391,18 +415,20 @@ resolver.resolve("remember")       # → ["recall", "store_memory"]
 resolver.suggest_tools("remind me to call Sarah")  # → ["create_reminder"]
 ```
 
+Current caveat: `DomainVerbResolver` is only a hint layer and still contains stale names. `store_memory`, `update_item`, and `create_quick_note` are not registered Python tools in the current runtime. The live note tool is `quick_note`; there is `create_item`, but no `update_item`.
+
 **Verb map** (selected entries):
 
 | Verb | Tools |
 |---|---|
 | `remind` | `create_reminder` |
-| `remember` | `recall`, `store_memory` |
+| `remember` | `recall`, `store_memory` *(stale hint; no registered `store_memory` tool)* |
 | `research` | `search_web`, `fetch_url` |
 | `plan` | `dispatch_worker` |
-| `track` | `create_item`, `update_item` |
+| `track` | `create_item`, `update_item` *(stale hint; no registered `update_item` tool)* |
 | `log` | `log_medication`, `log_meal` |
 | `focus` | `start_focus_block` |
-| `note` | `create_quick_note` |
+| `note` | `create_quick_note` *(stale hint; current registered tool is `quick_note`)* |
 | `routine` | `list_routines`, `start_routine` |
 | `search` / `find` | `search_web`, `recall` |
 | `schedule` | `create_reminder` |

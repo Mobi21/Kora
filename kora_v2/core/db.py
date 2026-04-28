@@ -423,6 +423,243 @@ CREATE TABLE IF NOT EXISTS energy_log (
 CREATE INDEX IF NOT EXISTS idx_energy_log_logged
     ON energy_log(logged_at);
 
+-- Life OS: durable product-domain proof --------------------------------------
+CREATE TABLE IF NOT EXISTS domain_events (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    aggregate_type TEXT NOT NULL,
+    aggregate_id TEXT,
+    source_service TEXT NOT NULL,
+    correlation_id TEXT,
+    causation_id TEXT,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_domain_events_type_created
+    ON domain_events(event_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_domain_events_aggregate
+    ON domain_events(aggregate_type, aggregate_id, created_at);
+
+CREATE TABLE IF NOT EXISTS day_plans (
+    id TEXT PRIMARY KEY,
+    plan_date TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'active',
+    supersedes_day_plan_id TEXT,
+    generated_from TEXT NOT NULL DEFAULT 'conversation',
+    load_assessment_id TEXT,
+    summary TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_day_plans_one_active
+    ON day_plans(plan_date)
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_day_plans_date_revision
+    ON day_plans(plan_date, revision);
+
+CREATE TABLE IF NOT EXISTS day_plan_entries (
+    id TEXT PRIMARY KEY,
+    day_plan_id TEXT NOT NULL,
+    calendar_entry_id TEXT,
+    item_id TEXT,
+    reminder_id TEXT,
+    routine_id TEXT,
+    title TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    intended_start TEXT,
+    intended_end TEXT,
+    expected_effort TEXT,
+    support_tags TEXT,
+    status TEXT NOT NULL DEFAULT 'planned',
+    reality_state TEXT NOT NULL DEFAULT 'unknown',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(day_plan_id) REFERENCES day_plans(id)
+);
+CREATE INDEX IF NOT EXISTS idx_day_plan_entries_plan_status
+    ON day_plan_entries(day_plan_id, status, reality_state);
+CREATE INDEX IF NOT EXISTS idx_day_plan_entries_sources
+    ON day_plan_entries(calendar_entry_id, item_id);
+
+CREATE TABLE IF NOT EXISTS life_events (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    event_time TEXT NOT NULL,
+    source TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    confirmation_state TEXT NOT NULL DEFAULT 'confirmed',
+    calendar_entry_id TEXT,
+    item_id TEXT,
+    day_plan_entry_id TEXT,
+    support_module TEXT,
+    title TEXT,
+    details TEXT,
+    raw_text TEXT,
+    metadata TEXT,
+    supersedes_event_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_life_events_time_type
+    ON life_events(event_time, event_type);
+CREATE INDEX IF NOT EXISTS idx_life_events_plan_entry
+    ON life_events(day_plan_entry_id, confirmation_state);
+
+CREATE TABLE IF NOT EXISTS load_assessments (
+    id TEXT PRIMARY KEY,
+    assessment_date TEXT NOT NULL,
+    score REAL NOT NULL,
+    band TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    factors TEXT NOT NULL,
+    recommended_mode TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    confirmed_by_user INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_load_assessments_date
+    ON load_assessments(assessment_date, generated_at);
+
+CREATE TABLE IF NOT EXISTS plan_repair_actions (
+    id TEXT PRIMARY KEY,
+    day_plan_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    title TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    source_event_id TEXT,
+    load_assessment_id TEXT,
+    target_calendar_entry_id TEXT,
+    target_item_id TEXT,
+    target_day_plan_entry_id TEXT,
+    proposed_changes TEXT NOT NULL,
+    requires_confirmation INTEGER NOT NULL DEFAULT 0,
+    idempotency_key TEXT NOT NULL,
+    applied_at TEXT,
+    rejected_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_repair_actions_plan_status
+    ON plan_repair_actions(day_plan_id, status);
+
+CREATE TABLE IF NOT EXISTS nudge_decisions (
+    id TEXT PRIMARY KEY,
+    candidate_type TEXT NOT NULL,
+    candidate_payload TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    urgency TEXT NOT NULL,
+    support_tags TEXT,
+    load_assessment_id TEXT,
+    notification_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nudge_decisions_created
+    ON nudge_decisions(created_at, decision);
+
+CREATE TABLE IF NOT EXISTS nudge_feedback (
+    id TEXT PRIMARY KEY,
+    nudge_decision_id TEXT NOT NULL,
+    feedback TEXT NOT NULL,
+    details TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nudge_feedback_decision
+    ON nudge_feedback(nudge_decision_id, feedback);
+
+CREATE TABLE IF NOT EXISTS support_mode_state (
+    id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    trigger_event_id TEXT,
+    load_assessment_id TEXT,
+    reason TEXT,
+    user_confirmed INTEGER DEFAULT 0,
+    metadata TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_support_mode_state_active
+    ON support_mode_state(status, mode, started_at);
+
+CREATE TABLE IF NOT EXISTS context_packs (
+    id TEXT PRIMARY KEY,
+    calendar_entry_id TEXT,
+    item_id TEXT,
+    title TEXT NOT NULL,
+    pack_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    content_path TEXT,
+    summary TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    metadata TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_context_packs_target
+    ON context_packs(calendar_entry_id, item_id, status);
+
+CREATE TABLE IF NOT EXISTS future_self_bridges (
+    id TEXT PRIMARY KEY,
+    bridge_date TEXT NOT NULL,
+    source_day_plan_id TEXT,
+    load_assessment_id TEXT,
+    summary TEXT NOT NULL,
+    carryovers TEXT NOT NULL,
+    first_moves TEXT NOT NULL,
+    content_path TEXT,
+    created_at TEXT NOT NULL,
+    metadata TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_future_self_bridges_date
+    ON future_self_bridges(bridge_date, created_at);
+
+CREATE TABLE IF NOT EXISTS support_profiles (
+    id TEXT PRIMARY KEY,
+    profile_key TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    user_label TEXT,
+    settings TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_support_profiles_status
+    ON support_profiles(status, profile_key);
+
+CREATE TABLE IF NOT EXISTS support_profile_signals (
+    id TEXT PRIMARY KEY,
+    profile_key TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    weight REAL NOT NULL,
+    source TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    last_seen_at TEXT,
+    metadata TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_support_profile_signals_profile
+    ON support_profile_signals(profile_key, signal_type);
+
+CREATE TABLE IF NOT EXISTS safety_boundary_records (
+    id TEXT PRIMARY KEY,
+    boundary_type TEXT NOT NULL,
+    trigger_text TEXT,
+    risk_level TEXT NOT NULL,
+    preempted_flow TEXT,
+    response_summary TEXT NOT NULL,
+    input_excerpt TEXT,
+    severity TEXT,
+    matched_terms TEXT,
+    preempted INTEGER,
+    response_family TEXT,
+    metadata TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_safety_boundary_records_created
+    ON safety_boundary_records(boundary_type, created_at);
+
 -- Autonomous plan budget columns: request_count, token_estimate, cost_estimate
 -- Added as ALTER TABLE below since autonomous_plans was created without them.
 
@@ -540,6 +777,27 @@ _REMINDERS_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("metadata", "ALTER TABLE reminders ADD COLUMN metadata TEXT"),
 )
 
+_DAY_PLAN_ENTRY_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("reminder_id", "ALTER TABLE day_plan_entries ADD COLUMN reminder_id TEXT"),
+    ("routine_id", "ALTER TABLE day_plan_entries ADD COLUMN routine_id TEXT"),
+)
+
+_CONTEXT_PACK_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("metadata", "ALTER TABLE context_packs ADD COLUMN metadata TEXT"),
+)
+
+_FUTURE_SELF_BRIDGE_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("metadata", "ALTER TABLE future_self_bridges ADD COLUMN metadata TEXT"),
+)
+
+_SAFETY_BOUNDARY_RECORD_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("input_excerpt", "ALTER TABLE safety_boundary_records ADD COLUMN input_excerpt TEXT"),
+    ("severity", "ALTER TABLE safety_boundary_records ADD COLUMN severity TEXT"),
+    ("matched_terms", "ALTER TABLE safety_boundary_records ADD COLUMN matched_terms TEXT"),
+    ("preempted", "ALTER TABLE safety_boundary_records ADD COLUMN preempted INTEGER"),
+    ("response_family", "ALTER TABLE safety_boundary_records ADD COLUMN response_family TEXT"),
+)
+
 
 async def _ensure_columns(
     db: aiosqlite.Connection,
@@ -576,6 +834,14 @@ async def init_operational_db(db_path: Path) -> None:
         await _ensure_columns(db, "items", _ITEMS_MIGRATIONS)
         await _ensure_columns(db, "focus_blocks", _FOCUS_BLOCK_MIGRATIONS)
         await _ensure_columns(db, "reminders", _REMINDERS_MIGRATIONS)
+        await _ensure_columns(db, "day_plan_entries", _DAY_PLAN_ENTRY_MIGRATIONS)
+        await _ensure_columns(db, "context_packs", _CONTEXT_PACK_MIGRATIONS)
+        await _ensure_columns(db, "future_self_bridges", _FUTURE_SELF_BRIDGE_MIGRATIONS)
+        await _ensure_columns(
+            db,
+            "safety_boundary_records",
+            _SAFETY_BOUNDARY_RECORD_MIGRATIONS,
+        )
         # Phase 8e: idx_reminders_due references due_at, which is added by the
         # migration above — must be created AFTER the migration runs.
         await db.execute(

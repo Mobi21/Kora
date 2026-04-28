@@ -1,6 +1,6 @@
 # Orchestration Engine — `kora_v2/runtime/orchestration/`
 
-Phase 7.5 shipped a single unified scheduler for every background, idle, and autonomous job in Kora. The `OrchestrationEngine` replaced the tiered `BackgroundWorker` that lived in `daemon/worker.py` + `work_items.py`, the standalone `AutonomousExecutionLoop` from `kora_v2/autonomous/loop.py`, and the `start_autonomous` supervisor tool. One engine, one dispatcher loop, one `WorkerTask` primitive, one `RequestLimiter`, one `NotificationGate`. Everything non-conversational goes through it.
+Phase 7.5 shipped the unified orchestration substrate for every background, idle, and autonomous job in Kora. The current code has moved beyond the original mostly-stub slice: `OrchestrationEngine` owns registries and lifecycle, `TriggerEvaluator` fires triggers, `Dispatcher` steps ready `WorkerTask` rows, and Phase 8 memory/vault/proactive/reminder handlers are wired into the 20 core pipelines.
 
 This document maps the subsystem. It is the reference when you need to understand how a scheduled pipeline decides to run, how a step function is called, or why a task is sitting in `paused_for_state`.
 
@@ -20,15 +20,15 @@ This document maps the subsystem. It is the reference when you need to understan
 | `triggers.py` | 8 trigger kinds: `INTERVAL`, `EVENT`, `CONDITION`, `TIME_OF_DAY`, `SEQUENCE_COMPLETE`, `USER_ACTION`, `ANY_OF`, `ALL_OF` |
 | `registry.py` | `PipelineRegistry`, `WorkerTaskRegistry`, `PipelineInstanceRegistry`, `TriggerStateStore`, schema init |
 | `ledger.py` | `WorkLedger` — append-only audit trail (`work_ledger` rows) |
-| `working_doc.py` | `WorkingDocStore` — per-instance YAML-frontmatter markdown under `_KoraMemory/Inbox/` |
+| `working_doc.py` | `WorkingDocStore` — per-instance YAML-frontmatter markdown under `<memory_root>/Inbox/` |
 | `templates.py` | `TemplateRegistry` — YAML notification templates, hot reload |
 | `decisions.py` | `OpenDecisionsTracker` — SQL-backed `open_decisions` table |
 | `checkpointing.py` | `CheckpointStore` — writes/reads the `checkpoint_blob` JSON column |
-| `core_pipelines.py` | `build_core_pipelines()` — 20 core declarations (2 real + 1 real-via-factory + 17 stubs) |
+| `core_pipelines.py` | `build_core_pipelines()` — 20 core declarations; most Phase 8 handlers are now wired, with `in_turn_subagent` still stubbed and two housekeeping no-ops |
 | `autonomous_migration.py` | Idempotent one-shot: legacy `autonomous_checkpoints` → `worker_tasks` + `pipeline_instances` |
 | `autonomous_budget.py` | 5-axis `BudgetEnforcer` used by the `user_autonomous_task` step function |
 | `overlap.py` | `check_topic_overlap()` — foreground conversation vs running task topic score |
-| `profile_bootstrap.py` | Fills orchestration anchors into `_KoraMemory/User Model/` without clobbering user-set values |
+| `profile_bootstrap.py` | Fills orchestration anchors into `<memory_root>/User Model/` without clobbering user-set values |
 | `migrations/001_orchestration.sql` | Eight orchestration tables; idempotent |
 | `migrations/002_notifications_templates.sql` | Two-tier columns on the existing `notifications` table |
 
@@ -214,13 +214,13 @@ Templated messages cost **zero** provider requests, so even when the limiter is 
 
 ### Templates
 
-`TemplateRegistry` reads YAML templates from `_KoraMemory/.kora/templates/`, writes default templates the first time, and supports `reload_if_changed()` for hot-reload. Templates carry `priority`, `bypass_dnd`, and a Jinja-style variable list. `RenderedTemplate` is what the gate gets back.
+`TemplateRegistry` reads YAML templates from `<memory_root>/.kora/templates/`, writes default templates the first time, and supports `reload_if_changed()` for hot-reload. Templates carry `priority`, `bypass_dnd`, and a Jinja-style variable list. `RenderedTemplate` is what the gate gets back.
 
 ---
 
-## Working documents — `_KoraMemory/Inbox/`
+## Working documents — `<memory_root>/Inbox/`
 
-Every pipeline instance writes a markdown working document while it runs. Content goes into `_KoraMemory/Inbox/<pipeline-instance-id>.md`; this is the human-readable surface the user and the supervisor both read.
+Every pipeline instance writes a markdown working document while it runs. Content goes into `<memory_root>/Inbox/<pipeline-instance-id>.md`; this is the human-readable surface the user and the supervisor both read.
 
 `WorkingDocStore`:
 
@@ -248,32 +248,52 @@ Working docs are the canonical "what is this background task actually doing" sur
 
 ## The 20 core pipelines
 
-`core_pipelines.py` declares the 20 pipelines from spec §4.3. Two of them have real step functions (`session_bridge_pruning`, `skill_refinement` — both replace the only real work items the deleted `BackgroundWorker` owned). One more has a real step function via the autonomous pipeline factory (`user_autonomous_task`). The other 17 are log-and-complete stubs so the trigger state machine has something to fire while the Phase 8 slices wire in their actual behaviour.
+`core_pipelines.py` declares the 20 pipelines from spec §4.3. Current code wires real step handlers for:
+
+- `post_session_memory` (`extract`, `consolidate`, `dedup`, `entities`, `vault_handoff`)
+- `post_memory_vault` (`reindex`, `structure`, `links`, `moc_sessions`)
+- `weekly_adhd_profile`
+- `user_autonomous_task`
+- `wake_up_preparation`
+- `continuity_check`
+- `proactive_pattern_scan`
+- `anticipatory_prep`
+- `proactive_research`
+- `article_digest`
+- `follow_through_draft`
+- `contextual_engagement`
+- `commitment_tracking`
+- `stuck_detection`
+- `weekly_triage`
+- `draft_on_observation`
+- `connection_making`
+
+`in_turn_subagent` is still wired to the generic stub. `session_bridge_pruning` and `skill_refinement` are registered housekeeping placeholders that complete with no-op summaries. The old “17 stubs” statement is obsolete.
 
 | # | Pipeline | Preset | Trigger(s) | Step function |
 |---|----------|--------|------------|---------------|
-| 1 | `post_session_memory` | `bounded_background` | `EVENT(SESSION_END)` | stub |
-| 2 | `post_memory_vault` | `bounded_background` | `ANY_OF(SEQUENCE_COMPLETE(post_session_memory), INTERVAL(1800s, deep_idle))` | stub |
-| 3 | `weekly_adhd_profile` | `bounded_background` | `TIME_OF_DAY(02:00)` | stub |
+| 1 | `post_session_memory` | `bounded_background` | `EVENT(SESSION_END)` | real 5-stage Memory Steward |
+| 2 | `post_memory_vault` | `bounded_background` | `ANY_OF(SEQUENCE_COMPLETE(post_session_memory), INTERVAL(1800s, deep_idle))` | real 4-stage Vault Organizer |
+| 3 | `weekly_adhd_profile` | `bounded_background` | `TIME_OF_DAY(02:00)` | real ADHD profile refinement |
 | 4 | `user_autonomous_task` | `long_background` | `USER_ACTION(decompose_and_dispatch)` | **real** — `autonomous.pipeline_factory.get_autonomous_step_fn()` |
 | 5 | `in_turn_subagent` | `in_turn` | `USER_ACTION(decompose_and_dispatch_in_turn)` | stub |
-| 6 | `wake_up_preparation` | `bounded_background` | `TIME_OF_DAY(06:15)` | stub |
-| 7 | `continuity_check` | `bounded_background` | `INTERVAL(300s)` | stub |
-| 8 | `proactive_pattern_scan` | `bounded_background` | `ANY_OF(INSIGHT_AVAILABLE, EMOTION_SHIFT_DETECTED, MEMORY_STORED, INTERVAL(1800s, idle))` | stub |
-| 9 | `anticipatory_prep` | `long_background` | `ANY_OF(INTERVAL(1200s, deep_idle), TIME_OF_DAY(06:15))` | stub |
-| 10 | `proactive_research` | `long_background` | `USER_ACTION(dispatch_research)` | stub |
-| 11 | `article_digest` | `long_background` | `CONDITION(min_interval=3600s)` | stub |
-| 12 | `follow_through_draft` | `bounded_background` | `EVENT(USER_STATED_INTENT)` | stub |
-| 13 | `contextual_engagement` | `bounded_background` | `ANY_OF(EMOTION_SHIFT_DETECTED, TASK_LINGERING, OPEN_DECISION_POSED, LONG_FOCUS_BLOCK_ENDED)` | stub |
-| 14 | `commitment_tracking` | `bounded_background` | `TIME_OF_DAY(01:00)` | stub |
-| 15 | `stuck_detection` | `bounded_background` | `INTERVAL(21600s, idle)` | stub |
-| 16 | `weekly_triage` | `bounded_background` | `TIME_OF_DAY(09:00)` | stub |
-| 17 | `draft_on_observation` | `bounded_background` | `EVENT(USER_STATED_NEED)` | stub |
-| 18 | `connection_making` | `bounded_background` | `TIME_OF_DAY(03:00)` | stub |
-| 19 | `session_bridge_pruning` | `bounded_background` | `INTERVAL(3600s, deep_idle)` | **real** — prune expired session bridges |
-| 20 | `skill_refinement` | `bounded_background` | `TIME_OF_DAY(03:00)` | **real** — LLM review of one skill YAML per day |
+| 6 | `wake_up_preparation` | `bounded_background` | `TIME_OF_DAY(06:15)` | real proactive handler |
+| 7 | `continuity_check` | `bounded_background` | `INTERVAL(300s)` / medication event | real reminder/proactive handler |
+| 8 | `proactive_pattern_scan` | `bounded_background` | `ANY_OF(INSIGHT_AVAILABLE, EMOTION_SHIFT_DETECTED, MEMORY_STORED, INTERVAL(1800s, idle))` | real proactive handler |
+| 9 | `anticipatory_prep` | `long_background` | `ANY_OF(INTERVAL(1200s, deep_idle), TIME_OF_DAY(06:15))` | real proactive handler |
+| 10 | `proactive_research` | `long_background` | `USER_ACTION(dispatch_research)` | real proactive handler; latest short acceptance leaves full proof red |
+| 11 | `article_digest` | `long_background` | `CONDITION(min_interval=3600s)` | real proactive handler |
+| 12 | `follow_through_draft` | `bounded_background` | `EVENT(USER_STATED_INTENT)` | real proactive handler |
+| 13 | `contextual_engagement` | `bounded_background` | `ANY_OF(EMOTION_SHIFT_DETECTED, TASK_LINGERING, OPEN_DECISION_POSED, LONG_FOCUS_BLOCK_ENDED)` | real proactive handler |
+| 14 | `commitment_tracking` | `bounded_background` | `TIME_OF_DAY(01:00)` | real proactive handler |
+| 15 | `stuck_detection` | `bounded_background` | `INTERVAL(21600s, idle)` | real proactive handler |
+| 16 | `weekly_triage` | `bounded_background` | `TIME_OF_DAY(09:00)` | real proactive handler |
+| 17 | `draft_on_observation` | `bounded_background` | `EVENT(USER_STATED_NEED)` | real proactive handler |
+| 18 | `connection_making` | `bounded_background` | `TIME_OF_DAY(03:00)` | real proactive handler |
+| 19 | `session_bridge_pruning` | `bounded_background` | `INTERVAL(3600s, deep_idle)` | housekeeping no-op placeholder |
+| 20 | `skill_refinement` | `bounded_background` | `TIME_OF_DAY(03:00)` | skill-review no-op placeholder |
 
-Phase 8 slices wire in the remaining 17 step functions; the stub path exists so the trigger evaluation loop is exercisable end-to-end today.
+The stub path remains for `in_turn_subagent` and for future runtime-created work, but the core catalogue is no longer primarily stubbed.
 
 ---
 
@@ -325,9 +345,9 @@ Callers that just want "everything live" pass both filter args as `None`.
 
 When the orchestration migration replaces legacy subsystems, spec §17.7 pins a 10-row table of behaviours that **must** survive. These are enforced by `tests/integration/orchestration/test_preservation_contract.py`:
 
-1. 14-value `AutonomousState.status` enum — unchanged, still the node transition driver
+1. 12-value `AutonomousState.status` enum — unchanged, still the node transition driver
 2. Topic-overlap pause threshold at 0.70 — now surfaced as a `paused_for_state` step outcome
-3. 5-axis budget enforcer — runs before every work node inside the step function
+3. 5-axis budget enforcer — currently checked before `plan`, `execute_step`, and `replan`
 4. Reflect heuristic: avg step confidence <0.35 → `replan`
 5. Same-node watchdog: 5 repeats of a non-cyclic node → `failed`
 6. In-memory `DecisionManager` with `auto_select` / `never_auto` policies for pause/resume

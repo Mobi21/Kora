@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,8 @@ TOOL_BUCKETS: dict[str, set[str]] = {
         "query_reminders", "query_medications", "query_meals",
         "query_focus_blocks", "quick_note",
         "start_focus_block", "end_focus_block",
+        "create_routine", "list_routines", "start_routine",
+        "advance_routine", "routine_progress",
     },
     "filesystem_tools": {
         "read_file", "write_file", "list_directory",
@@ -85,6 +87,11 @@ def _auto_mark_coverage(
     messages: list[dict[str, Any]],
     auth_results: list[dict[str, Any]],
     latest_status: dict[str, Any] | None,
+    orch_evidence: dict[str, Any] | None = None,
+    benchmark_state: dict[str, Any] | None = None,
+    error_results: list[dict[str, Any]] | None = None,
+    snapshots_dir: Path | None = None,
+    skill_gating_check: dict[str, Any] | None = None,
 ) -> dict[int, str]:
     """Derive coverage markers from observable run evidence.
 
@@ -114,33 +121,123 @@ def _auto_mark_coverage(
                     return True
         return False
 
-    # Item 2: personal context — name + ADHD + pet or partner signal
-    if _msg_mentions("adhd") and _msg_mentions("mochi", "alex"):
+    def _assistant_after_user(
+        user_needles: tuple[str, ...],
+        response_needles: tuple[str, ...],
+        *,
+        require_all: bool = False,
+    ) -> bool:
+        for idx, msg in enumerate(messages):
+            if msg.get("role") != "user":
+                continue
+            content = str(msg.get("content") or "").lower()
+            if not any(needle.lower() in content for needle in user_needles):
+                continue
+            for follow in messages[idx + 1:]:
+                if follow.get("role") != "assistant":
+                    continue
+                response = str(follow.get("content") or "").lower()
+                if require_all:
+                    if all(
+                        needle.lower() in response
+                        for needle in response_needles
+                    ):
+                        return True
+                    break
+                if any(
+                    needle.lower() in response
+                    for needle in response_needles
+                ):
+                    return True
+                break
+        return False
+
+    def _has_all_term_groups(text: str, groups: tuple[tuple[str, ...], ...]) -> bool:
+        lowered = text.lower()
+        return all(any(term in lowered for term in group) for group in groups)
+
+    def _assistant_message_has_groups(
+        groups: tuple[tuple[str, ...], ...],
+        *,
+        extra_any: tuple[str, ...] = (),
+    ) -> bool:
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = str(msg.get("content") or "")
+            lowered = content.lower()
+            if not _has_all_term_groups(content, groups):
+                continue
+            if extra_any and not any(term in lowered for term in extra_any):
+                continue
+            return True
+        return False
+
+    def _assistant_after_user_groups(
+        user_needles: tuple[str, ...],
+        groups: tuple[tuple[str, ...], ...],
+    ) -> bool:
+        for idx, msg in enumerate(messages):
+            if msg.get("role") != "user":
+                continue
+            content = str(msg.get("content") or "").lower()
+            if not any(needle.lower() in content for needle in user_needles):
+                continue
+            for follow in messages[idx + 1:]:
+                if follow.get("role") != "assistant":
+                    continue
+                if _has_all_term_groups(
+                    str(follow.get("content") or ""),
+                    groups,
+                ):
+                    return True
+                break
+        return False
+
+    # Item 2: Life OS identity and support context.
+    if (
+        _msg_mentions("jordan")
+        and _msg_mentions("adhd", "autism", "sensory", "anxiety", "burnout")
+        and _msg_mentions("alex", "trusted support", "support")
+        and _msg_mentions("local-first", "local first", "privacy")
+    ):
         auto[2] = "x"
 
-    # Item 3: week planning with concrete tasks — any write_file + planning language
-    if tool_counts.get("write_file", 0) >= 2 and _msg_mentions(
-        "plan", "week", "this week", "schedule"
+    # Item 3: internal calendar as the spine.
+    if (
+        _msg_mentions("calendar", "schedule", "appointment", "remind me")
+        and _msg_mentions("today", "tomorrow", "this week", "monday", "tuesday")
     ):
         auto[3] = "x"
 
-    # Item 4: coding track — filesystem writes + code-ish language
-    if tool_usage.get("filesystem") and _msg_mentions(
-        "tsx", "component", ".py", "function", "class"
-    ):
+    # Item 4: ADHD / executive-dysfunction support.
+    if _msg_mentions(
+        "adhd", "time blind", "avoid", "forgot", "initiate", "executive"
+    ) and _msg_mentions("tiny", "next action", "carry", "repair", "missed"):
         auto[4] = "x"
 
-    # Item 5: research track — research artifacts
-    if _msg_mentions("research", "deep dive", "landscape", "compare"):
+    # Item 5: autism / sensory-load support.
+    if _msg_mentions(
+        "autism", "sensory", "noise", "routine", "transition", "overload"
+    ) and _msg_mentions("predictable", "low-ambiguity", "fewer decisions", "sequence"):
         auto[5] = "x"
 
-    # Item 6: writing track — writing artifacts
-    if _msg_mentions("outline", "draft", "brief", "paper", "essay"):
+    # Item 6: burnout/anxiety/low-energy support.
+    if _msg_mentions("burnout", "anxious", "low energy", "dread", "frozen") and _msg_mentions(
+        "stabilize", "essentials", "downshift", "smaller"
+    ):
         auto[6] = "x"
 
-    # Item 7: life management tools used
-    if tool_usage.get("life_management"):
+    # Item 7: life management tools used. Full credit requires the actual
+    # acceptance surfaces, not just one life tool somewhere in the run.
+    life_required = ("medication", "meal", "reminder", "quick_note", "focus_block")
+    life_hit_count = sum(
+        1 for key in life_required if int(life_data.get(f"{key}_count", 0) or 0) > 0
+    )
+    if life_hit_count == len(life_required):
         auto[7] = "x"
+    elif life_hit_count > 0 or tool_usage.get("life_management"):
+        auto[7] = "~"
 
     # Item 9: web research — successful MCP/capability call OR disclosed
     # failure (the item description explicitly allows both).
@@ -158,31 +255,58 @@ def _auto_mark_coverage(
         ):
             auto[15] = "x"
 
-    # Item 11: revision wave
-    if _msg_mentions(
-        "rewrite", "restructure", "pivot", "revise", "rework"
-    ):
+    # Item 11: wrong inference or plan-drift repair.
+    if _assistant_after_user(
+        (
+            "that's not what i meant",
+            "wrong assumption",
+            "you assumed",
+            "actually",
+            "correct that",
+            "not a phone call",
+        ),
+        ("update", "correct", "replan"),
+        require_all=False,
+    ) or _msg_mentions("LIFE_EVENT_CORRECTED", "WRONG_INFERENCE_REPAIRED"):
         auto[11] = "x"
 
-    # Item 8 (un-deferred in AT1): decompose_and_dispatch creates a
-    # pipeline_instance with sub-tasks. Tool-call evidence is the AT1
-    # signal; AT3 will add a real query against pipeline_instances /
-    # worker_tasks for the multi-stage check.
+    # Item 8: decompose_and_dispatch must create durable orchestration
+    # evidence. A tool call alone only proves Kora acknowledged the work,
+    # not that the scheduler received anything executable.
     if tool_counts.get("decompose_and_dispatch", 0) >= 1:
-        auto[8] = "x"
+        if orch_evidence and _has_user_pipeline_with_tasks(orch_evidence):
+            auto[8] = "x"
+        else:
+            auto[8] = "~"
 
-    # Item 12 (un-deferred in AT1): real background pipelines fire during
-    # DEEP_IDLE. The legacy BackgroundWorker count was dropped along
-    # with the worker itself (Phase 7.5); the equivalent post-7.5 signal
-    # is "any orchestration core pipeline has logged a row in
-    # work_ledger". Until AT3 wires that query, we accept the legacy
-    # status field as a fallback if the harness still sets it, and
-    # otherwise leave the item for operator marking.
-    if latest_status and latest_status.get("background_worker_items", 0) >= 1:
+    # Item 12: real background pipelines fire during DEEP_IDLE. The
+    # retired BackgroundWorker no longer exists; post-7.5 evidence is
+    # the core housekeeping pipelines themselves completing under
+    # orchestration.
+    if orch_evidence and _deep_idle_housekeeping_marker(orch_evidence):
+        auto[12] = "x"
+    elif latest_status and latest_status.get("background_worker_items", 0) >= 1:
         auto[12] = "x"
 
-    # Item 14: weekly review
-    if _msg_mentions("weekly review", "weekly_review", "week review"):
+    # Item 14: lived-week review. Credit only concrete stateful review
+    # language, not a vague "nice week" summary.
+    if _assistant_after_user(
+        (
+            "weekly review",
+            "weekly_review",
+            "week review",
+            "summary",
+            "recap",
+            "what actually happened",
+            "before you end",
+        ),
+        ("missed", "repaired", "tomorrow"),
+        require_all=False,
+    ) or _assistant_after_user(
+        ("weekly review", "week review", "what state backs"),
+        ("calendar", "reminder", "routine", "next week"),
+        require_all=True,
+    ):
         auto[14] = "x"
 
     # Item 16: memory recall
@@ -198,31 +322,158 @@ def _auto_mark_coverage(
         elif has_approved or has_denied:
             auto[17] = "~"
 
-    # Item 21: long-running autonomous execution via decompose_and_dispatch.
-    # AT3 will replace this with an evidence query against
-    # pipeline_instances WHERE intent_duration='long'. For now we accept
-    # any decompose_and_dispatch tool call as best-effort signal; the
-    # legacy auto_state-derived counters have been removed (the
-    # autonomous_plans / autonomous_checkpoints tables were retired in
-    # Phase 7.5 along with start_autonomous).
-    if (
-        tool_counts.get("decompose_and_dispatch", 0) >= 1
-        or auto_state.get("total_items", 0) > 0
-    ):
-        auto[21] = "x"
+    # Item 18: malformed/empty/raw inputs produced graceful error frames
+    # and the normal follow-up turn still completed.
+    if error_results:
+        required = {
+            "malformed_json_frame",
+            "empty_chat_content",
+            "normal_after_errors",
+        }
+        passed = {
+            str(r.get("test"))
+            for r in error_results
+            if r.get("survived") is True
+        }
+        if required.issubset(passed):
+            auto[18] = "x"
+        elif passed:
+            auto[18] = "~"
 
-    # Item 22: filesystem operations
-    if tool_usage.get("filesystem"):
+    # Item 19: emotional/energy adaptation. This is backed by durable
+    # self-report rows plus either emotion-shift runtime evidence or
+    # contextual engagement that reacts to that shift.
+    if int(life_data.get("energy_self_report_count", 0) or 0) > 0:
+        emotion_runtime = False
+        if orch_evidence:
+            ledger_events = orch_evidence.get("ledger_events") or []
+            emotion_runtime = any(
+                evt.get("trigger_name") == "EMOTION_SHIFT_DETECTED"
+                for evt in ledger_events
+            ) or any(
+                p.get("pipeline_name") == "contextual_engagement"
+                for p in orch_evidence.get("pipeline_instances", [])
+            )
+        auto[19] = "x" if emotion_runtime else "~"
+
+    # Item 13: restart preservation is evidenced by the pre/post restart
+    # snapshots plus a healthy post-restart daemon. Working-doc and
+    # orchestration continuity get deeper coverage in items 35/44.
+    if snapshots_dir is not None:
+        pre_restart = snapshots_dir / "pre_restart.json"
+        post_restart = snapshots_dir / "post_restart.json"
+        if pre_restart.exists() and post_restart.exists():
+            try:
+                post = json.loads(post_restart.read_text())
+            except Exception:
+                post = {}
+            status = post.get("status") or {}
+            continuity_response = _assistant_after_user(
+                (
+                    "before the restart",
+                    "survived restart",
+                    "restart",
+                ),
+                ("calendar", "reminder"),
+                require_all=True,
+            ) or _assistant_after_user(
+                (
+                    "before the restart",
+                    "survived restart",
+                    "restart",
+                ),
+                ("support", "routine"),
+                require_all=True,
+            ) or _assistant_after_user(
+                (
+                    "before the restart",
+                    "survived restart",
+                    "restart",
+                ),
+                ("tomorrow", "unfinished"),
+                require_all=True,
+            )
+            if (
+                status.get("status") in {"ok", "healthy", "running"}
+                and continuity_response
+            ):
+                auto[13] = "x"
+            elif status.get("status") in {"ok", "healthy", "running"}:
+                auto[13] = "~"
+            post_working_docs = (
+                post.get("vault_state", {}).get("working_docs", [])
+            )
+            if orch_evidence and post_working_docs:
+                has_orch_after_restart = bool(
+                    orch_evidence.get("worker_tasks")
+                    or orch_evidence.get("pipeline_instances")
+                )
+                if has_orch_after_restart and status.get("status") in {
+                    "ok", "healthy", "running",
+                }:
+                    auto[35] = "x"
+                elif has_orch_after_restart:
+                    auto[35] = "~"
+
+    # Item 21: long-running autonomous execution. Dispatch is not enough:
+    # require a long-intent pipeline plus ledger/task evidence. Completed
+    # pipelines get full credit; running pipelines with task progress are
+    # partial.
+    long_marker = (
+        _long_autonomous_marker(orch_evidence) if orch_evidence else None
+    )
+    if long_marker:
+        auto[21] = long_marker
+    elif auto_state.get("total_items", 0) > 0:
+        auto[21] = "~"
+
+    # Item 29: mid-flight progress query. The report cannot replay the
+    # full tool payload, but a get_task_progress call during a run is
+    # captured in the conversation tool log and the live evidence log
+    # carries the exact returned state/elapsed fields.
+    if tool_counts.get("get_task_progress", 0) >= 1:
+        auto[29] = "x"
+
+    if skill_gating_check:
+        auto[20] = "x" if skill_gating_check.get("passed") else "~"
+
+    # Item 37: re-engagement merge. Older reports expected the explicit
+    # get_running_tasks tool; the runtime now also prefetches relevant
+    # terminal tasks into the turn and the supervisor may inspect them
+    # through get_task_progress/get_working_doc. Require both a
+    # re-engagement surface and completed task evidence.
+    reengagement_surface = (
+        tool_counts.get("get_running_tasks", 0) >= 1
+        or tool_counts.get("get_task_progress", 0) >= 1
+        or tool_counts.get("get_working_doc", 0) >= 1
+    )
+    if reengagement_surface and orch_evidence:
+        completed_background = any(
+            task.get("state") == "completed"
+            for task in orch_evidence.get("worker_tasks", [])
+        )
+        if completed_background:
+            auto[37] = "x"
+
+    # Item 22: filesystem operations. The coverage item names the full
+    # read/write/list surface, so do not score it from a write-only run.
+    if all(
+        int(tool_counts.get(name, 0) or 0) >= 1
+        for name in ("read_file", "write_file", "list_directory")
+    ):
         auto[22] = "x"
 
     # Item 23: life management DB records persist
     if life_data.get("available"):
-        total_records = sum(
-            life_data.get(f"{k}_count", 0)
-            for k in ("medication", "meal", "reminder", "quick_note", "focus_block")
+        required_records = (
+            int(life_data.get("medication_count", 0) or 0),
+            int(life_data.get("meal_count", 0) or 0),
+            int(life_data.get("reminder_count", 0) or 0),
         )
-        if total_records > 0:
+        if all(count > 0 for count in required_records):
             auto[23] = "x"
+        elif any(count > 0 for count in required_records):
+            auto[23] = "~"
 
     # Item 100: capability pack surface — either a real call OR a pack
     # that reports unconfigured/degraded with a remediation hint.
@@ -256,13 +507,92 @@ def _auto_mark_coverage(
         auto[102] = "x"
 
     # Items 24-67 (Phase 7.5 + Phase 8 orchestration / memory / vault /
-    # context / proactive coverage) all need real evidence queries
-    # against orchestration tables (pipeline_instances, worker_tasks,
-    # work_ledger, system_state_log, runtime_pipelines, open_decisions).
-    # AT3 wires those queries; for AT1 they are intentionally left for
-    # operator marking via coverage.md.
+    # context / proactive coverage) — credit from real evidence in the
+    # orchestration tables. Only items with matching SQL evidence are
+    # auto-marked; items requiring semantic judgment (19 emotion tone,
+    # 20 skill gating) or external observation stay for operator marking.
+    if orch_evidence:
+        for item_id, marker in _derive_orchestration_markers(
+            orch_evidence
+        ).items():
+            auto.setdefault(item_id, marker)
+        if (
+            int(life_data.get("reminders_delivered_count", 0) or 0) >= 1
+            and any(
+                p.get("pipeline_name") == "continuity_check"
+                and p.get("state") == "completed"
+                for p in orch_evidence.get("pipeline_instances", [])
+            )
+        ):
+            auto[66] = "x"
+
+    if benchmark_state:
+        if int(benchmark_state.get("memories_consolidated", 0) or 0) >= 1:
+            auto.setdefault(48, "x")
+        if int(benchmark_state.get("memories_dedup_merged", 0) or 0) >= 1:
+            auto.setdefault(49, "x")
+        if int(benchmark_state.get("entities_merged", 0) or 0) >= 1:
+            auto.setdefault(50, "x")
+        if int(benchmark_state.get("vault_entity_pages", 0) or 0) >= 1:
+            auto.setdefault(55, "x")
+        if int(benchmark_state.get("vault_moc_pages", 0) or 0) >= 1:
+            auto.setdefault(56, "x")
+        if int(benchmark_state.get("vault_sessions", 0) or 0) >= 1:
+            auto.setdefault(57, "x")
 
     return auto
+
+
+def _latest_benchmark_state(snapshots_dir: Path) -> dict[str, Any] | None:
+    if not snapshots_dir.exists():
+        return None
+    bench_files = sorted(
+        snapshots_dir.glob("*.benchmarks.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not bench_files:
+        return None
+    try:
+        data = json.loads(bench_files[-1].read_text())
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _current_vault_benchmark_state() -> dict[str, Any] | None:
+    """Return direct vault counts for coverage items backed by files.
+
+    Full acceptance runs usually collect these through a benchmark
+    snapshot. Targeted mini-runs often do not, so the final report should
+    still be able to score vault coverage from the current configured
+    memory root instead of leaving real entity/session files invisible.
+    """
+    try:
+        from kora_v2.core.settings import get_settings
+
+        root = Path(get_settings().memory.kora_memory_path).expanduser()
+    except Exception:
+        root = _PROJECT_ROOT / "data" / "_KoraMemory"
+
+    if not root.exists():
+        return None
+
+    def count_md(relative: str) -> int:
+        folder = root / relative
+        if not folder.exists():
+            return 0
+        return sum(1 for _ in folder.rglob("*.md"))
+
+    entity_pages = (
+        count_md("Entities/People")
+        + count_md("Entities/Places")
+        + count_md("Entities/Projects")
+    )
+    return {
+        "vault_entity_pages": entity_pages,
+        "vault_moc_pages": count_md("Maps of Content"),
+        "vault_sessions": count_md("Sessions"),
+    }
 
 
 def _latest_snapshot_status(snapshots_dir: Path) -> dict[str, Any] | None:
@@ -343,6 +673,26 @@ def _parse_coverage_file(coverage_path: Path) -> dict[int, str]:
                 continue
             result[item_id] = marker
     return result
+
+
+def _with_startup_grace(started_at: str | None, *, seconds: int = 30) -> str | None:
+    """Move the orchestration evidence boundary slightly before harness start.
+
+    Startup-triggered pipelines can be seeded while ``cmd_start`` is still
+    waiting for the daemon/harness handshake, a few seconds before the
+    persisted acceptance ``started_at``. Without this grace window, the
+    report misses current-run startup work like session_bridge_pruning even
+    though it was created by this run.
+    """
+    if not started_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(started_at)
+    except ValueError:
+        return started_at
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return (parsed - timedelta(seconds=seconds)).isoformat()
 
 
 def _extract_tool_usage(messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -476,27 +826,936 @@ async def _query_life_management(output_dir: Path) -> dict[str, Any]:
                     result[f"{key}_count"] = row[0] if row else 0
                 except Exception:
                     result[f"{key}_count"] = 0
+            try:
+                cursor = await db.execute(
+                    "SELECT COUNT(*) FROM energy_log WHERE source = 'self_report'"
+                )
+                row = await cursor.fetchone()
+                result["energy_self_report_count"] = row[0] if row else 0
+            except Exception:
+                result["energy_self_report_count"] = 0
+            try:
+                cursor = await db.execute(
+                    "SELECT COUNT(*) FROM reminders "
+                    "WHERE status='delivered' OR delivered_at IS NOT NULL"
+                )
+                row = await cursor.fetchone()
+                result["reminders_delivered_count"] = row[0] if row else 0
+            except Exception:
+                result["reminders_delivered_count"] = 0
 
         return result
     except Exception:
         return {"available": False}
 
 
+async def _query_policy_grants(since: str | None = None) -> list[dict[str, Any]]:
+    """Return recorded permission decisions from operational.db.
+
+    The WebSocket auth-test tracker is useful but volatile: if the
+    harness restarts or the report is generated out of process, the raw
+    ``auth_test_results`` list can be empty even though the daemon wrote
+    durable decisions to ``permission_grants``. The DB table is the
+    authoritative audit surface for the Policy Grants section.
+    """
+    op_db = _PROJECT_ROOT / "data" / "operational.db"
+    if not op_db.exists():
+        return []
+    try:
+        import aiosqlite
+
+        async with aiosqlite.connect(str(op_db)) as db:
+            db.row_factory = aiosqlite.Row
+            if since:
+                cursor = await db.execute(
+                    "SELECT tool_name, risk_level, decision, granted_at "
+                    "FROM permission_grants WHERE granted_at >= ? "
+                    "ORDER BY granted_at ASC",
+                    (since,),
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT tool_name, risk_level, decision, granted_at "
+                    "FROM permission_grants ORDER BY granted_at ASC"
+                )
+            rows = await cursor.fetchall()
+    except Exception:
+        return []
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        decision = str(row["decision"] or "").lower()
+        approved: bool | None
+        if decision == "approved":
+            approved = True
+        elif decision == "denied":
+            approved = False
+        else:
+            approved = None
+        results.append(
+            {
+                "tool": row["tool_name"],
+                "risk": row["risk_level"],
+                "approved": approved,
+                "decision": decision,
+                "ts": row["granted_at"],
+                "source": "permission_grants",
+            }
+        )
+    return results
+
+
+async def _query_orchestration_evidence(since: str | None = None) -> dict[str, Any]:
+    """Query orchestration tables for evidence of Phase 7.5/8 behaviours.
+
+    Returns a summary dict used by :func:`_auto_mark_coverage` to credit
+    items 24–67 based on real DB state. Missing tables (e.g. pre-7.5
+    DB) return empty fields so the caller degrades gracefully.
+    """
+    op_db = _PROJECT_ROOT / "data" / "operational.db"
+    proj_db = _PROJECT_ROOT / "data" / "projection.db"
+    result: dict[str, Any] = {"available": False}
+    if not op_db.exists():
+        return result
+    try:
+        import aiosqlite
+
+        result["available"] = True
+        async with aiosqlite.connect(str(op_db)) as db:
+            db.row_factory = aiosqlite.Row
+
+            async def _scalar(q: str, params: tuple[Any, ...] = ()) -> int:
+                try:
+                    cur = await db.execute(q, params)
+                    row = await cur.fetchone()
+                    return int(row[0]) if row and row[0] is not None else 0
+                except Exception:
+                    return 0
+
+            async def _rows(
+                q: str, params: tuple[Any, ...] = ()
+            ) -> list[dict[str, Any]]:
+                try:
+                    cur = await db.execute(q, params)
+                    return [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    return []
+
+            # SystemStatePhase transitions observed.
+            since_phase = " WHERE transitioned_at >= ?" if since else ""
+            phase_rows = await _rows(
+                f"SELECT DISTINCT new_phase FROM system_state_log{since_phase}",
+                (since,) if since else (),
+            )
+            result["system_phases_observed"] = sorted(
+                {r["new_phase"] for r in phase_rows if r.get("new_phase")}
+            )
+
+            # Pipeline instance summary (by pipeline name + state).
+            since_pipeline = " WHERE started_at >= ?" if since else ""
+            pipeline_rows = await _rows(
+                "SELECT id, pipeline_name, state, intent_duration, "
+                "  parent_session_id, completion_reason, working_doc_path, goal "
+                f"FROM pipeline_instances{since_pipeline}",
+                (since,) if since else (),
+            )
+            result["pipeline_instances"] = pipeline_rows
+
+            # Worker task summary (stage/preset/state/outcome). Outcome
+            # summaries are needed to distinguish "stage ran" from
+            # "stage actually merged/deduped/resolved something".
+            if since:
+                task_rows = await _rows(
+                    "SELECT w.id, w.pipeline_instance_id, w.stage_name, w.state, "
+                    "  w.task_preset, w.result_summary, w.error_message, "
+                    "  w.cancellation_requested "
+                    "FROM worker_tasks w "
+                    "JOIN pipeline_instances p ON p.id = w.pipeline_instance_id "
+                    "WHERE p.started_at >= ?",
+                    (since,),
+                )
+            else:
+                task_rows = await _rows(
+                    "SELECT id, pipeline_instance_id, stage_name, state, "
+                    "  task_preset, result_summary, error_message, "
+                    "  cancellation_requested "
+                    "FROM worker_tasks"
+                )
+            result["worker_tasks"] = task_rows
+
+            # Work ledger event types by pipeline.
+            since_ledger = " WHERE timestamp >= ?" if since else ""
+            ledger_rows = await _rows(
+                "SELECT event_type, pipeline_instance_id, reason, trigger_name, "
+                "worker_task_id, metadata_json "
+                f"FROM work_ledger{since_ledger}",
+                (since,) if since else (),
+            )
+            result["ledger_events"] = ledger_rows
+
+            trace_where = " WHERE started_at >= ?" if since else ""
+            result["turn_traces"] = await _rows(
+                "SELECT user_input, tool_call_count, tools_invoked, "
+                f"final_output, succeeded FROM turn_traces{trace_where}",
+                (since,) if since else (),
+            )
+
+            limiter_rows = await _rows(
+                "SELECT class, COUNT(*) AS cnt FROM request_limiter_log "
+                "GROUP BY class"
+            )
+            result["request_limiter_by_class"] = {
+                r.get("class"): int(r.get("cnt") or 0)
+                for r in limiter_rows
+                if r.get("class")
+            }
+
+            # Notifications.
+            notif_where = " WHERE delivered_at >= ?" if since else ""
+            result["notification_count"] = await _scalar(
+                f"SELECT COUNT(*) FROM notifications{notif_where}",
+                (since,) if since else (),
+            )
+            result["delivered_notifications"] = await _scalar(
+                "SELECT COUNT(*) FROM notifications "
+                "WHERE delivered_at IS NOT NULL"
+                + (" AND delivered_at >= ?" if since else ""),
+                (since,) if since else (),
+            )
+            result["reminder_count"] = await _scalar(
+                "SELECT COUNT(*) FROM reminders"
+            )
+            result["notifications"] = await _rows(
+                "SELECT delivery_tier, template_id, reason, delivered_at "
+                "FROM notifications"
+                + (" WHERE delivered_at >= ?" if since else ""),
+                (since,) if since else (),
+            )
+
+            # Runtime pipelines (user-registered).
+            runtime_where = " WHERE created_at >= ?" if since else ""
+            result["runtime_pipeline_count"] = await _scalar(
+                f"SELECT COUNT(*) FROM runtime_pipelines{runtime_where}",
+                (since,) if since else (),
+            )
+
+            # Open decisions are deliberately age-based. Acceptance may
+            # backdate ``posed_at`` to prove DECISION_PENDING_3D, so do not
+            # filter this count by run start or the report hides the very
+            # decision it is trying to score.
+            result["open_decision_count"] = await _scalar(
+                "SELECT COUNT(*) FROM open_decisions",
+            )
+
+            # Session transcripts and signal queue (memory pipeline inputs).
+            transcripts_where = " WHERE created_at >= ?" if since else ""
+            result["session_transcripts"] = await _scalar(
+                f"SELECT COUNT(*) FROM session_transcripts{transcripts_where}",
+                (since,) if since else (),
+            )
+            signals_where = " WHERE created_at >= ?" if since else ""
+            result["signal_queue_count"] = await _scalar(
+                f"SELECT COUNT(*) FROM signal_queue{signals_where}",
+                (since,) if since else (),
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Projection DB evidence (memory notes / entities).
+    if proj_db.exists():
+        try:
+            import aiosqlite as _aiosqlite
+
+            async with _aiosqlite.connect(str(proj_db)) as db:
+                db.row_factory = _aiosqlite.Row
+                for table, key in [
+                    ("notes", "notes_total"),
+                    ("entities", "entities_total"),
+                ]:
+                    try:
+                        cur = await db.execute(
+                            f"SELECT COUNT(*) FROM {table}"
+                        )
+                        row = await cur.fetchone()
+                        result[key] = int(row[0]) if row else 0
+                    except Exception:
+                        result[key] = 0
+        except Exception:  # noqa: BLE001
+            pass
+
+    return result
+
+
+def _derive_orchestration_markers(
+    orch: dict[str, Any],
+) -> dict[int, str]:
+    """Turn orchestration evidence into ``{item_id: marker}`` credits.
+
+    Only runs evidence-based items 24–67; items requiring semantic
+    judgment or external observation stay unmarked.
+    """
+    marks: dict[int, str] = {}
+    if not orch.get("available"):
+        return marks
+
+    pipelines = orch.get("pipeline_instances") or []
+    tasks = orch.get("worker_tasks") or []
+    ledger = orch.get("ledger_events") or []
+    turn_traces = orch.get("turn_traces") or []
+    notifications = orch.get("notifications") or []
+    phases = set(orch.get("system_phases_observed") or [])
+
+    def pipes_by_name(name: str) -> list[dict[str, Any]]:
+        return [p for p in pipelines if p.get("pipeline_name") == name]
+
+    def completed(name: str) -> bool:
+        return any(
+            p.get("state") == "completed"
+            for p in pipes_by_name(name)
+        )
+
+    def any_state(name: str, states: set[str]) -> bool:
+        return any(
+            p.get("state") in states for p in pipes_by_name(name)
+        )
+
+    def _task_summary_positive(stage_name: str, patterns: tuple[str, ...]) -> bool:
+        for task in tasks:
+            if (
+                task.get("stage_name") != stage_name
+                or task.get("state") != "completed"
+            ):
+                continue
+            summary = str(task.get("result_summary") or "")
+            for pattern in patterns:
+                match = re.search(pattern, summary, flags=re.IGNORECASE)
+                if match and int(match.group(1)) > 0:
+                    return True
+        return False
+
+    def _pipeline_completed_clean(
+        pipeline: dict[str, Any],
+        *,
+        require_substantive_doc: bool = False,
+    ) -> bool:
+        if pipeline.get("state") != "completed":
+            return False
+        if require_substantive_doc and not _pipeline_has_substantive_doc(pipeline):
+            return False
+        return not _pipeline_has_cancellation_evidence(pipeline, tasks, ledger)
+
+    # 24: required idle progression observed.
+    required_idle_phases = {
+        "conversation",
+        "active_idle",
+        "light_idle",
+        "deep_idle",
+    }
+    seen_required = phases & required_idle_phases
+    if required_idle_phases.issubset(phases):
+        marks[24] = "x"
+    elif len(seen_required) >= 2:
+        marks[24] = "~"
+
+    # 25: long_background task dispatch — a worker_task with
+    # preset='long_background' exists.
+    if any(t.get("task_preset") == "long_background" for t in tasks):
+        marks[25] = "x"
+
+    # 26: working doc exists is filesystem evidence — handled inline
+    # below (tested via pipeline presence and working_doc frontmatter
+    # status). A pipeline instance having any task is sufficient AT3
+    # credit.
+    if any(p.get("state") in {"running", "completed"} for p in pipelines):
+        marks[26] = "x"
+
+    # 27 adaptive mutation — evidence: proposed_new_tasks or
+    # user_added stage tasks exist.
+    if any(t.get("stage_name") == "user_added" for t in tasks):
+        marks[27] = "x"
+        marks[31] = "x"
+
+    # 28 Kora-judged completion: a user-facing completed pipeline should
+    # have either a substantive working doc or be a non-research core
+    # pipeline with task evidence.
+    if any(
+        _pipeline_completed_clean(
+            p,
+            require_substantive_doc=p.get("pipeline_name") == "proactive_research",
+        )
+        for p in pipelines
+    ):
+        marks[28] = "x"
+
+    # 30 cancel_task evidence: the disposable cancel-probe must be
+    # cancelled without collateral cancellation on the real research task.
+    if _cancel_probe_isolated(pipelines, tasks, ledger):
+        marks[30] = "x"
+    elif any(evt.get("event_type") == "task_cancelled" for evt in ledger):
+        marks[30] = "~"
+
+    # 32 conversation reserve preserved under background load. Full credit
+    # needs both background limiter traffic and a successful foreground turn
+    # after rate-pressure evidence appears.
+    limiter_by_class = orch.get("request_limiter_by_class") or {}
+    any_successful_turn = any(
+        int(trace.get("succeeded") or 0) == 1 for trace in turn_traces
+    )
+    if int(limiter_by_class.get("background", 0) or 0) > 0 and any_successful_turn:
+        marks[32] = "~"
+
+    # 33 rate-limit pause+resume.
+    has_paused = any(
+        evt.get("event_type") == "task_paused"
+        and (evt.get("reason") or "").startswith("rate")
+        for evt in ledger
+    )
+    has_resumed = any(
+        evt.get("event_type") == "task_resumed"
+        and (evt.get("reason") or "").startswith("rate")
+        for evt in ledger
+    )
+    if has_paused and has_resumed:
+        marks[33] = "x"
+        if any_successful_turn:
+            marks[32] = "x"
+    elif has_paused:
+        marks[33] = "~"
+
+    # 34 templated fallback: the limiter hook sends a templated
+    # rate_limit_paused notification. Score from NotificationGate rows, not
+    # only from generic notification totals.
+    if any(
+        n.get("delivery_tier") == "templated"
+        and n.get("template_id") == "rate_limit_paused"
+        for n in notifications
+    ):
+        marks[34] = "x"
+
+    # 36: >=2 long-intent pipelines completed.
+    long_completed = [
+        p for p in pipelines
+        if p.get("intent_duration") == "long"
+        and p.get("state") == "completed"
+    ]
+    if len(long_completed) >= 2:
+        marks[36] = "x"
+    elif len(long_completed) >= 1:
+        marks[36] = "~"
+
+    # 39 sequence_complete linking post_session_memory -> post_memory_vault.
+    # This item verifies the trigger handoff. The vault pipeline can still
+    # fail later in its own stage-specific items, so do not require final
+    # post_memory_vault completion here.
+    has_sequence_trigger = any(
+        evt.get("event_type") == "trigger_fired"
+        and (
+            evt.get("trigger_name") == "post_memory_vault.seq.post_session_memory"
+            or "sequence_complete" in str(evt.get("metadata_json") or "")
+        )
+        for evt in ledger
+    )
+    if completed("post_session_memory") and has_sequence_trigger:
+        marks[39] = "x"
+    elif completed("post_session_memory") and any_state(
+        "post_memory_vault", {"running", "completed", "failed"}
+    ):
+        marks[39] = "~"
+
+    # 40 WAKE_UP_WINDOW
+    if "wake_up_window" in phases and completed("wake_up_preparation"):
+        marks[40] = "x"
+    elif "wake_up_window" in phases:
+        marks[40] = "~"
+
+    # 41 / 62 contextual_engagement
+    if completed("contextual_engagement"):
+        marks[41] = "x"
+        marks[62] = "x"
+
+    # 38 continuity_check mid-session evidence. Notification delivery is
+    # covered by 66; completion itself proves the inline pipeline fired.
+    if completed("continuity_check"):
+        marks[38] = "x"
+
+    insight_triggered = any(
+        evt.get("event_type") == "trigger_fired"
+        and (
+            "INSIGHT_AVAILABLE" in str(evt.get("trigger_name") or "")
+            or "INSIGHT_AVAILABLE" in str(evt.get("metadata_json") or "")
+        )
+        for evt in ledger
+    )
+    pattern_nudge_sent = any(
+        n.get("delivery_tier") == "templated"
+        and n.get("template_id") == "pattern_nudge"
+        for n in notifications
+    )
+
+    # 42 proactive_pattern_scan consumes INSIGHT_AVAILABLE evidence. 59
+    # specifically requires the resulting pattern nudge to hit NotificationGate.
+    if completed("proactive_pattern_scan") and insight_triggered:
+        marks[42] = "x"
+    elif completed("proactive_pattern_scan"):
+        marks[42] = "~"
+    if completed("proactive_pattern_scan") and pattern_nudge_sent:
+        marks[59] = "x"
+
+    # 43 open decisions
+    has_decision_aging = any(
+        evt.get("event_type") == "trigger_fired"
+        and evt.get("trigger_name") == "DECISION_PENDING_3D"
+        for evt in ledger
+    )
+    if orch.get("open_decision_count", 0) > 0 and has_decision_aging:
+        marks[43] = "x"
+    elif orch.get("open_decision_count", 0) > 0:
+        marks[43] = "~"
+
+    # 44 runtime pipelines
+    routine_runtime_fired = any(
+        str(p.get("pipeline_name") or "").startswith("routine_")
+        and p.get("state") in {"running", "completed"}
+        for p in pipelines
+    )
+    if orch.get("runtime_pipeline_count", 0) > 0 and routine_runtime_fired:
+        marks[44] = "x"
+    elif orch.get("runtime_pipeline_count", 0) > 0:
+        marks[44] = "~"
+
+    # 45 WorkLedger answers.
+    if len(ledger) > 0:
+        marks[45] = "x"
+
+    # 46 long-background templated ack: GraphTurnRunner records the final
+    # output and invoked tool names for the turn. The runtime short-circuit
+    # path makes the acknowledgement the final output immediately after the
+    # dispatch tool result instead of asking the provider for another reply.
+    for trace in turn_traces:
+        tools_raw = str(trace.get("tools_invoked") or "")
+        output = str(trace.get("final_output") or "")
+        if (
+            "decompose_and_dispatch" in tools_raw
+            and output.startswith("I'll keep that running in the background")
+        ):
+            marks[46] = "x"
+            break
+
+    # Memory Steward stages (47-51)
+    post_session_stages = {
+        t.get("stage_name")
+        for t in tasks
+        if any(
+            p.get("id") == t.get("pipeline_instance_id")
+            and p.get("pipeline_name") == "post_session_memory"
+            for p in pipelines
+        )
+        and t.get("state") == "completed"
+    }
+    if "extract" in post_session_stages:
+        marks[47] = "x"
+    # 48-50 need outcome evidence from benchmark/projection deltas; stage
+    # completion alone only proves the code path ran.
+    if _task_summary_positive("consolidate", (r"(\d+)\s+groups?\s+merged",)):
+        marks[48] = "x"
+    if _task_summary_positive(
+        "dedup",
+        (r"(\d+)\s+duplicates?\s+removed", r"(\d+)\s+deduped"),
+    ):
+        marks[49] = "x"
+    if _task_summary_positive("entities", (r"(\d+)\s+merged",)):
+        marks[50] = "x"
+    if completed("weekly_adhd_profile"):
+        marks[51] = "x"
+
+    # Vault Organizer stages (52-57)
+    vault_stages = {
+        t.get("stage_name")
+        for t in tasks
+        if any(
+            p.get("id") == t.get("pipeline_instance_id")
+            and p.get("pipeline_name") == "post_memory_vault"
+            for p in pipelines
+        )
+        and t.get("state") == "completed"
+    }
+    if "reindex" in vault_stages:
+        marks[52] = "x"
+    if "structure" in vault_stages:
+        marks[53] = "x"
+    if "links" in vault_stages:
+        marks[54] = "x"
+    # 56 is scored from vault benchmark/page-count evidence. A completed
+    # moc_sessions stage that writes zero MOC pages is not enough.
+
+    # 58 ContextEngine insight — INSIGHT_AVAILABLE event surfaced and was
+    # consumed by proactive_pattern_scan.
+    if completed("proactive_pattern_scan") and insight_triggered:
+        marks[58] = "x"
+    elif completed("proactive_pattern_scan"):
+        marks[58] = "~"
+
+    # 60 anticipatory_prep
+    if completed("anticipatory_prep"):
+        marks[60] = "x"
+
+    # 61 proactive_research
+    if any(
+        p.get("pipeline_name") == "proactive_research"
+        and _pipeline_completed_clean(p, require_substantive_doc=True)
+        and _pipeline_doc_matches_goal(p)
+        for p in pipelines
+    ):
+        marks[61] = "x"
+    elif any(
+        p.get("pipeline_name") == "proactive_research"
+        and p.get("state") in {
+            "running",
+            "paused_for_rate_limit",
+            "paused_for_state",
+        }
+        and not _pipeline_has_cancellation_evidence(p, tasks, ledger)
+        and (p.get("working_doc_path") or any(
+            t.get("pipeline_instance_id") == p.get("id")
+            and t.get("stage_name") == "user_added"
+            for t in tasks
+        ))
+        for p in pipelines
+    ):
+        marks[61] = "~"
+    elif any(
+        p.get("pipeline_name") == "proactive_research"
+        and p.get("state") == "completed"
+        and not _pipeline_has_cancellation_evidence(p, tasks, ledger)
+        and (
+            _pipeline_has_degraded_research_output(p)
+            or any(
+                t.get("pipeline_instance_id") == p.get("id")
+                and t.get("stage_name") == "user_added"
+                and t.get("state") == "completed"
+                for t in tasks
+            )
+        )
+        for p in pipelines
+    ):
+        marks[61] = "~"
+
+    # 63 commitment_tracking
+    if completed("commitment_tracking"):
+        marks[63] = "x"
+
+    # 64 stuck_detection
+    if completed("stuck_detection"):
+        marks[64] = "x"
+
+    # 65 connection_making
+    if completed("connection_making"):
+        marks[65] = "x"
+
+    # 66 reminders -> continuity_check. Partial credit requires an actual
+    # reminder row; unrelated routine notifications are not enough.
+    if (
+        completed("continuity_check")
+        and int(orch.get("reminder_count", 0) or 0) > 0
+    ):
+        marks[66] = "~"
+
+    # 67 wake_up briefing delivered
+    if completed("wake_up_preparation") and "wake_up_window" in phases:
+        marks[67] = "x"
+    elif completed("wake_up_preparation"):
+        marks[67] = "~"
+
+    return marks
+
+
+def _has_user_pipeline_with_tasks(orch: dict[str, Any]) -> bool:
+    pipelines = orch.get("pipeline_instances") or []
+    tasks = orch.get("worker_tasks") or []
+    user_pipeline_ids = {
+        p.get("id")
+        for p in pipelines
+        if p.get("parent_session_id") and p.get("state") in {"running", "completed"}
+    }
+    return any(t.get("pipeline_instance_id") in user_pipeline_ids for t in tasks)
+
+
+def _pipeline_has_cancellation_evidence(
+    pipeline: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    ledger: list[dict[str, Any]],
+) -> bool:
+    pipeline_id = pipeline.get("id")
+    if not pipeline_id:
+        return False
+    pipeline_tasks = [
+        task for task in tasks if task.get("pipeline_instance_id") == pipeline_id
+    ]
+    task_ids = {str(task.get("id")) for task in pipeline_tasks if task.get("id")}
+    if any(
+        task.get("state") == "cancelled"
+        or int(task.get("cancellation_requested") or 0) > 0
+        for task in pipeline_tasks
+    ):
+        return True
+    return any(
+        evt.get("event_type") == "task_cancelled"
+        and (
+            evt.get("pipeline_instance_id") == pipeline_id
+            or str(evt.get("worker_task_id") or "") in task_ids
+        )
+        for evt in ledger
+    )
+
+
+def _cancel_probe_isolated(
+    pipelines: list[dict[str, Any]],
+    tasks: list[dict[str, Any]],
+    ledger: list[dict[str, Any]],
+) -> bool:
+    probe_ids = {
+        str(p.get("id"))
+        for p in pipelines
+        if _is_cancel_probe_pipeline(p)
+    }
+    if not probe_ids:
+        return False
+    probe_cancelled = any(
+        str(p.get("id")) in probe_ids
+        and p.get("state") == "cancelled"
+        for p in pipelines
+    ) or any(
+        task.get("pipeline_instance_id") in probe_ids
+        and (
+            task.get("state") == "cancelled"
+            or int(task.get("cancellation_requested") or 0) > 0
+        )
+        for task in tasks
+    )
+    if not probe_cancelled:
+        return False
+    for pipeline in pipelines:
+        if _is_cancel_probe_pipeline(pipeline):
+            continue
+        if pipeline.get("pipeline_name") == "proactive_research" and (
+            _pipeline_has_cancellation_evidence(pipeline, tasks, ledger)
+            or pipeline.get("state") == "cancelled"
+        ):
+            return False
+    return True
+
+
+def _is_cancel_probe_pipeline(pipeline: dict[str, Any]) -> bool:
+    haystack = " ".join(
+        str(pipeline.get(key) or "").lower()
+        for key in (
+            "id",
+            "pipeline_name",
+            "goal",
+            "working_doc_path",
+        )
+    ).replace("_", "-")
+    return "cancel-probe" in haystack
+
+
+def _deep_idle_housekeeping_marker(orch: dict[str, Any]) -> bool:
+    pipelines = orch.get("pipeline_instances") or []
+    phases = set(orch.get("system_phases_observed") or [])
+    completed_housekeeping = {
+        p.get("pipeline_name")
+        for p in pipelines
+        if p.get("state") == "completed"
+        and p.get("pipeline_name") in {"session_bridge_pruning", "skill_refinement"}
+    }
+    return "deep_idle" in phases and {
+        "session_bridge_pruning",
+        "skill_refinement",
+    }.issubset(completed_housekeeping)
+
+
+def _pipeline_has_substantive_doc(pipeline: dict[str, Any]) -> bool:
+    path_raw = pipeline.get("working_doc_path")
+    if not path_raw:
+        return False
+    path = Path(str(path_raw))
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    try:
+        from kora_v2.runtime.orchestration.working_doc import (
+            parse_frontmatter,
+            parse_sections,
+        )
+
+        _, body = parse_frontmatter(text)
+        sections = parse_sections(body)
+    except Exception:  # noqa: BLE001
+        sections = {}
+
+    def _substantive(value: str | None, *, min_len: int = 8) -> bool:
+        cleaned = re.sub(r"(?m)^#+\s+.*$", "", value or "")
+        cleaned = re.sub(r"(?m)^[-*]\s*$", "", cleaned)
+        return len(cleaned.strip()) >= min_len
+
+    if not sections:
+        lower = text.lower()
+        return (
+            "summary" in lower
+            and "findings" in lower
+            and len(text.strip()) >= 300
+            and "summary`/`findings` are blank" not in lower
+        )
+
+    summary_ok = _substantive(sections.get("Summary"))
+    findings_ok = _substantive(sections.get("Findings"))
+    if summary_ok and findings_ok:
+        return True
+
+    # Older proactive research writes embedded reports as top-level
+    # non-canonical sections after the scaffold. That still represents
+    # substantive user-visible progress, as long as it is not just a
+    # completion ledger line.
+    noncanonical_chunks = [
+        body
+        for name, body in sections.items()
+        if name
+        not in {
+            "Goal",
+            "Summary",
+            "Current Plan",
+            "Findings",
+            "Notes",
+            "Open Questions",
+            "Dead Ends",
+            "Completed Tasks Log",
+            "Completion",
+        }
+    ]
+    noncanonical_text = "\n\n".join(noncanonical_chunks).lower()
+    if not summary_ok and not _substantive(noncanonical_text, min_len=80):
+        return False
+    research_terms = (
+        "research",
+        "finding",
+        "comparison",
+        "approach",
+        "tradeoff",
+        "recommendation",
+        "source verification pending",
+    )
+    return any(term in noncanonical_text for term in research_terms)
+
+
+def _pipeline_has_degraded_research_output(pipeline: dict[str, Any]) -> bool:
+    path_raw = pipeline.get("working_doc_path")
+    if not path_raw:
+        return False
+    path = Path(str(path_raw))
+    try:
+        text = path.read_text(encoding="utf-8").lower()
+    except OSError:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "source verification pending",
+            "candidate to verify",
+            "live search",
+            "search was degraded",
+            "web search was degraded",
+            "could not run live web",
+            "not live scraping",
+        )
+    )
+
+
+def _pipeline_doc_matches_goal(pipeline: dict[str, Any]) -> bool:
+    path_raw = pipeline.get("working_doc_path")
+    if not path_raw:
+        return False
+    path = Path(str(path_raw))
+    try:
+        text = path.read_text(encoding="utf-8").lower()
+    except OSError:
+        return False
+    goal = str(pipeline.get("goal") or "").lower()
+    required_terms = [
+        term for term in (
+            "obsidian",
+            "logseq",
+            "anytype",
+            "local-first",
+            "local first",
+            "privacy",
+        )
+        if term in goal
+    ]
+    if not required_terms:
+        return True
+    hits = sum(1 for term in required_terms if term in text)
+    return hits >= max(1, min(2, len(required_terms)))
+
+
+def _long_autonomous_marker(orch: dict[str, Any]) -> str | None:
+    pipelines = orch.get("pipeline_instances") or []
+    tasks = orch.get("worker_tasks") or []
+    ledger = orch.get("ledger_events") or []
+    long_pipeline_ids = {
+        p.get("id")
+        for p in pipelines
+        if p.get("intent_duration") == "long"
+        and p.get("parent_session_id")
+    }
+    if not long_pipeline_ids:
+        return None
+    completed_long = [
+        p
+        for p in pipelines
+        if p.get("id") in long_pipeline_ids and p.get("state") == "completed"
+    ]
+    clean_completed_long = [
+        p
+        for p in completed_long
+        if not _pipeline_has_cancellation_evidence(p, tasks, ledger)
+    ]
+    if clean_completed_long and any(
+        p.get("pipeline_name") != "proactive_research"
+        or _pipeline_has_substantive_doc(p)
+        for p in clean_completed_long
+    ):
+        return "x"
+    if completed_long:
+        return "~"
+    has_task = any(t.get("pipeline_instance_id") in long_pipeline_ids for t in tasks)
+    has_ledger = any(
+        evt.get("pipeline_instance_id") in long_pipeline_ids
+        and evt.get("event_type") in {
+            "task_started",
+            "task_progress",
+            "task_checkpointed",
+            "task_completed",
+            "pipeline_completed",
+        }
+        for evt in ledger
+    )
+    if has_task and has_ledger:
+        return "~"
+    return None
+
+
 async def _query_autonomous_state() -> dict[str, Any]:
     """Query live autonomous state directly from operational.db.
 
-    Primary source: the ``autonomous_plans`` table written by
-    ``persist_plan`` in the autonomous loop. Some acceptance run
-    configurations wipe ``autonomous_plans`` between harness restarts
-    (see ``_clean_stale_autonomous_data``) so the table can be empty
-    even when a plan genuinely ran — the 2026-04-11 audit hit this.
-    When that happens we synthesise a view from:
-
-      * ``items`` rows whose ``autonomous_plan_id`` is set (root + steps)
-      * ``autonomous_updates`` rows (checkpoint + completion summaries)
-
-    so the report reflects actual work instead of emitting the
-    misleading "no plans recorded in DB" line.
+    Phase 7.5 moved authoritative autonomous state onto the
+    orchestration tables (``pipeline_instances`` + ``worker_tasks`` +
+    ``work_ledger``). This function now prefers those tables and falls
+    back to the retired ``autonomous_plans`` / ``autonomous_updates`` /
+    ``autonomous_checkpoints`` view only when the new tables are empty,
+    so runs that pre-date 7.5 still produce a legible report.
     """
     op_db = _PROJECT_ROOT / "data" / "operational.db"
     if not op_db.exists():
@@ -530,6 +1789,15 @@ async def _query_autonomous_state() -> dict[str, Any]:
                 cur = await db.execute("SELECT COUNT(*) FROM autonomous_checkpoints")
                 row = await cur.fetchone()
                 checkpoint_count = row[0] if row else 0
+            except Exception:
+                pass
+            try:
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM work_ledger "
+                    "WHERE event_type='task_checkpointed'"
+                )
+                row = await cur.fetchone()
+                checkpoint_count = max(checkpoint_count, row[0] if row else 0)
             except Exception:
                 pass
 
@@ -590,24 +1858,113 @@ async def _query_autonomous_state() -> dict[str, Any]:
             except Exception:
                 updates = []
 
-        unified_plans = plans or derived_plans
+        # Phase 7.5 orchestration view — the primary truth source.
+        orchestration_plans: list[dict[str, Any]] = []
+        orchestration_checkpoint_count = 0
+        orchestration_tasks_by_state: dict[str, int] = {}
+        orchestration_events_by_type: dict[str, int] = {}
+        try:
+            async with aiosqlite.connect(str(op_db)) as db:
+                db.row_factory = aiosqlite.Row
+                try:
+                    cur = await db.execute(
+                        """SELECT id, pipeline_name, goal, state,
+                                  started_at,
+                                  COALESCE(updated_at, started_at) AS updated_at,
+                                  completed_at, completion_reason,
+                                  parent_session_id
+                           FROM pipeline_instances
+                           ORDER BY started_at DESC
+                           LIMIT 10"""
+                    )
+                    orchestration_plans = [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    orchestration_plans = []
+
+                try:
+                    cur = await db.execute(
+                        "SELECT COUNT(*) FROM worker_tasks "
+                        "WHERE checkpoint_blob IS NOT NULL"
+                    )
+                    row = await cur.fetchone()
+                    orchestration_checkpoint_count = row[0] if row else 0
+                except Exception:
+                    pass
+
+                try:
+                    cur = await db.execute(
+                        "SELECT state, COUNT(*) AS cnt "
+                        "FROM worker_tasks GROUP BY state"
+                    )
+                    orchestration_tasks_by_state = {
+                        r["state"]: r["cnt"] for r in await cur.fetchall()
+                    }
+                except Exception:
+                    pass
+
+                try:
+                    cur = await db.execute(
+                        "SELECT event_type, COUNT(*) AS cnt "
+                        "FROM work_ledger GROUP BY event_type"
+                    )
+                    orchestration_events_by_type = {
+                        r["event_type"]: r["cnt"] for r in await cur.fetchall()
+                    }
+                except Exception:
+                    pass
+        except Exception:
+            orchestration_plans = []
+
+        # Prefer the Phase 7.5 orchestration view when it has data, so the
+        # report reflects what the dispatcher actually ran. Fall back to
+        # the legacy autonomous_plans view for older runs.
+        if orchestration_plans:
+            unified_plans = [
+                {
+                    "id": p["id"],
+                    "goal": p.get("goal"),
+                    "status": p.get("state"),
+                    "created_at": p.get("started_at"),
+                    "updated_at": p.get("updated_at"),
+                    "completion_reason": p.get("completion_reason"),
+                }
+                for p in orchestration_plans
+            ]
+            plans_source = "pipeline_instances"
+        else:
+            unified_plans = plans or derived_plans
+            plans_source = (
+                "autonomous_plans" if plans else (
+                    "derived_from_items" if derived_plans else "empty"
+                )
+            )
+
         active_plans = [
             p for p in unified_plans
-            if p.get("status") not in ("completed", "cancelled", "failed")
+            if p.get("status") not in (
+                "completed", "cancelled", "failed"
+            )
         ]
 
         return {
             "available": True,
             "plans": unified_plans,
-            "plans_source": "autonomous_plans" if plans else (
-                "derived_from_items" if derived_plans else "empty"
-            ),
+            "plans_source": plans_source,
             "plans_query_error": plans_query_error,
             "active_plan_count": len(active_plans),
-            "checkpoint_count": checkpoint_count,
+            "checkpoint_count": (
+                orchestration_checkpoint_count or checkpoint_count
+            ),
             "total_items": total_items,
             "items_by_status": items_by_status,
             "updates": updates,
+            # Phase 7.5 orchestration fields — authoritative when present.
+            "orchestration": {
+                "pipeline_instances": orchestration_plans,
+                "tasks_by_state": orchestration_tasks_by_state,
+                "events_by_type": orchestration_events_by_type,
+                "checkpoint_count": orchestration_checkpoint_count,
+            },
         }
     except Exception:
         return {"available": False}
@@ -845,12 +2202,37 @@ async def build_report(
     tool_usage = _extract_tool_usage(messages)
     cap_health = await _build_capability_health()
     life_data = await _query_life_management(output_dir)
+    from tests.acceptance.life_os import (
+        collect_life_os_acceptance,
+        render_life_os_acceptance,
+    )
+
+    life_os_summary = collect_life_os_acceptance(
+        _PROJECT_ROOT / "data" / "operational.db",
+        messages=messages,
+        capability_pack_status=cap_health,
+    )
     auto_state = await _query_autonomous_state()
+    run_started_at = session_state.get("started_at")
+    run_started_filter = run_started_at if isinstance(run_started_at, str) else None
+    orch_evidence = await _query_orchestration_evidence(
+        _with_startup_grace(run_started_filter)
+    )
     auth_results = session_state.get("auth_test_results", [])
+    policy_grants = await _query_policy_grants(
+        run_started_filter
+    )
+    auth_evidence = auth_results or policy_grants
     compaction_events_resolved = (
         compaction_events or session_state.get("compaction_events", [])
     )
     latest_status = _latest_snapshot_status(snapshots_dir)
+    latest_benchmark = _latest_benchmark_state(snapshots_dir)
+    current_vault_benchmark = _current_vault_benchmark_state()
+    benchmark_state = {
+        **(latest_benchmark or {}),
+        **(current_vault_benchmark or {}),
+    } or None
 
     # ── Coverage ──────────────────────────────────────────────────────────
     # Merge operator-edited markers from ``coverage.md`` with
@@ -864,8 +2246,13 @@ async def build_report(
         cap_health=cap_health,
         compaction_events=compaction_events_resolved,
         messages=messages,
-        auth_results=auth_results,
+        auth_results=auth_evidence,
         latest_status=latest_status,
+        orch_evidence=orch_evidence,
+        benchmark_state=benchmark_state,
+        error_results=session_state.get("error_recovery_results", []),
+        snapshots_dir=snapshots_dir,
+        skill_gating_check=session_state.get("skill_gating_check", {}),
     )
     from tests.acceptance.scenario.week_plan import COVERAGE_ITEMS, CoverageStatus
 
@@ -878,7 +2265,14 @@ async def build_report(
     auto_applied = 0
     for item_id, item in sorted(active_items.items()):
         operator = operator_markers.get(item_id)
-        if operator in ("x", "~", " "):
+        # Only treat an operator marker as authoritative when it carries
+        # explicit intent ("x" = satisfied, "~" = partial). Blank
+        # markers mean "operator has not edited this row" and should
+        # fall through to the auto-derived evidence instead of
+        # overriding it with an empty cell. The previous behaviour
+        # printed 0/N coverage despite hundreds of auto-derived tool
+        # calls because every template row ships as blank.
+        if operator in ("x", "~"):
             marker = operator
             provenance = ""
         elif item_id in auto_markers:
@@ -897,7 +2291,8 @@ async def build_report(
     lines.append(
         f"\nActive coverage: {active_covered}/{len(active_items)} satisfied"
         f" + {active_partial} partial"
-        f" (auto-derived: {auto_applied}, operator-edited: {len(operator_markers)})"
+        f" (auto-derived: {auto_applied}, operator-edited: "
+        f"{sum(1 for value in operator_markers.values() if value in ('x', '~'))})"
     )
 
     lines.append("\n## Coverage -- Deferred Items")
@@ -906,6 +2301,13 @@ async def build_report(
         lines.append(f"      DEFERRED: {item.deferred_reason}")
 
     lines.append(f"\nDeferred: {len(deferred_items)} items (not tested, awaiting V2 implementation)")
+
+    lines.extend(
+        render_life_os_acceptance(
+            life_os_summary,
+            manual_verification=session_state.get("life_os_manual_verification", {}),
+        )
+    )
 
     # ── Tool Usage Summary ────────────────────────────────────────────────
     lines.append(f"\n## Tool Usage ({tool_usage['total']} calls, {tool_usage['unique']} unique tools)")
@@ -980,15 +2382,20 @@ async def build_report(
         lines.append(line)
 
     # ── Policy Grants ──────────────────────────────────────────────────────
-    # auth_test_results was already read at the top of the function.
-    # Here we count approvals / denials / timeouts for the policy-matrix
-    # enforcement section (Phase 9).
-    approval_prompts = len(auth_results)
-    approved = sum(1 for ar in auth_results if ar.get("approved"))
-    denied = sum(1 for ar in auth_results if not ar.get("approved") and ar.get("approved") is not None)
+    # Prefer durable permission_grants rows for the policy-matrix audit.
+    # The in-memory WebSocket auth test list is used only when the DB has
+    # no rows (for isolated report tests).
+    rendered_grants = policy_grants or auth_results
+    approval_prompts = len(rendered_grants)
+    approved = sum(1 for ar in rendered_grants if ar.get("approved"))
+    denied = sum(
+        1
+        for ar in rendered_grants
+        if not ar.get("approved") and ar.get("approved") is not None
+    )
     timed_out = approval_prompts - approved - denied
 
-    lines.append(f"\n## Policy Grants ({approval_prompts} approval prompts)")
+    lines.append(f"\n## Policy Grants ({approval_prompts} recorded decisions)")
     lines.append(f"- Approved: {approved}")
     lines.append(f"- Denied: {denied}")
     lines.append(f"- Timed out / unknown: {timed_out}")
@@ -1100,10 +2507,10 @@ async def build_report(
         lines.append("No compaction events detected during the test run.")
 
     # ── Auth Test Results (detail log) ───────────────────────────────────────
-    # auth_results was already fetched for the Policy Grants summary above.
-    if auth_results:
-        lines.append(f"\n## Auth Relay Test ({len(auth_results)} events)")
-        for ar in auth_results:
+    # auth_evidence was already fetched for coverage above.
+    if auth_evidence:
+        lines.append(f"\n## Auth Relay Test ({len(auth_evidence)} events)")
+        for ar in auth_evidence:
             ar_status = "APPROVED" if ar.get("approved") else "DENIED"
             lines.append(f"- [{ar_status}] tool={ar.get('tool')} risk={ar.get('risk')} at {ar.get('ts', '?')}")
 

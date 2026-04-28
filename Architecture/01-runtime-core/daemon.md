@@ -464,7 +464,7 @@ The five `work_items.py` factories that existed before 7.5b have all moved into 
 | `session_bridge_pruning` | `session_bridge_pruning` (real step fn) | `interval(3600s, deep_idle)` |
 | `skill_refinement` | `skill_refinement` (real step fn) | `time_of_day(3:00)` |
 
-Only the two housekeeping items at the bottom have real step functions in Slice 7.5b; the rest carry stub steps that the Phase 8 slices will flesh out. See [orchestration.md § 20 core pipelines](orchestration.md#the-20-core-pipelines) for the full catalogue.
+This mapping is historical. Current code wires real Phase 8 memory, vault, proactive, reminder, ADHD-profile, and autonomous handlers into most core pipelines; `in_turn_subagent` is still stubbed, while `session_bridge_pruning` and `skill_refinement` are registered housekeeping no-ops. See [orchestration.md § 20 core pipelines](orchestration.md#the-20-core-pipelines) for the current catalogue.
 
 ### `_check_autonomous_overlap()` — rerouted onto the engine
 
@@ -543,4 +543,4 @@ _websocket_handler()
 - `request_permission()` in `auth_relay.py` is marked deprecated (legacy path); only `request_permission_with_policy()` is used by new callers
 - `_build_working_on()` uses pattern matching rather than LLM extraction to keep session-end latency low — accuracy depends on consistent message phrasing
 - Bridge sidecar JSON is written separately from the YAML; a crash between writes can leave an inconsistent pair — no reconciliation logic currently exists
-- 17 of the 20 core pipelines registered by `register_core_pipelines()` still point at stub step functions; only `session_bridge_pruning`, `skill_refinement`, and `user_autonomous_task` have real bodies in Slice 7.5b (see [orchestration.md](orchestration.md))
+- Current core-pipeline wiring should be read from [orchestration.md](orchestration.md): most Phase 8 handlers are now real, while `in_turn_subagent` remains stubbed and `session_bridge_pruning` / `skill_refinement` are housekeeping no-ops.

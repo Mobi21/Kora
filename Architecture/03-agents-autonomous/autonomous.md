@@ -117,22 +117,23 @@ Any change to this surface requires a migration — the constants are deliberate
 
 ## The 12 graph nodes
 
-`kora_v2/autonomous/graph.py` still defines the twelve node functions as plain async coroutines. The canonical order is pinned by `AUTONOMOUS_NODES` in `pipeline_factory.py`; adding a new node or status requires updating both.
+`kora_v2/autonomous/graph.py` still defines the autonomous node functions as plain async coroutines. `classify_request()` is a first-tick initializer, not one of the canonical `AUTONOMOUS_NODES`. The canonical 12-node order is pinned by `AUTONOMOUS_NODES` in `pipeline_factory.py`; adding a new node or status requires updating both.
 
 | # | Node | What it does | Failure behaviour |
 |---|------|--------------|-------------------|
-| 1 | `classify_request` | Keyword scan of the goal string. Any word in `_ROUTINE_KEYWORDS` sets `mode="routine"`. Generates `plan_id`. Sets `status="planned"`. | Pure function — cannot fail |
-| 2 | `plan` | Calls `container.resolve_worker("planner")` with a `PlanInput`. Stores steps in `state.metadata["steps"]`. **Empty plan is a hard fail** to prevent a tight `plan→plan` loop. | Transitions to `failed` on empty plan or exception |
-| 3 | `persist_plan` | Writes a parent `items` row for the goal and child items for each step. On replan, only inserts new steps not already in `metadata["item_ids"]`. Creates the `autonomous_plans` row on first call. | Transitions to `failed` on any exception (rather than retrying, to avoid an infinite tight loop) |
-| 4 | `execute_step` | Pops the first pending step. Routes to executor / reviewer / memory / research / life_mgmt / screen / ClaudeCodeDelegate based on `step_data["worker"]`. Updates the `items` row to `in_progress` / `completed` / `failed`. | Transitions to `failed` on exception |
-| 5 | `review_step` | Calls the reviewer worker. Computes confidence via `confidence_from_review()`. Stores the result under `state.quality_summary[step_id]`. | Review errors are **non-fatal** — they store a default confidence of 0.5 and continue |
-| 6 | `checkpoint` | Marks a durable boundary by asking the step function to checkpoint the scratch state. Generates fresh `checkpoint_id` + `resume_token` UUIDs. | Cannot fail — it is a no-op on the state machine level |
-| 7 | `reflect` | Pure heuristic decision function (no LLM). Answers five questions in order: (1) all steps done → `complete`; (2) `overlap_score >= 0.70` → `paused_for_overlap`; (3) decision queue non-empty → `decision_request`; (4) average step confidence `< 0.35` and at least one step completed → `replan`; (5) default → `continue` | Pure — cannot fail |
-| 8 | `replan` | Calls the planner again with context about how many steps are done and why replanning fired. Replaces `pending_step_ids`. | Transitions to `failed` on exception |
-| 9 | `decision_request` | Registers a `PendingDecision` with the shared `DecisionManager`. Sets `status="waiting_on_user"` and adds the id to `decision_queue`. | Cannot fail |
-| 10 | `waiting_on_user` | Returns immediately — the step function converts this node into a `paused_for_decision` outcome and the dispatcher keeps the task parked until `record_decision` writes to `open_decisions` | — |
-| 11 | `paused_for_overlap` | Returns immediately — the step function converts this node into a `paused_for_state` outcome with `reason="overlap"`. The dispatcher resumes when `SystemStatePhase` allows | — |
-| 12 | `complete` / `failed` | Updates `autonomous_plans` and the root item to the terminal state. Sets `state.status` accordingly. The step function returns `StepResult(outcome="complete" | "failed")` which the dispatcher interprets as the end of the pipeline instance | — |
+| init | `classify_request` | First-tick initializer. Keyword scan of the goal string. Any word in `_ROUTINE_KEYWORDS` sets `mode="routine"`. Generates `plan_id`. Sets `status="planned"`. | Pure function — cannot fail |
+| 1 | `plan` | Calls `container.resolve_worker("planner")` with a `PlanInput`. Stores steps in `state.metadata["steps"]`. **Empty plan is a hard fail** to prevent a tight `plan→plan` loop. | Transitions to `failed` on empty plan or exception |
+| 2 | `persist_plan` | Writes a parent `items` row for the goal and child items for each step. On replan, only inserts new steps not already in `metadata["item_ids"]`. Creates the `autonomous_plans` row on first call. | Transitions to `failed` on any exception (rather than retrying, to avoid an infinite tight loop) |
+| 3 | `execute_step` | Pops the first pending step. Routes to executor / reviewer / memory / research / life_mgmt / screen / ClaudeCodeDelegate based on `step_data["worker"]`. Updates the `items` row to `in_progress` / `completed` / `failed`. | Transitions to `failed` on exception |
+| 4 | `review_step` | Calls the reviewer worker. Computes confidence via `confidence_from_review()`. Stores the result under `state.quality_summary[step_id]`. | Review errors are **non-fatal** — they store a default confidence of 0.5 and continue |
+| 5 | `checkpoint` | Marks a durable boundary by asking the step function to checkpoint the scratch state. Generates fresh `checkpoint_id` + `resume_token` UUIDs. | Cannot fail — it is a no-op on the state machine level |
+| 6 | `reflect` | Pure heuristic decision function (no LLM). Answers five questions in order: (1) all steps done → `complete`; (2) `overlap_score >= 0.70` → `paused_for_overlap`; (3) decision queue non-empty → `decision_request`; (4) average step confidence `< 0.35` and at least one step completed → `replan`; (5) default → `continue` | Pure — cannot fail |
+| 7 | `replan` | Calls the planner again with context about how many steps are done and why replanning fired. Replaces `pending_step_ids`. | Transitions to `failed` on exception |
+| 8 | `decision_request` | Registers a `PendingDecision` with the shared in-memory `DecisionManager`. Sets `status="waiting_on_user"` and adds the id to `decision_queue`. Current acceptance does not prove this path writes `open_decisions`. | Cannot fail |
+| 9 | `waiting_on_user` | Returns immediately — the step function converts this node into a `paused_for_decision` outcome and the dispatcher keeps the task parked until a decision is resolved. | — |
+| 10 | `paused_for_overlap` | Returns immediately — the step function converts this node into a `paused_for_state` outcome with `reason="overlap"`. The dispatcher resumes when `SystemStatePhase` allows | — |
+| 11 | `complete` | Updates `autonomous_plans` and the root item to the terminal completed state. | — |
+| 12 | `failed` | Updates `autonomous_plans` and the root item to the terminal failed state. | — |
 
 ### `route_next_node(state) → str`
 
@@ -314,7 +315,7 @@ The 10-row parity contract is pinned by `tests/integration/orchestration/test_pr
 | # | Preserved behaviour | Asserted by |
 |---|---------------------|-------------|
 | 1 | 12-node sequence and names | `live_graph_node_names() == AUTONOMOUS_NODES` |
-| 2 | 14-value `AutonomousState.status` enum | Field literal on the Pydantic model |
+| 2 | 12-value `AutonomousState.status` enum | Field literal on the Pydantic model |
 | 3 | `classify_request` routine keyword detection | Golden-case test with routine vs task goals |
 | 4 | `reflect` five-question heuristic (order matters) | Golden-case state transitions |
 | 5 | Same-node watchdog at 5 repeats | Inject a stuck state, assert terminal `failed` |

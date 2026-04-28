@@ -226,6 +226,28 @@ class TestBuildDynamicSuffix:
         suffix = build_dynamic_suffix(state)
         assert "## Remember" not in suffix
 
+    def test_dynamic_suffix_renders_prefetched_orchestration_tasks(self) -> None:
+        state = {
+            "turn_count": 3,
+            "session_id": "s",
+            "_orchestration_tasks": [
+                {
+                    "stage": "research",
+                    "state": "completed",
+                    "goal": "local-first productivity tools",
+                    "result_summary": "report written with 5 sources",
+                }
+            ],
+        }
+
+        suffix = build_dynamic_suffix(state)
+
+        assert "## Relevant Background Work" in suffix
+        assert "Mention completed/failed items" in suffix
+        assert "research: completed" in suffix
+        assert "local-first productivity tools" in suffix
+        assert "report written with 5 sources" in suffix
+
     def test_dynamic_suffix_object_emotional_state(self) -> None:
         """Supports object-style (non-dict) emotional state."""
         class EmotionObj:

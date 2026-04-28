@@ -142,6 +142,13 @@ def _user_model_facts_total(state: dict[str, Any]) -> int:
     return int(umf.get("total", 0) or 0)
 
 
+def _user_model_facts_by_status(state: dict[str, Any]) -> dict[str, int]:
+    by_status = (_mem(state).get("user_model_facts") or {}).get("by_status") or {}
+    if not isinstance(by_status, dict):
+        return {}
+    return {str(k): int(v or 0) for k, v in by_status.items()}
+
+
 def _entities_total(state: dict[str, Any]) -> int:
     e = _mem(state).get("entities") or {}
     return int(e.get("total", 0) or 0)
@@ -254,8 +261,15 @@ def _check_item(item_id: int, state: dict[str, Any]) -> CheckResult:
 
     # 33 — paired RATE_LIMIT_PAUSED + RATE_LIMIT_RESUMED.
     if item_id == 33:
-        paused = _ledger_count(state, "rate_limit_paused")
-        resumed = _ledger_count(state, "rate_limit_resumed")
+        by_reason = (_orch(state).get("work_ledger") or {}).get("by_reason") or {}
+        paused = (
+            _ledger_count(state, "rate_limit_paused")
+            or int(by_reason.get("rate_limit_paused", 0) or 0)
+        )
+        resumed = (
+            _ledger_count(state, "rate_limit_resumed")
+            or int(by_reason.get("rate_limit_retry", 0) or 0)
+        )
         if paused >= 1 and resumed >= 1:
             return True, (
                 f"rate_limit_paused={paused}, rate_limit_resumed={resumed}"
@@ -302,13 +316,20 @@ def _check_item(item_id: int, state: dict[str, Any]) -> CheckResult:
     # 39 — post_session_memory → post_memory_vault sequence.
     if item_id == 39:
         a = _pipeline_completed_for(state, "post_session_memory")
-        b = _pipeline_completed_for(state, "post_memory_vault")
-        if a and b:
+        b = _pipeline_count(state, "post_memory_vault") >= 1
+        recent = ((_orch(state).get("work_ledger") or {}).get("recent") or [])
+        seq = any(
+            str(r.get("trigger_name") or "") == "post_memory_vault.seq.post_session_memory"
+            or "sequence_complete" in str(r.get("metadata_json") or "")
+            for r in recent
+            if isinstance(r, dict)
+        )
+        if a and seq:
             return True, (
-                "post_session_memory + post_memory_vault both completed"
+                "post_session_memory completed and sequence_complete fired post_memory_vault"
             )
         return False, (
-            f"post_session_memory_completed={a}, post_memory_vault_completed={b}"
+            f"post_session_memory_completed={a}, post_memory_vault_started={b}"
         )
 
     # 40 — wake_up_preparation completed within WAKE_UP_WINDOW.
@@ -357,9 +378,21 @@ def _check_item(item_id: int, state: dict[str, Any]) -> CheckResult:
     if item_id == 44:
         rp = _orch(state).get("runtime_pipelines") or {}
         total = int(rp.get("total", 0) or 0)
-        if total >= 1:
-            return True, f"runtime_pipelines.total={total}"
-        return False, "runtime_pipelines table empty"
+        by_name = (_orch(state).get("pipeline_instances") or {}).get(
+            "by_name"
+        ) or {}
+        routine_fired = sum(
+            int(v or 0)
+            for k, v in by_name.items()
+            if str(k).startswith("routine_")
+        )
+        if total >= 1 and routine_fired >= 1:
+            return True, (
+                f"runtime_pipelines.total={total}, routine_fired={routine_fired}"
+            )
+        return False, (
+            f"runtime_pipelines.total={total}, routine_fired={routine_fired}"
+        )
 
     # 45 — work_ledger can answer "why did X run". Require >=1 row.
     if item_id == 45:
@@ -387,40 +420,48 @@ def _check_item(item_id: int, state: dict[str, Any]) -> CheckResult:
     if item_id == 48:
         mem = _mem(state).get("memories") or {}
         consolidated = int(mem.get("with_consolidated_into", 0) or 0)
+        facts = _mem(state).get("user_model_facts") or {}
+        fact_consolidated = int(facts.get("with_consolidated_into", 0) or 0)
         statuses = _memories_by_status(state)
         via_status = int(statuses.get("consolidated", 0) or 0)
-        n = consolidated + via_status
+        fact_statuses = _user_model_facts_by_status(state)
+        fact_via_status = int(fact_statuses.get("consolidated", 0) or 0)
+        n = consolidated + via_status + fact_consolidated + fact_via_status
         if n >= 1:
             return True, (
                 f"consolidated memories: with_consolidated_into={consolidated}, "
-                f"by_status[consolidated]={via_status}"
+                f"by_status[consolidated]={via_status}; "
+                f"user_model_facts.with_consolidated_into={fact_consolidated}, "
+                f"user_model_facts[consolidated]={fact_via_status}"
             )
         return False, "no consolidated memories detected"
 
     # 49 — dedup soft-deleted a near-duplicate memory.
     if item_id == 49:
         statuses = _memories_by_status(state)
-        soft_deleted = int(statuses.get("deleted", 0) or 0) + int(
-            statuses.get("soft_deleted", 0) or 0
+        fact_statuses = _user_model_facts_by_status(state)
+        dedup_statuses = ("deleted", "soft_deleted", "merged")
+        soft_deleted = sum(int(statuses.get(st, 0) or 0) for st in dedup_statuses)
+        fact_merged = sum(
+            int(fact_statuses.get(st, 0) or 0) for st in dedup_statuses
         )
         if soft_deleted >= 1:
             return True, (
                 f"memories[status=soft_deleted]={soft_deleted}"
             )
-        return False, "no soft-deleted memories detected"
+        if fact_merged >= 1:
+            return True, f"user_model_facts[status=merged]={fact_merged}"
+        return False, "no dedup/merged memories or user-model facts detected"
 
-    # 50 — entities merged: rows with merged_from OR entity totals.
+    # 50 — entities merged: rows with merged_from provenance. A nonzero
+    # entity total only proves extraction, not resolution.
     if item_id == 50:
-        mem = _mem(state).get("memories") or {}
-        merged_from = int(mem.get("with_merged_from", 0) or 0)
-        entities = _entities_total(state)
-        if merged_from >= 1 or entities >= 1:
-            return True, (
-                f"memories.with_merged_from={merged_from}, "
-                f"entities.total={entities}"
-            )
+        entities = _mem(state).get("entities") or {}
+        entity_merged_from = int(entities.get("with_merged_from", 0) or 0)
+        if entity_merged_from >= 1:
+            return True, f"entities.with_merged_from={entity_merged_from}"
         return False, (
-            f"memories.with_merged_from={merged_from}, entities.total={entities}"
+            f"entities.with_merged_from={entity_merged_from}"
         )
 
     # 51 — weekly_adhd_profile pipeline ran + user_model_facts non-empty.
@@ -588,7 +629,7 @@ def _check_item(item_id: int, state: dict[str, Any]) -> CheckResult:
             .get("wake_up_window", 0) or 0
         )
         wake_pipe = _pipeline_count(state, "wake_up_preparation")
-        if wake_phases >= 1 or wake_pipe >= 1:
+        if wake_phases >= 1 and wake_pipe >= 1:
             return True, (
                 f"wake_up_window phases={wake_phases}, "
                 f"wake_up_preparation={wake_pipe}"

@@ -125,6 +125,7 @@ BOUNDED_BACKGROUND = WorkerTaskConfig(
     request_class=RequestClass.BACKGROUND,
     allowed_states=frozenset(
         {
+            SystemStatePhase.ACTIVE_IDLE,
             SystemStatePhase.LIGHT_IDLE,
             SystemStatePhase.DEEP_IDLE,
             SystemStatePhase.WAKE_UP_WINDOW,
@@ -148,6 +149,7 @@ LONG_BACKGROUND = WorkerTaskConfig(
     request_class=RequestClass.BACKGROUND,
     allowed_states=frozenset(
         {
+            SystemStatePhase.ACTIVE_IDLE,
             SystemStatePhase.LIGHT_IDLE,
             SystemStatePhase.DEEP_IDLE,
             SystemStatePhase.WAKE_UP_WINDOW,

@@ -22,6 +22,7 @@ import json
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # pysqlite3 monkey-patch
@@ -533,6 +534,66 @@ class TestLinksStep:
         entity_files = list(entity_dir.glob("*.md"))
         assert len(entity_files) >= 1
 
+    @pytest.mark.asyncio
+    async def test_backfills_entity_pages_without_pending_notes(
+        self, tmp_path: Path
+    ) -> None:
+        from kora_v2.memory.projection import EntityRecord, EntityRelationship, MemoryRecord
+
+        mock_entity = EntityRecord(
+            id="ent-1",
+            name="Sarah",
+            canonical_name="sarah",
+            entity_type="person",
+            active_link_count=1,
+            first_mention="2025-01-01",
+            last_mention="2025-06-01",
+        )
+        mock_memory = MemoryRecord(
+            id="note-001",
+            content="I met Sarah at the park.",
+            memory_type="episodic",
+            created_at="2025-01-01",
+        )
+        mock_relationship = EntityRelationship(
+            entity_id="ent-2",
+            entity_name="John",
+            co_occurrence_count=2,
+        )
+
+        container = MagicMock()
+        container.projection_db = AsyncMock()
+        container.projection_db.get_entities_by_type = AsyncMock(
+            side_effect=lambda t: [mock_entity] if t == "person" else []
+        )
+        container.projection_db.get_memories_by_entity = AsyncMock(
+            return_value=[mock_memory]
+        )
+        container.projection_db.get_entity_relationships = AsyncMock(
+            return_value=[mock_relationship]
+        )
+        container.memory_store = MagicMock()
+        container.memory_store._base = tmp_path
+        container.memory_store.read_note = AsyncMock(return_value=None)
+        container.memory_store.update_body = AsyncMock()
+
+        with patch(
+            "kora_v2.agents.background.vault_organizer_handlers.get_autonomous_context"
+        ) as mock_ctx:
+            mock_ctx.return_value = MagicMock(container=container, db_path=tmp_path / "op.db")
+
+            task = _make_task("links")
+            ctx = _make_ctx(task)
+            result = await links_step(task, ctx)
+
+        assert result.outcome == "complete"
+        entity_file = tmp_path / "Entities" / "People" / "Sarah.md"
+        assert entity_file.is_file()
+        page = entity_file.read_text(encoding="utf-8")
+        assert "[[note-001]]" in page
+        assert "[[John]]" in page
+        assert "First mentioned" in page
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # MOC & Sessions step
@@ -651,6 +712,68 @@ class TestMocSessionsStep:
             assert len(moc_files) == 0
 
     @pytest.mark.asyncio
+    async def test_regenerates_overview_moc_when_total_threshold_met(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        container = MagicMock()
+        container.projection_db = AsyncMock()
+
+        mock_cursor_type = AsyncMock()
+        mock_cursor_type.fetchall = AsyncMock(return_value=[
+            ("episodic", 3),
+        ])
+        mock_cursor_domain = AsyncMock()
+        mock_cursor_domain.fetchall = AsyncMock(return_value=[
+            ("identity", 2),
+        ])
+        mock_cursor_notes = AsyncMock()
+        mock_cursor_notes.fetchall = AsyncMock(return_value=[
+            ("note-1", "Content about memory 1", 0.8, "2025-01-01"),
+            ("note-2", "Content about memory 2", 0.6, "2025-01-02"),
+            ("note-3", "Content about memory 3", 0.9, "2025-01-03"),
+        ])
+        mock_cursor_facts = AsyncMock()
+        mock_cursor_facts.fetchall = AsyncMock(return_value=[
+            ("fact-1", "Jordan uses local-first tools", 0.9, "2025-01-04"),
+            ("fact-2", "Jordan prefers low maintenance", 0.8, "2025-01-05"),
+        ])
+
+        async def mock_execute(query, *args):
+            if "GROUP BY memory_type" in query:
+                return mock_cursor_type
+            if "GROUP BY domain" in query:
+                return mock_cursor_domain
+            if "FROM memories" in query and "ORDER BY" in query:
+                return mock_cursor_notes
+            if "FROM user_model_facts" in query and "ORDER BY" in query:
+                return mock_cursor_facts
+            m = AsyncMock()
+            m.fetchall = AsyncMock(return_value=[])
+            return m
+
+        container.projection_db._db = AsyncMock()
+        container.projection_db._db.execute = mock_execute
+        container.memory_store = MagicMock()
+        container.memory_store._base = tmp_path
+
+        with patch(
+            "kora_v2.agents.background.vault_organizer_handlers.get_autonomous_context"
+        ) as mock_ctx:
+            mock_ctx.return_value = MagicMock(
+                container=container,
+                db_path=tmp_path / "op.db",
+            )
+
+            task = _make_task("moc_sessions")
+            ctx = _make_ctx(task)
+            result = await moc_sessions_step(task, ctx)
+
+        assert result.outcome == "complete"
+        moc_file = tmp_path / "Maps of Content" / "MOC - Overview.md"
+        assert moc_file.exists()
+
+    @pytest.mark.asyncio
     async def test_session_mirror_creates_notes(self, tmp_path: Path) -> None:
         # Create a bridge file
         bridges_dir = tmp_path / ".kora" / "bridges"
@@ -699,6 +822,117 @@ class TestMocSessionsStep:
         # Session index should exist
         index_file = tmp_path / "Sessions" / "index.md"
         assert index_file.is_file()
+
+    @pytest.mark.asyncio
+    async def test_session_mirror_reads_markdown_bridges(
+        self, tmp_path: Path
+    ) -> None:
+        bridges_dir = tmp_path / ".kora" / "bridges"
+        bridges_dir.mkdir(parents=True, exist_ok=True)
+        bridge = bridges_dir / "20250615_143000_session-002.md"
+        bridge.write_text(
+            "---\n"
+            "session_id: session-002\n"
+            "created_at: '2025-06-15T14:30:00+00:00'\n"
+            "open_threads:\n"
+            "  - finish PR review\n"
+            "emotional_trajectory: focused -> tired\n"
+            "---\n\n"
+            "# Session: session-002\n"
+            "We planned the next implementation pass.\n",
+            encoding="utf-8",
+        )
+
+        container = MagicMock()
+        container.projection_db = AsyncMock()
+
+        async def mock_execute(query, *args):
+            m = AsyncMock()
+            m.fetchall = AsyncMock(return_value=[])
+            return m
+
+        container.projection_db._db = AsyncMock()
+        container.projection_db._db.execute = mock_execute
+        container.memory_store = MagicMock()
+        container.memory_store._base = tmp_path
+
+        with patch(
+            "kora_v2.agents.background.vault_organizer_handlers.get_autonomous_context"
+        ) as mock_ctx:
+            mock_ctx.return_value = MagicMock(
+                container=container,
+                db_path=tmp_path / "op.db",
+            )
+
+            task = _make_task("moc_sessions")
+            ctx = _make_ctx(task)
+            result = await moc_sessions_step(task, ctx)
+
+        assert result.outcome == "complete"
+        sessions_dir = tmp_path / "Sessions" / "2025" / "06"
+        session_files = list(sessions_dir.glob("*.md"))
+        assert session_files
+        assert (tmp_path / "Sessions" / "index.md").is_file()
+
+    @pytest.mark.asyncio
+    async def test_session_mirror_uses_runtime_memory_root(
+        self, tmp_path: Path
+    ) -> None:
+        runtime_root = tmp_path / "runtime_memory"
+        legacy_root = tmp_path / "legacy_memory"
+        bridges_dir = runtime_root / ".kora" / "bridges"
+        bridges_dir.mkdir(parents=True, exist_ok=True)
+        bridge = bridges_dir / "20250615_143000_session-runtime.md"
+        bridge.write_text(
+            "---\n"
+            "session_id: session-runtime\n"
+            "created_at: '2025-06-15T14:30:00+00:00'\n"
+            "summary: Runtime bridge summary\n"
+            "open_threads:\n"
+            "  - finish PR review\n"
+            "emotional_trajectory: focused -> tired\n"
+            "---\n\n"
+            "Runtime bridge body.\n",
+            encoding="utf-8",
+        )
+
+        container = MagicMock()
+        container.settings = SimpleNamespace(
+            memory=SimpleNamespace(kora_memory_path=str(runtime_root))
+        )
+        container.projection_db = AsyncMock()
+
+        async def mock_execute(query, *args):
+            m = AsyncMock()
+            m.fetchall = AsyncMock(return_value=[])
+            return m
+
+        container.projection_db._db = AsyncMock()
+        container.projection_db._db.execute = mock_execute
+        container.memory_store = MagicMock()
+        container.memory_store._base = legacy_root
+
+        with patch(
+            "kora_v2.agents.background.vault_organizer_handlers.get_autonomous_context"
+        ) as mock_ctx:
+            mock_ctx.return_value = MagicMock(
+                container=container,
+                db_path=tmp_path / "op.db",
+            )
+
+            task = _make_task("moc_sessions")
+            ctx = _make_ctx(task)
+            result = await moc_sessions_step(task, ctx)
+
+        assert result.outcome == "complete"
+        runtime_index = runtime_root / "Sessions" / "index.md"
+        assert runtime_index.is_file()
+        assert not (legacy_root / "Sessions" / "index.md").exists()
+
+        session_files = list((runtime_root / "Sessions" / "2025" / "06").glob("*.md"))
+        assert session_files
+        session_note = session_files[0].read_text(encoding="utf-8")
+        assert "Runtime bridge summary" in session_note
 
 
 # ══════════════════════════════════════════════════════════════════════════

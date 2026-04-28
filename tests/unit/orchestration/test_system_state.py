@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
 from datetime import UTC, datetime, time, timedelta
 
+import kora_v2.runtime.orchestration.system_state as system_state_module
 from kora_v2.runtime.orchestration.system_state import (
     SystemStateMachine,
     SystemStatePhase,
@@ -98,3 +100,21 @@ def test_dst_safe_timezone_conversion() -> None:
         SystemStatePhase.WAKE_UP_WINDOW,
         SystemStatePhase.DEEP_IDLE,
     }
+
+
+def test_idle_thresholds_can_be_shortened_for_acceptance(monkeypatch) -> None:
+    monkeypatch.setenv("KORA_ORCHESTRATION_ACTIVE_IDLE_SECONDS", "2")
+    monkeypatch.setenv("KORA_ORCHESTRATION_LIGHT_IDLE_SECONDS", "4")
+    try:
+        module = importlib.reload(system_state_module)
+        machine = module.SystemStateMachine(module.UserScheduleProfile(timezone="UTC"))
+        t_end = datetime(2026, 4, 14, 12, 0, 0, tzinfo=UTC)
+        machine.note_session_end(t_end)
+
+        assert machine.current_phase(t_end + timedelta(seconds=1)) is module.SystemStatePhase.ACTIVE_IDLE
+        assert machine.current_phase(t_end + timedelta(seconds=3)) is module.SystemStatePhase.LIGHT_IDLE
+        assert machine.current_phase(t_end + timedelta(seconds=5)) is module.SystemStatePhase.DEEP_IDLE
+    finally:
+        monkeypatch.delenv("KORA_ORCHESTRATION_ACTIVE_IDLE_SECONDS", raising=False)
+        monkeypatch.delenv("KORA_ORCHESTRATION_LIGHT_IDLE_SECONDS", raising=False)
+        importlib.reload(system_state_module)

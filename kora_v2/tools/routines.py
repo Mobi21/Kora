@@ -9,6 +9,9 @@ and PEP 563 (stringified annotations) breaks issubclass(input_type, BaseModel).
 """
 
 import json
+import re
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -37,11 +40,60 @@ def _get_routine_manager(container: Any):
     return getattr(container, "routine_manager", None)
 
 
+def _active_session_id(container: Any) -> str | None:
+    session_mgr = getattr(container, "session_manager", None)
+    active = getattr(session_mgr, "active_session", None)
+    session_id = getattr(active, "session_id", None)
+    return str(session_id) if session_id else None
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return slug or f"routine_{uuid.uuid4().hex[:8]}"
+
+
+async def _register_runtime_pipeline_for_routine(
+    routine_id: str,
+    container: Any,
+) -> str | None:
+    mgr = _get_routine_manager(container)
+    engine = getattr(container, "orchestration_engine", None)
+    if mgr is None or engine is None:
+        return None
+    routine = await mgr.get_routine(routine_id)
+    if routine is None:
+        return None
+    try:
+        from kora_v2.life.routines import register_routine_pipeline
+
+        pipeline = await register_routine_pipeline(routine, engine)
+        return pipeline.name
+    except Exception as exc:
+        log.warning(
+            "routine_pipeline_register_failed",
+            routine_id=routine_id,
+            error=str(exc),
+        )
+        return None
+
+
 # ── Input models ─────────────────────────────────────────────────────────────
 
 
 class ListRoutinesInput(BaseModel):
     tags: str = Field("", description="Comma-separated tags to filter by (empty = all)")
+
+
+class CreateRoutineInput(BaseModel):
+    name: str = Field(..., description="Human-readable routine name")
+    description: str = Field("", description="Short routine purpose")
+    steps: list[str] = Field(..., description="Ordered routine step titles")
+    routine_id: str = Field("", description="Optional stable routine template ID")
+    tags: str = Field("", description="Comma-separated routine tags")
+    low_energy_steps: list[str] = Field(
+        default_factory=list,
+        description="Optional reduced step list for low-energy days",
+    )
 
 
 class StartRoutineInput(BaseModel):
@@ -61,6 +113,106 @@ class RoutineProgressInput(BaseModel):
 
 
 # ── Tool implementations ─────────────────────────────────────────────────────
+
+
+@tool(
+    name="create_routine",
+    description=(
+        "Create or persist a reusable guided routine template from ordered "
+        "steps, then register its runtime pipeline so it can fire later."
+    ),
+    category=ToolCategory.LIFE_MANAGEMENT,
+    auth_level=AuthLevel.ASK_FIRST,
+    is_read_only=False,
+)
+async def create_routine(input: CreateRoutineInput, container: Any) -> str:
+    """Create a routine template and register its runtime pipeline."""
+    mgr = _get_routine_manager(container)
+    if mgr is None:
+        return _err("Routine manager not available")
+
+    step_titles = [s.strip() for s in input.steps if str(s).strip()]
+    if not step_titles:
+        return _err("routine requires at least one step")
+
+    try:
+        from kora_v2.life.routines import Routine, RoutineStep, RoutineVariant
+
+        now = datetime.now(UTC)
+        routine_id = input.routine_id.strip() or _slug(input.name)
+
+        def make_steps(titles: list[str]) -> list[RoutineStep]:
+            return [
+                RoutineStep(
+                    index=i,
+                    title=title,
+                    description=title,
+                    estimated_minutes=5,
+                    energy_required="low" if len(titles) <= 3 else "medium",
+                    skippable=True,
+                    cue=title,
+                )
+                for i, title in enumerate(titles)
+            ]
+
+        standard_steps = make_steps(step_titles)
+        low_energy = None
+        le_titles = [
+            s.strip() for s in input.low_energy_steps if str(s).strip()
+        ]
+        if le_titles:
+            le_steps = make_steps(le_titles)
+            low_energy = RoutineVariant(
+                name="low_energy",
+                steps=le_steps,
+                estimated_total_minutes=sum(s.estimated_minutes for s in le_steps),
+            )
+
+        routine = Routine(
+            id=routine_id,
+            name=input.name.strip(),
+            description=input.description.strip(),
+            standard=RoutineVariant(
+                name="standard",
+                steps=standard_steps,
+                estimated_total_minutes=sum(
+                    s.estimated_minutes for s in standard_steps
+                ),
+            ),
+            low_energy=low_energy,
+            tags=[t.strip() for t in input.tags.split(",") if t.strip()],
+            created_at=now,
+            updated_at=now,
+        )
+        created_new = True
+        try:
+            await mgr.create_routine(routine)
+        except Exception as exc:
+            if "UNIQUE constraint failed" not in str(exc):
+                raise
+            existing = await mgr.get_routine(routine_id)
+            if existing is None:
+                raise
+            routine = existing
+            created_new = False
+        pipeline_name = await _register_runtime_pipeline_for_routine(
+            routine.id, container
+        )
+        return _ok({
+            "status": "created" if created_new else "existing",
+            "routine_id": routine.id,
+            "name": routine.name,
+            "step_count": len(routine.standard.steps),
+            "runtime_pipeline": pipeline_name,
+            "runtime_pipeline_registered": bool(pipeline_name),
+            "message": (
+                "Routine template ready and runtime pipeline registered: "
+                f"{pipeline_name}"
+            ),
+        })
+    except Exception as exc:
+        log.warning("create_routine.error", error=str(exc))
+        return _err(f"failed to create routine: {exc}")
 
 
 @tool(
@@ -123,18 +275,24 @@ async def start_routine(input: StartRoutineInput, container: Any) -> str:
             routine_id=input.routine_id,
             session_id=input.session_id,
             variant=input.variant,
+            parent_session_id=_active_session_id(container),
+        )
+        pipeline_name = await _register_runtime_pipeline_for_routine(
+            input.routine_id, container
         )
         log.info(
             "start_routine.ok",
             session_id=session.session_id,
             routine_id=input.routine_id,
             variant=session.variant,
+            runtime_pipeline=pipeline_name,
         )
         return _ok({
             "status": "started",
             "session_id": session.session_id,
             "routine_id": session.routine_id,
             "variant": session.variant,
+            "runtime_pipeline": pipeline_name,
             "message": f"Routine session started ({session.variant} variant)",
         })
     except Exception as exc:

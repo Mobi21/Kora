@@ -127,12 +127,21 @@ async def _llm_call(container: Any, system: str, user: str) -> str:
     if llm is None:
         raise RuntimeError("LLM provider not available on container")
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-
-    response = await llm.chat(messages)
+    chat = getattr(llm, "chat", None)
+    if callable(chat):
+        response = await chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+        )
+    else:
+        response = await llm.generate(
+            [{"role": "user", "content": user}],
+            system_prompt=system,
+            temperature=0.2,
+            max_tokens=2000,
+        )
 
     # Handle various response shapes from the provider
     if isinstance(response, str):
@@ -142,6 +151,71 @@ async def _llm_call(container: Any, system: str, user: str) -> str:
     if hasattr(response, "content"):
         return str(response.content)
     return str(response)
+
+
+def _deterministic_consolidation(note_contents: list[str]) -> str:
+    """Build a fact-preserving consolidation when the model over-shrinks."""
+    sections: list[str] = [
+        "Consolidated memory preserving the source notes verbatim."
+    ]
+    seen: set[str] = set()
+    for idx, content in enumerate(note_contents, start=1):
+        body = content.strip()
+        if not body or body in seen:
+            continue
+        seen.add(body)
+        sections.append(f"## Source Note {idx}\n\n{body}")
+    return "\n\n".join(sections)
+
+
+_RELATIONSHIP_ALIAS_CANONICAL_NAMES = {"partner", "roommate"}
+
+
+def _is_relationship_alias_entity(entity: dict) -> bool:
+    canonical = str(
+        entity.get("canonical_name") or entity.get("name") or ""
+    ).strip().lower()
+    return canonical in _RELATIONSHIP_ALIAS_CANONICAL_NAMES
+
+
+def _is_relationship_alias_pair(e1: dict, e2: dict) -> bool:
+    if e1.get("entity_type") != "person" or e2.get("entity_type") != "person":
+        return False
+    return _is_relationship_alias_entity(e1) != _is_relationship_alias_entity(e2)
+
+
+def _relationship_alias_context_confirms(
+    e1: dict,
+    e2: dict,
+    context_a: str,
+    context_b: str,
+) -> bool:
+    """Confirm relation aliases when source facts explicitly co-mention both.
+
+    Entity rows such as ``partner`` and ``roommate`` are aliases, not separate
+    people, when their linked facts also name the person. Those pairs do not
+    pass fuzzy-name matching, so the entity stage handles the deterministic
+    co-reference case before falling back to the LLM.
+    """
+    if not _is_relationship_alias_pair(e1, e2):
+        return False
+    alias = e1 if _is_relationship_alias_entity(e1) else e2
+    named = e2 if alias is e1 else e1
+    alias_key = str(alias.get("canonical_name") or alias.get("name")).lower()
+    named_key = str(named.get("canonical_name") or named.get("name")).lower()
+    combined = f"{context_a}\n{context_b}".lower()
+    return alias_key in combined and named_key in combined
+
+
+def _choose_entity_merge_target(e1: dict, e2: dict) -> tuple[dict, dict]:
+    """Return ``(target, source)`` for an entity merge."""
+    e1_alias = _is_relationship_alias_entity(e1)
+    e2_alias = _is_relationship_alias_entity(e2)
+    if e1_alias != e2_alias:
+        return (e2, e1) if e1_alias else (e1, e2)
+    if e1["link_count"] >= e2["link_count"]:
+        return e1, e2
+    return e2, e1
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -269,6 +343,7 @@ async def extract_step(
                                     content=fact["content"],
                                     domain=fact.get("domain", "identity"),
                                     importance=fact["importance"],
+                                    entity_hints=fact.get("entities", []),
                                     skip_dedup=False,
                                 )
                             else:
@@ -277,6 +352,7 @@ async def extract_step(
                                     memory_type=memory_type,
                                     importance=fact["importance"],
                                     tags=fact.get("tags", []),
+                                    entity_hints=fact.get("entities", []),
                                     skip_dedup=False,
                                 )
                             extracted_count += 1
@@ -331,7 +407,9 @@ async def extract_step(
                         ("failed", now, "transcript processing failed", sig["id"]),
                     )
                 elif sig_session not in batch_session_ids:
-                    # Transcript not in this batch — revert to pending
+                    # Transcript not in this batch — leave pending so a later
+                    # extract invocation can process it when its transcript is
+                    # within MAX_TRANSCRIPTS_PER_INVOCATION.
                     await db.execute(
                         "UPDATE signal_queue SET status = 'pending' "
                         "WHERE id = ?",
@@ -431,12 +509,24 @@ async def consolidate_step(
                 shrinkage = compute_shrinkage(note_contents, consolidated_text)
                 if shrinkage > SHRINKAGE_REJECTION_THRESHOLD:
                     log.warning(
-                        "consolidation_rejected_shrinkage",
+                        "consolidation_shrinkage_fallback",
                         shrinkage=f"{shrinkage:.2f}",
                         note_ids=note_ids,
                     )
-                    rejected_count += 1
-                    continue
+                    consolidated_text = _deterministic_consolidation(
+                        note_contents
+                    )
+                    fallback_shrinkage = compute_shrinkage(
+                        note_contents, consolidated_text
+                    )
+                    if fallback_shrinkage > SHRINKAGE_REJECTION_THRESHOLD:
+                        log.warning(
+                            "consolidation_rejected_shrinkage",
+                            shrinkage=f"{fallback_shrinkage:.2f}",
+                            note_ids=note_ids,
+                        )
+                        rejected_count += 1
+                        continue
 
                 # Store consolidated note
                 first_record = group.records[0]
@@ -547,20 +637,28 @@ async def dedup_step(
                 if note_a is None or note_b is None:
                     continue
 
-                # LLM confirmation
-                user_prompt = DEDUP_USER_TEMPLATE.format(
-                    note_a=note_a.body[:2000],
-                    note_b=note_b.body[:2000],
-                )
-                response_text = await _llm_call(
-                    container, DEDUP_SYSTEM_PROMPT, user_prompt
-                )
-                request_count += 1
+                body_a = " ".join(note_a.body.lower().split())
+                body_b = " ".join(note_b.body.lower().split())
+                if body_a and body_a == body_b:
+                    result = {
+                        "is_duplicate": True,
+                        "reasoning": "exact normalized body match",
+                    }
+                else:
+                    # LLM confirmation
+                    user_prompt = DEDUP_USER_TEMPLATE.format(
+                        note_a=note_a.body[:2000],
+                        note_b=note_b.body[:2000],
+                    )
+                    response_text = await _llm_call(
+                        container, DEDUP_SYSTEM_PROMPT, user_prompt
+                    )
+                    request_count += 1
 
-                result = parse_json_response(response_text)
-                if not isinstance(result, dict):
-                    log.warning("dedup_llm_parse_failed", pair_ids=(pair.record_a.id, pair.record_b.id))
-                    continue
+                    result = parse_json_response(response_text)
+                    if not isinstance(result, dict):
+                        log.warning("dedup_llm_parse_failed", pair_ids=(pair.record_a.id, pair.record_b.id))
+                        continue
 
                 is_duplicate = result.get("is_duplicate", False)
 
@@ -572,12 +670,16 @@ async def dedup_step(
                             "content": note_a.body,
                             "importance": pair.record_a.importance,
                             "entities": pair.record_a.entities,
+                            "created_at": pair.record_a.created_at,
+                            "updated_at": pair.record_a.updated_at,
                         },
                         {
                             "id": pair.record_b.id,
                             "content": note_b.body,
                             "importance": pair.record_b.importance,
                             "entities": pair.record_b.entities,
+                            "created_at": pair.record_b.created_at,
+                            "updated_at": pair.record_b.updated_at,
                         },
                     )
 
@@ -686,6 +788,7 @@ async def entities_step(
     try:
         # Query entities through the projection DB for each common type
         candidate_pairs: list[tuple[dict, dict]] = []
+        candidate_keys: set[tuple[str, str]] = set()
 
         for entity_type in ("person", "place", "project", "organization", "medication"):
             entities = await projection_db.get_entities_by_type(entity_type)
@@ -700,24 +803,30 @@ async def entities_step(
                     similarity = jaro_winkler_similarity(
                         e1.canonical_name, e2.canonical_name
                     )
-                    if similarity >= ENTITY_FUZZY_THRESHOLD:
+                    e1_payload = {
+                        "id": e1.id,
+                        "name": e1.name,
+                        "canonical_name": e1.canonical_name,
+                        "entity_type": e1.entity_type,
+                        "link_count": e1.active_link_count,
+                    }
+                    e2_payload = {
+                        "id": e2.id,
+                        "name": e2.name,
+                        "canonical_name": e2.canonical_name,
+                        "entity_type": e2.entity_type,
+                        "link_count": e2.active_link_count,
+                    }
+                    if (
+                        similarity >= ENTITY_FUZZY_THRESHOLD
+                        or _is_relationship_alias_pair(e1_payload, e2_payload)
+                    ):
+                        pair_key = tuple(sorted((e1.id, e2.id)))
+                        if pair_key in candidate_keys:
+                            continue
+                        candidate_keys.add(pair_key)
                         candidate_pairs.append(
-                            (
-                                {
-                                    "id": e1.id,
-                                    "name": e1.name,
-                                    "canonical_name": e1.canonical_name,
-                                    "entity_type": e1.entity_type,
-                                    "link_count": e1.active_link_count,
-                                },
-                                {
-                                    "id": e2.id,
-                                    "name": e2.name,
-                                    "canonical_name": e2.canonical_name,
-                                    "entity_type": e2.entity_type,
-                                    "link_count": e2.active_link_count,
-                                },
-                            )
+                            (e1_payload, e2_payload)
                         )
 
         # Process up to MAX_ENTITY_PAIRS
@@ -734,36 +843,37 @@ async def entities_step(
                     m.content[:200] for m in memories_b[:3]
                 ) or "(no notes found)"
 
-                # LLM confirmation
-                user_prompt = ENTITY_RESOLUTION_USER_TEMPLATE.format(
-                    entity_a=e1["name"],
-                    type_a=e1["entity_type"],
-                    entity_b=e2["name"],
-                    type_b=e2["entity_type"],
-                    context_a=context_a,
-                    context_b=context_b,
-                )
-                response_text = await _llm_call(
-                    container, ENTITY_RESOLUTION_SYSTEM_PROMPT, user_prompt
-                )
-                request_count += 1
-
-                result = parse_json_response(response_text)
-                if not isinstance(result, dict):
-                    log.warning(
-                        "entity_resolution_parse_failed",
-                        entities=(e1["name"], e2["name"]),
+                if _relationship_alias_context_confirms(
+                    e1, e2, context_a, context_b
+                ):
+                    is_same = True
+                else:
+                    # LLM confirmation
+                    user_prompt = ENTITY_RESOLUTION_USER_TEMPLATE.format(
+                        entity_a=e1["name"],
+                        type_a=e1["entity_type"],
+                        entity_b=e2["name"],
+                        type_b=e2["entity_type"],
+                        context_a=context_a,
+                        context_b=context_b,
                     )
-                    continue
+                    response_text = await _llm_call(
+                        container, ENTITY_RESOLUTION_SYSTEM_PROMPT, user_prompt
+                    )
+                    request_count += 1
 
-                is_same = result.get("is_same", False)
+                    result = parse_json_response(response_text)
+                    if not isinstance(result, dict):
+                        log.warning(
+                            "entity_resolution_parse_failed",
+                            entities=(e1["name"], e2["name"]),
+                        )
+                        continue
+
+                    is_same = result.get("is_same", False)
 
                 if is_same:
-                    # Merge the entity with fewer links into the one with more
-                    if e1["link_count"] >= e2["link_count"]:
-                        target, source = e1, e2
-                    else:
-                        target, source = e2, e1
+                    target, source = _choose_entity_merge_target(e1, e2)
 
                     await projection_db.merge_entities(
                         source_id=source["id"],

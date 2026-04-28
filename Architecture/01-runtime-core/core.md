@@ -2,7 +2,7 @@
 
 The `core` package is Kora's shared infrastructure layer. It provides the typed dependency-injection container that wires every subsystem together, a Pydantic settings model loaded from TOML and environment variables, two SQLite database abstractions (the schema-initialisation layer and a migration runner), an async event bus, and all the Pydantic models that form the data contracts between the supervisor, workers, and tools.
 
-Nothing in `core` imports from agents, graph, or life. Everything else imports from `core`.
+`core` is still the shared infrastructure layer, but `core/di.py` now lazy-loads runtime services from graph, life, support, and safety packages when those container properties are requested. Other core modules should remain dependency-light.
 
 ---
 
@@ -11,9 +11,9 @@ Nothing in `core` imports from agents, graph, or life. Everything else imports f
 | Path | Purpose | Approx. lines |
 |---|---|---|
 | `core/__init__.py` | Empty package marker | ~1 |
-| `core/di.py` | Typed DI container — wires LLM, event bus, graph, memory, workers | ~554 |
-| `core/settings.py` | Pydantic settings — 13 nested sections, TOML + env loading | ~368 |
-| `core/db.py` | `operational.db` schema DDL + additive migration helpers | ~557 |
+| `core/di.py` | Typed DI container — wires LLM, event bus, graph, memory, workers, Life OS services | ~650+ |
+| `core/settings.py` | Pydantic settings — nested sections, TOML + env loading | ~368 |
+| `core/db.py` | `operational.db` schema DDL + additive migration helpers, including Life OS tables | ~750+ |
 | `core/migrations.py` | File-based SQL migration runner for `projection.db` | ~250 |
 | `core/events.py` | Async event bus (`EventEmitter`) with typed `EventType` enum | ~141 |
 | `core/models.py` | All shared Pydantic models: emotion, planning, workers, session | ~446 |
@@ -85,6 +85,25 @@ initialize_phase4()                    # sync, emotion assessors, quality, sessi
 - Lazy-built on first access via `build_supervisor_graph(self)`
 - Subsequent accesses return the cached instance
 - The ADHD life-engine properties (`adhd_profile`, `adhd_module`, `context_engine`, `calendar_sync`) are also lazy-built on first property access
+
+**Life OS service properties**
+
+The container also exposes lazy Life OS services used by `kora_v2/tools/life_os.py` and by migrated life-management writes:
+
+| Property | Service |
+|---|---|
+| `domain_event_store` | Append-only Life OS domain events |
+| `life_event_ledger` | Confirmed/inferred/corrected/rejected reality ledger |
+| `day_plan_service` | Versioned day-plan engine |
+| `life_load_engine` | Explainable load assessment |
+| `day_repair_engine` | Repair actions and day-plan revisioning |
+| `proactivity_policy_engine` | Nudge send/defer/suppress/queue decisions |
+| `stabilization_mode_service` | Quiet/high-support/recovery/stabilization state |
+| `context_pack_service` | Context-pack metadata and memory artifacts |
+| `future_self_bridge_service` | End-of-day and next-morning bridge artifacts |
+| `trusted_support_export_service` / `social_sensory_support_service` | User-reviewed support exports and social/sensory helpers |
+| `support_registry` / `support_profile_bootstrap` | Baseline and condition-specific support profile state |
+| `crisis_safety_router` | Crisis-boundary preemption records |
 
 **Key method: `close()`** [`di.py:492`](../../kora_v2/core/di.py#L492)
 - Shutdown order matters: cancel autonomous tasks → flush checkpointer → close projection DB → unload embedding model
@@ -182,6 +201,20 @@ Manages `data/operational.db` — the runtime database for everything that is no
 | `calendar_entries` | Unified timeline (events, meds, focus blocks, reminders, deadlines) |
 | `finance_log` | Financial entries with impulse flag |
 | `energy_log` | Energy/focus check-in records |
+| `domain_events` | Append-only Life OS domain proof events |
+| `day_plans` | Versioned day plans; one active revision per local day |
+| `day_plan_entries` | Entries inside a day-plan revision |
+| `life_events` | Life Event Ledger rows for confirmed, inferred, corrected, rejected, and tool-generated reality |
+| `load_assessments` | Life Load Meter score, band, factors, and assumptions |
+| `plan_repair_actions` | Repair proposals/applied actions and effects |
+| `nudge_decisions` | Proactivity policy send/defer/suppress/queue decisions |
+| `nudge_feedback` | User feedback on nudge usefulness or overreach |
+| `support_mode_state` | Current quiet/high-support/recovery/stabilization state |
+| `context_packs` | Context pack metadata linked to memory-root artifacts |
+| `future_self_bridges` | End-of-day bridge metadata linked to artifacts |
+| `support_profiles` | Baseline and condition-specific profile status/configuration |
+| `support_profile_signals` | User corrections and profile-learning signals |
+| `safety_boundary_records` | Crisis-boundary checks and routing records |
 
 **Orchestration tables (Phase 7.5).** Eight additional tables live in the same `operational.db` but are created by a separate migration runner in `kora_v2/runtime/orchestration/migrations/001_orchestration.sql`: `pipeline_instances`, `worker_tasks` (with a `checkpoint_blob` column, not a separate table), `work_ledger`, `trigger_state`, `request_limiter_log`, `system_state_log`, `open_decisions`, `runtime_pipelines`. A companion migration `002_notifications_templates.sql` adds the two-tier columns (`tier`, `severity`, `bypass_dnd`, `template_id`, `delivered_channel`) to the existing `notifications` table. Full schema is documented in [orchestration.md § Database tables](orchestration.md#database-tables).
 

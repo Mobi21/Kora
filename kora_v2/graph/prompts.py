@@ -313,8 +313,11 @@ When the user asks for **deep, open-ended research** ("dig into the
 best espresso setups under $500", "compare the four IBS protocols"),
 call ``decompose_and_dispatch`` with ``pipeline_name="proactive_research"``
 and ``in_turn=False``. That spawns a long-running working doc that
-mutates over time. For **quick multi-step work that should finish this
-turn** ("look up X, then summarise Y for me"), call
+mutates over time. Do not invent topic-specific background research
+pipeline names such as ``privacy_research`` or ``tool_research``; use
+the registered ``proactive_research`` pipeline and put the topic in the
+goal. For **quick multi-step work that should finish this turn** ("look
+up X, then summarise Y for me"), call
 ``decompose_and_dispatch`` with ``in_turn=True`` and a short stage
 list — the IN_TURN preset blocks the parent until aggregated results
 return.
@@ -343,6 +346,15 @@ tool list. Two hard constraints the engine enforces:
   focus on X instead".
 - **cancel_task(task_id, reason=...)** — stops a task cleanly. Only
   call this on explicit user request.
+- If the user asks to stop one background task while keeping another
+  one, cancel only the named target. Never cancel a task the user
+  explicitly says to keep or preserve.
+- Do not cancel protected system pipelines such as ``post_session_memory``,
+  ``post_memory_vault``, ``session_bridge_pruning``, ``skill_refinement``,
+  wake-up, continuity, or proactive system checks unless the user names
+  that exact system pipeline. A broad request like "stop that drifting
+  research" targets user-dispatched research work, not memory/vault
+  housekeeping.
 
 ## Open decisions
 
@@ -350,8 +362,10 @@ When the user poses a question they're weighing ("do I take the job?",
 "Python or Go for this?", "should I tell them tonight?") and does not
 commit to an answer in the same turn, call **record_decision** with the
 question as ``prompt``. The tracker resurfaces open decisions later so
-you can nudge gently. Don't record trivial asks — only things the user
-is actually deliberating on.
+you can nudge gently. This includes phrases like "I can't decide",
+"I'm weighing X vs Y", "leave this as an open question", or "remind me
+to decide later". Don't record trivial asks — only things the user is
+actually deliberating on.
 
 ## Honesty rule
 
@@ -702,6 +716,11 @@ def build_dynamic_suffix(state: dict[str, Any]) -> str:
         parts.append("")
         parts.append("[Hyperfocus mode — Kora stays out of the way]")
 
+    active_guidance = state.get("_active_skill_guidance")
+    if isinstance(active_guidance, str) and active_guidance.strip():
+        parts.append("")
+        parts.append(active_guidance.strip())
+
     # Session bridge (from last session)
     bridge = state.get("session_bridge")
     if bridge is not None:
@@ -730,6 +749,28 @@ def build_dynamic_suffix(state: dict[str, Any]) -> str:
         for upd in updates[:3]:
             summary = upd.get("summary", "") if isinstance(upd, dict) else str(upd)
             parts.append(f"- {summary}")
+
+    # Turn-start orchestration prefetch: the runtime already applied the
+    # relevance filter. If these are present, make them visible to the
+    # supervisor before turn-end acknowledgement marks them seen.
+    orchestration_tasks = state.get("_orchestration_tasks") or []
+    if orchestration_tasks:
+        parts.append("")
+        parts.append("## Relevant Background Work")
+        parts.append("[Mention completed/failed items before answering the new request]")
+        for task in orchestration_tasks[:5]:
+            if not isinstance(task, dict):
+                continue
+            stage = task.get("stage") or "task"
+            task_state = task.get("state") or "unknown"
+            goal = task.get("goal") or ""
+            summary = task.get("result_summary") or task.get("error_message") or ""
+            line = f"- {stage}: {task_state}"
+            if goal:
+                line += f" — {goal}"
+            if summary:
+                line += f" ({summary})"
+            parts.append(line)
 
     # Overlap hint (shown only when background autonomous work is active and
     # the user's message is topically related but not a hard pause trigger).

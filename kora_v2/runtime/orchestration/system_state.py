@@ -14,6 +14,7 @@ whenever the computed phase actually moves.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
@@ -42,9 +43,40 @@ class SystemStatePhase(StrEnum):
     SLEEPING = "sleeping"
 
 
-ACTIVE_IDLE_SECONDS = 300          # < 5 min since session end
-LIGHT_IDLE_SECONDS = 3600          # < 1 hour since session end
+def _idle_threshold_from_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("invalid_idle_threshold_env", name=name, value=raw)
+        return default
+    if value < 1:
+        log.warning("invalid_idle_threshold_env", name=name, value=raw)
+        return default
+    return value
+
+
+ACTIVE_IDLE_SECONDS = _idle_threshold_from_env(
+    "KORA_ORCHESTRATION_ACTIVE_IDLE_SECONDS", 300
+)          # < 5 min since session end by default
+LIGHT_IDLE_SECONDS = _idle_threshold_from_env(
+    "KORA_ORCHESTRATION_LIGHT_IDLE_SECONDS", 3600
+)          # < 1 hour since session end by default
 WAKE_UP_WINDOW_MINUTES = 30        # 30 min before wake time
+
+
+def _optional_seconds_env(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("invalid_seconds_env", name=name, value=raw)
+        return None
+    return value if value >= 0 else None
 
 
 @dataclass
@@ -242,6 +274,11 @@ class SystemStateMachine:
             return SystemStatePhase.DEEP_IDLE
 
         since_end = (now - self._last_session_ended_at).total_seconds()
+        forced_wake_after = _optional_seconds_env(
+            "KORA_ORCHESTRATION_WAKE_WINDOW_AFTER_IDLE_SECONDS"
+        )
+        if forced_wake_after is not None and since_end >= forced_wake_after:
+            return SystemStatePhase.WAKE_UP_WINDOW
         if since_end < ACTIVE_IDLE_SECONDS:
             return SystemStatePhase.ACTIVE_IDLE
         if since_end < LIGHT_IDLE_SECONDS:

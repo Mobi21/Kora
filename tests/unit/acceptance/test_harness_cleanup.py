@@ -17,9 +17,13 @@ import pytest
 
 from tests.acceptance._harness_server import (
     _LEGACY_AUTONOMOUS_TABLES,
+    _LIFE_MANAGEMENT_TABLES,
+    _LIFECYCLE_TABLES,
     _ORCHESTRATION_TABLES,
     _PROACTIVE_TABLES,
+    _RUNTIME_STATE_TABLES,
     _clean_stale_autonomous_data,
+    _clean_stale_projection_data,
     _clean_stale_test_data,
 )
 
@@ -128,6 +132,87 @@ async def _init_full_schema(db_path: Path) -> None:
                 rejected_at TEXT NOT NULL,
                 PRIMARY KEY (id_a, id_b)
             );
+            CREATE TABLE permission_grants (
+                id TEXT PRIMARY KEY,
+                tool_name TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT,
+                provenance TEXT,
+                recorded_by TEXT,
+                granted_at TEXT NOT NULL,
+                expires_at TEXT,
+                session_id TEXT
+            );
+            CREATE TABLE checkpoints (
+                thread_id TEXT,
+                checkpoint_ns TEXT,
+                checkpoint_id TEXT PRIMARY KEY,
+                parent_checkpoint_id TEXT,
+                type TEXT,
+                checkpoint BLOB,
+                metadata BLOB
+            );
+            CREATE TABLE turn_traces (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE turn_trace_events (
+                id TEXT PRIMARY KEY,
+                trace_id TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                started_at TEXT,
+                ended_at TEXT
+            );
+            CREATE TABLE medication_log (
+                id TEXT PRIMARY KEY,
+                medication_name TEXT,
+                taken_at TEXT
+            );
+            CREATE TABLE meal_log (
+                id TEXT PRIMARY KEY,
+                meal_type TEXT,
+                logged_at TEXT
+            );
+            CREATE TABLE focus_blocks (
+                id TEXT PRIMARY KEY,
+                started_at TEXT
+            );
+            CREATE TABLE quick_notes (
+                id TEXT PRIMARY KEY,
+                content TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE routines (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                steps_json TEXT NOT NULL,
+                low_energy_variant_json TEXT,
+                tags TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE routine_sessions (
+                id TEXT PRIMARY KEY,
+                routine_id TEXT NOT NULL,
+                session_id TEXT,
+                variant TEXT NOT NULL DEFAULT 'standard',
+                current_step_index INTEGER DEFAULT 0,
+                completed_steps TEXT NOT NULL DEFAULT '[]',
+                skipped_steps TEXT NOT NULL DEFAULT '[]',
+                checkpoint_state TEXT,
+                last_nudge_at TEXT,
+                completion_confidence REAL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT 'active',
+                started_at TEXT NOT NULL,
+                completed_at TEXT
+            );
             """
         )
         await db.commit()
@@ -209,9 +294,66 @@ async def _seed_one_row_per_table(db_path: Path) -> None:
             ("d_1", "x?", now, "pending"),
         )
         await db.execute(
+            "INSERT INTO permission_grants "
+            "(id, tool_name, scope, risk_level, decision, granted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("pg_1", "write_file", "global", "high", "approved", now),
+        )
+        await db.execute(
             "INSERT INTO runtime_pipelines "
             "(name, declaration_json, created_at, enabled) VALUES (?, ?, ?, ?)",
             ("p", "{}", now, 1),
+        )
+        # Runtime state
+        await db.execute(
+            "INSERT INTO checkpoints "
+            "(thread_id, checkpoint_ns, checkpoint_id, type, checkpoint, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("thread", "", "cp_1", "json", b"{}", b"{}"),
+        )
+        await db.execute(
+            "INSERT INTO turn_traces (id, session_id, created_at) "
+            "VALUES (?, ?, ?)",
+            ("trace_1", "s_1", now),
+        )
+        await db.execute(
+            "INSERT INTO turn_trace_events (id, trace_id, created_at) "
+            "VALUES (?, ?, ?)",
+            ("event_1", "trace_1", now),
+        )
+        await db.execute(
+            "INSERT INTO sessions (id, started_at, ended_at) "
+            "VALUES (?, ?, ?)",
+            ("sess_1", now, now),
+        )
+        # Life management
+        await db.execute(
+            "INSERT INTO medication_log (id, medication_name, taken_at) "
+            "VALUES (?, ?, ?)",
+            ("med_1", "Adderall", now),
+        )
+        await db.execute(
+            "INSERT INTO meal_log (id, meal_type, logged_at) VALUES (?, ?, ?)",
+            ("meal_1", "breakfast", now),
+        )
+        await db.execute(
+            "INSERT INTO focus_blocks (id, started_at) VALUES (?, ?)",
+            ("focus_1", now),
+        )
+        await db.execute(
+            "INSERT INTO quick_notes (id, content, created_at) VALUES (?, ?, ?)",
+            ("note_1", "x", now),
+        )
+        await db.execute(
+            "INSERT INTO routines "
+            "(id, name, steps_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("routine_1", "morning reset", "[]", now, now),
+        )
+        await db.execute(
+            "INSERT INTO routine_sessions "
+            "(id, routine_id, session_id, started_at) VALUES (?, ?, ?, ?)",
+            ("routine_session_1", "routine_1", "sess_1", now),
         )
         # Proactive / lifecycle adjuncts
         await db.execute(
@@ -267,6 +409,9 @@ def test_clean_stale_test_data_clears_all_tables(tmp_path: Path) -> None:
         for t in (
             *_LEGACY_AUTONOMOUS_TABLES,
             *_ORCHESTRATION_TABLES,
+            *_RUNTIME_STATE_TABLES,
+            *_LIFE_MANAGEMENT_TABLES,
+            *_LIFECYCLE_TABLES,
             *_PROACTIVE_TABLES,
         ):
             assert await _count_row(db_path, t) == 1, f"{t} not seeded"
@@ -276,6 +421,9 @@ def test_clean_stale_test_data_clears_all_tables(tmp_path: Path) -> None:
         for t in (
             *_LEGACY_AUTONOMOUS_TABLES,
             *_ORCHESTRATION_TABLES,
+            *_RUNTIME_STATE_TABLES,
+            *_LIFE_MANAGEMENT_TABLES,
+            *_LIFECYCLE_TABLES,
             *_PROACTIVE_TABLES,
         ):
             assert await _count_row(db_path, t) == 0, f"{t} still has rows"
@@ -329,6 +477,70 @@ def test_clean_stale_test_data_tolerates_missing_db(tmp_path: Path) -> None:
     # Must not raise.
     asyncio.run(_clean_stale_test_data(missing))
     assert not missing.exists()
+
+
+def test_clean_stale_projection_data_clears_acceptance_memory_rows(
+    tmp_path: Path,
+) -> None:
+    """Fresh acceptance runs must not inherit projection rows from old vaults."""
+    import sqlite3
+
+    db_path = tmp_path / "projection.db"
+    with sqlite3.connect(str(db_path)) as db:
+        db.executescript(
+            """
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                content TEXT,
+                source_path TEXT,
+                status TEXT DEFAULT 'active'
+            );
+            CREATE TABLE user_model_facts (
+                id TEXT PRIMARY KEY,
+                content TEXT,
+                source_path TEXT,
+                status TEXT DEFAULT 'active'
+            );
+            CREATE TABLE entities (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                canonical_name TEXT,
+                entity_type TEXT
+            );
+            CREATE TABLE entity_links (
+                entity_id TEXT,
+                memory_id TEXT,
+                user_model_fact_id TEXT,
+                relationship TEXT
+            );
+            CREATE TABLE memories_vec (embedding BLOB);
+            CREATE TABLE user_model_vec (embedding BLOB);
+            INSERT INTO memories (id, content, source_path) VALUES
+                ('m1', 'old memory', '/Users/mobi/.kora/memory/old.md');
+            INSERT INTO user_model_facts (id, content, source_path) VALUES
+                ('f1', 'old fact', '/Users/mobi/.kora/memory/fact.md');
+            INSERT INTO entities (id, name, canonical_name, entity_type) VALUES
+                ('e1', 'Alex', 'alex', 'person');
+            INSERT INTO entity_links (entity_id, memory_id, relationship) VALUES
+                ('e1', 'm1', 'mentions');
+            INSERT INTO memories_vec (embedding) VALUES (x'00');
+            INSERT INTO user_model_vec (embedding) VALUES (x'00');
+            """
+        )
+
+    _clean_stale_projection_data(db_path)
+
+    with sqlite3.connect(str(db_path)) as db:
+        for table in (
+            "entity_links",
+            "memories_vec",
+            "user_model_vec",
+            "memories",
+            "user_model_facts",
+            "entities",
+        ):
+            count = db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            assert count == 0, f"{table} still has rows"
 
 
 # Pytest collection marker — ensures the module is always pickable up by

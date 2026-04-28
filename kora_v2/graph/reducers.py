@@ -311,6 +311,15 @@ def ensure_tool_pair_integrity(messages: list[Any]) -> list[Any]:
             i += 1
             continue
 
+        # A role="tool" dict without a truthy tool_call_id is malformed.
+        # ``_extract_tool_result_ids`` returns an empty set for it, so the
+        # standalone-orphan branch above doesn't catch it. Drop it here —
+        # keeping it causes LangChain's ToolMessage validator to raise
+        # ``KeyError('tool_call_id')`` on the next add_messages merge.
+        if isinstance(msg, dict) and msg.get("role") == "tool" and not msg.get("tool_call_id"):
+            i += 1
+            continue
+
         result.append(msg)
         i += 1
 
@@ -339,7 +348,22 @@ def add_messages_reducer(
     Returns:
         Combined messages.
     """
-    return add_messages(existing or [], new or [])
+    def _sanitize(msgs: list[Any]) -> list[Any]:
+        """Drop or repair tool-role dicts missing tool_call_id.
+
+        LangChain's ``ToolMessage`` validator raises ``KeyError('tool_call_id')``
+        if a dict with ``role="tool"`` lacks that field. We drop the orphan
+        rather than crash the turn; ``ensure_tool_pair_integrity`` will strip
+        any remaining dangling siblings on the way out.
+        """
+        out = []
+        for m in msgs or []:
+            if isinstance(m, dict) and m.get("role") == "tool" and not m.get("tool_call_id"):
+                continue
+            out.append(m)
+        return out
+
+    return add_messages(_sanitize(existing or []), _sanitize(new or []))
 
 
 # =============================================================================

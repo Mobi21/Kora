@@ -510,13 +510,12 @@ class RuntimeInspector:
             "MemorySaver fallback active" if checkpointer is None else type(checkpointer).__name__,
         )
 
-        # 6. Phase 4.67 modules importable
+        # 6. Core modules importable
         modules_to_check = [
-            ("kora_v2.runtime.kernel", "RuntimeKernel"),
             ("kora_v2.runtime.turn_runner", "GraphTurnRunner"),
-            ("kora_v2.runtime.stores", "SessionStore"),
-            ("kora_v2.agents.harness", "SchemaRepairExhaustedError"),
-            ("kora_v2.emotion.fast_assessor", "FrustrationSignal"),
+            ("kora_v2.runtime.stores", "ArtifactStore"),
+            ("kora_v2.agents.harness", "AgentHarness"),
+            ("kora_v2.emotion.fast_assessor", "FastEmotionAssessor"),
         ]
         for mod_path, attr in modules_to_check:
             try:

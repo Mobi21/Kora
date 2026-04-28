@@ -87,6 +87,23 @@ class Container:
 
         # Phase 6B: Routine manager for guided routines.
         self._routine_manager: Any | None = None
+        self._reminder_store: Any | None = None
+
+        # Life OS pivot services (lazy-built via properties).
+        self._domain_event_store: Any | None = None
+        self._life_event_ledger: Any | None = None
+        self._day_plan_service: Any | None = None
+        self._support_registry: Any | None = None
+        self._support_profile_bootstrap: Any | None = None
+        self._crisis_safety_router: Any | None = None
+        self._life_load_engine: Any | None = None
+        self._day_repair_engine: Any | None = None
+        self._proactivity_policy_engine: Any | None = None
+        self._stabilization_mode_service: Any | None = None
+        self._context_pack_service: Any | None = None
+        self._future_self_bridge_service: Any | None = None
+        self._trusted_support_export_service: Any | None = None
+        self._social_sensory_support_service: Any | None = None
 
         # Phase 5: ADHD life engine components (lazy-built via properties).
         self._adhd_profile: Any | None = None
@@ -230,6 +247,7 @@ class Container:
         import kora_v2.tools.calendar  # noqa: F401
         import kora_v2.tools.filesystem  # noqa: F401
         import kora_v2.tools.life_management  # noqa: F401
+        import kora_v2.tools.life_os  # noqa: F401
         import kora_v2.tools.planning  # noqa: F401
         import kora_v2.tools.routines  # noqa: F401
         from kora_v2.agents.workers.executor import ExecutorWorkerHarness
@@ -375,9 +393,12 @@ class Container:
         self.session_manager = SessionManager(self)
 
         # Phase 6B: Routine manager
+        from kora_v2.life.reminders import ReminderStore
         from kora_v2.life.routines import RoutineManager
 
-        self._routine_manager = RoutineManager(self.settings.data_dir / "operational.db")
+        operational_db = self.settings.data_dir / "operational.db"
+        self._routine_manager = RoutineManager(operational_db)
+        self._reminder_store = ReminderStore(operational_db)
 
         log.info("phase4_services_initialized")
 
@@ -440,6 +461,11 @@ class Container:
         """RoutineManager for guided routine sessions."""
         return self._routine_manager
 
+    @property
+    def reminder_store(self) -> Any:
+        """ReminderStore for continuity checks and scheduled nudges."""
+        return self._reminder_store
+
     # ── Phase 5: ADHD life engine ─────────────────────────────────
 
     @property
@@ -498,12 +524,174 @@ class Container:
             self._calendar_sync = CalendarSync(self)
         return self._calendar_sync
 
+    # ── Life OS pivot services ──────────────────────────────────
+
+    @property
+    def operational_db_path(self) -> Path:
+        return self.settings.data_dir / "operational.db"
+
+    @property
+    def domain_event_store(self) -> Any:
+        if self._domain_event_store is None:
+            from kora_v2.life.domain_events import DomainEventStore
+
+            self._domain_event_store = DomainEventStore(self.operational_db_path)
+        return self._domain_event_store
+
+    @property
+    def life_event_ledger(self) -> Any:
+        if self._life_event_ledger is None:
+            from kora_v2.life.ledger import LifeEventLedger
+
+            self._life_event_ledger = LifeEventLedger(
+                self.operational_db_path,
+                domain_events=self.domain_event_store,
+            )
+        return self._life_event_ledger
+
+    @property
+    def day_plan_service(self) -> Any:
+        if self._day_plan_service is None:
+            from kora_v2.life.day_plan import DayPlanService
+
+            self._day_plan_service = DayPlanService(
+                self.operational_db_path,
+                ledger=self.life_event_ledger,
+                domain_events=self.domain_event_store,
+            )
+        return self._day_plan_service
+
+    @property
+    def support_registry(self) -> Any:
+        if self._support_registry is None:
+            from kora_v2.support.registry import SupportRegistry
+
+            self._support_registry = SupportRegistry(self.operational_db_path)
+        return self._support_registry
+
+    @property
+    def support_profile_bootstrap(self) -> Any:
+        if self._support_profile_bootstrap is None:
+            from kora_v2.support.bootstrap import SupportProfileBootstrapService
+
+            self._support_profile_bootstrap = SupportProfileBootstrapService(
+                self.operational_db_path,
+                registry=self.support_registry,
+            )
+        return self._support_profile_bootstrap
+
+    @property
+    def crisis_safety_router(self) -> Any:
+        if self._crisis_safety_router is None:
+            from kora_v2.safety.crisis import CrisisSafetyRouter
+
+            self._crisis_safety_router = CrisisSafetyRouter(self.operational_db_path)
+        return self._crisis_safety_router
+
+    @property
+    def life_load_engine(self) -> Any:
+        if self._life_load_engine is None:
+            from kora_v2.life.load import LifeLoadEngine
+
+            self._life_load_engine = LifeLoadEngine(
+                self.operational_db_path,
+                support_registry=self.support_registry,
+            )
+        return self._life_load_engine
+
+    @property
+    def day_repair_engine(self) -> Any:
+        if self._day_repair_engine is None:
+            from kora_v2.life.repair import DayRepairEngine
+
+            self._day_repair_engine = DayRepairEngine(self.operational_db_path)
+        return self._day_repair_engine
+
+    @property
+    def proactivity_policy_engine(self) -> Any:
+        if self._proactivity_policy_engine is None:
+            from kora_v2.life.proactivity_policy import ProactivityPolicyEngine
+
+            self._proactivity_policy_engine = ProactivityPolicyEngine(
+                self.operational_db_path
+            )
+        return self._proactivity_policy_engine
+
+    @property
+    def stabilization_mode_service(self) -> Any:
+        if self._stabilization_mode_service is None:
+            from kora_v2.life.stabilization import StabilizationModeService
+
+            self._stabilization_mode_service = StabilizationModeService(
+                self.operational_db_path,
+                day_plan_service=self.day_plan_service,
+            )
+        return self._stabilization_mode_service
+
+    @property
+    def context_pack_service(self) -> Any:
+        if self._context_pack_service is None:
+            from kora_v2.life.context_packs import ContextPackService
+
+            self._context_pack_service = ContextPackService(
+                self.operational_db_path,
+                Path(self.settings.memory.kora_memory_path).expanduser(),
+            )
+        return self._context_pack_service
+
+    @property
+    def future_self_bridge_service(self) -> Any:
+        if self._future_self_bridge_service is None:
+            from kora_v2.life.future_bridge import FutureSelfBridgeService
+
+            self._future_self_bridge_service = FutureSelfBridgeService(
+                self.operational_db_path,
+                Path(self.settings.memory.kora_memory_path).expanduser(),
+                day_plan_service=self.day_plan_service,
+            )
+        return self._future_self_bridge_service
+
+    @property
+    def trusted_support_export_service(self) -> Any:
+        if self._trusted_support_export_service is None:
+            from kora_v2.life.trusted_support import TrustedSupportExportService
+
+            self._trusted_support_export_service = TrustedSupportExportService(
+                self.operational_db_path
+            )
+        return self._trusted_support_export_service
+
+    @property
+    def social_sensory_support_service(self) -> Any:
+        if self._social_sensory_support_service is None:
+            from kora_v2.life.trusted_support import SocialSensorySupportService
+
+            self._social_sensory_support_service = SocialSensorySupportService(
+                self.operational_db_path
+            )
+        return self._social_sensory_support_service
+
     # ── Phase 7.5: Orchestration engine ──────────────────────────
 
     @property
     def orchestration_engine(self) -> Any | None:
         """The :class:`OrchestrationEngine` instance (set by init)."""
         return self._orchestration_engine
+
+    @property
+    def notification_gate(self) -> Any | None:
+        """The orchestration :class:`NotificationGate`, if the engine is up.
+
+        Proactive handlers call ``container.notification_gate`` to send
+        templated nudges. Exposing it here keeps callers from having to
+        reach through ``container.orchestration_engine.notifications`` and
+        gives the container a single no-op surface when orchestration is
+        not yet initialized (returns ``None``).
+        """
+        engine = self._orchestration_engine
+        if engine is None:
+            return None
+        return getattr(engine, "notifications", None)
 
     async def initialize_orchestration(
         self,

@@ -281,8 +281,10 @@ are referenced by settings but not yet wired up in the current codebase
 
 ## Integration points
 
-- **Turn runner** (`kora_v2/runtime/turn_runner.py`): calls
-  `QualityCollector.record_turn()` and `persist_turn()` after each turn.
+- **Supervisor graph** (`kora_v2/graph/supervisor.py`): currently calls
+  `QualityCollector.record_turn()` for in-memory turn samples. `persist_turn()`
+  exists on the collector, but public docs should not claim it is called after
+  every turn unless the call path is verified.
 - **Autonomous executor** (`kora_v2/autonomous/`): calls
   `execute_with_quality_gates()` to wrap plan-step execution.
 - **Reviewer worker** (`kora_v2/agents/workers/reviewer.py`): produces the

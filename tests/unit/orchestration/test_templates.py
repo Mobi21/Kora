@@ -27,6 +27,8 @@ def test_ensure_defaults_writes_yaml(registry: TemplateRegistry) -> None:
     raw = yaml.safe_load(registry.path.read_text())
     assert "rate_limit_paused" in raw
     assert "task_completed" in raw
+    assert "pipeline_completed" in raw
+    assert "pipeline_failed" in raw
 
 
 def test_ensure_defaults_is_idempotent(registry: TemplateRegistry) -> None:
@@ -78,6 +80,31 @@ def test_render_priority_override(registry: TemplateRegistry) -> None:
         percent=50,
     )
     assert rendered.priority is TemplatePriority.HIGH
+
+
+def test_pipeline_terminal_templates_render_without_llm(
+    registry: TemplateRegistry,
+) -> None:
+    registry.ensure_defaults()
+    completed = registry.render(
+        "pipeline_completed",
+        pipeline_name="proactive_research",
+        goal="local-first reminder tools",
+    )
+    failed = registry.render(
+        "pipeline_failed",
+        pipeline_name="proactive_research",
+        reason="timeout",
+        goal="local-first reminder tools",
+    )
+
+    assert completed.text == (
+        "proactive_research finished. local-first reminder tools"
+    )
+    assert failed.text == (
+        "proactive_research ran into trouble: timeout. "
+        "local-first reminder tools"
+    )
 
 
 def test_ids_returns_sorted_default_ids(registry: TemplateRegistry) -> None:

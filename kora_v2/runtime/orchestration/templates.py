@@ -66,6 +66,16 @@ DEFAULT_TEMPLATES: dict[str, dict[str, Any]] = {
         "priority": "medium",
         "bypass_dnd": False,
     },
+    "pipeline_completed": {
+        "text": "{pipeline_name} finished. {goal}",
+        "priority": "medium",
+        "bypass_dnd": False,
+    },
+    "pipeline_failed": {
+        "text": "{pipeline_name} ran into trouble: {reason}. {goal}",
+        "priority": "medium",
+        "bypass_dnd": False,
+    },
     "background_digest_ready": {
         "text": "Overnight digest of {count} items is ready to review in your Inbox.",
         "priority": "low",
@@ -79,6 +89,11 @@ DEFAULT_TEMPLATES: dict[str, dict[str, Any]] = {
     "reminder_generic": {
         "text": "Reminder: {subject}",
         "priority": "high",
+        "bypass_dnd": False,
+    },
+    "pattern_nudge": {
+        "text": "I noticed a pattern: {title}. {description}",
+        "priority": "medium",
         "bypass_dnd": False,
     },
 }
