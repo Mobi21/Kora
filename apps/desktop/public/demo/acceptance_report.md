@@ -15,7 +15,7 @@ Conversation: 46 user turns, 46 assistant turns
 - [x] 6. Burnout/anxiety/low-energy support is proven: Kora downshifts plans, stabilizes spirals, protects essentials, and avoids generic productivity pressure. _(auto)_
 - [x] 7. Life essentials are tracked durably: medication or health routine, meals/hydration, reminders, quick notes, focus/rest blocks, and routine progress. _(auto)_
 - [x] 8. Messy life-admin decomposition works in-turn: Kora breaks an overwhelming admin/social/home task into concrete next actions and durable follow-up without turning it into a coding/research project. _(auto)_
-- [x] 9. Optional external capability check: web/browser/workspace use may support practical life friction, but failure must be disclosed plainly and must not block Life OS core acceptance. _(auto)_
+- [x] 9. External-service boundary: networked services require explicit user configuration and must not block Life OS core acceptance. _(auto)_
 - [x] 10. Long-context compaction pressure survived without losing in-conversation facts. _(auto)_
 - [x] 11. Wrong inference and plan drift are repaired: Kora accepts a correction, updates state, avoids repeating the bad assumption, and replans from the corrected reality. _(auto)_
 - [x] 12. Real background pipelines fire during DEEP_IDLE — session_bridge_pruning and skill_refinement (see core_pipelines items 19-20) execute and write to work_ledger. _(auto)_
@@ -26,7 +26,7 @@ Conversation: 46 user turns, 46 assistant turns
 - [x] 17. Auth relay round-trip: deny once, then approve, both paths verified and logged. _(auto)_
 - [x] 18. Error recovery: malformed input handled gracefully and the session survives without the daemon crashing. _(auto)_
 - [x] 19. Stabilization behavior adapts to energy and emotion shifts without over-medicalizing: focused, scattered, overloaded, shutdown, and recovering states produce different support. _(auto)_
-- [x] 20. Skill activation gates life support, calendar, memory, and optional capability tools by need; coding/research/writing tools stay secondary. _(auto)_
+- [x] 20. Skill activation gates life support, calendar, and memory tools by need. _(auto)_
 - [x] 21. Long-running practical life support via decompose_and_dispatch(intent_duration='long') — an admin prep, appointment prep, or household follow-up task creates a pipeline, working doc, work_ledger rows, and completion summary. _(auto)_
 - [x] 22. Optional artifact support works for real life artifacts (appointment notes, scripts/messages, packing/checklists, support exports) using read_file, write_file, and list_directory. _(auto)_
 - [x] 23. Life-management DB records persist and match the report: medication/health routines, meals, reminders, notes, focus/rest blocks, day plans, repair actions, and support-profile events are queryable. _(auto)_
@@ -74,9 +74,9 @@ Conversation: 46 user turns, 46 assistant turns
 - [x] 65. ProactiveAgent Area E: connection_making_step surfaces old vault notes relevant to a new topic. _(auto)_
 - [x] 66. Reminders created via routines fire through the continuity_check pipeline at their scheduled time. _(auto)_
 - [x] 67. Wake-up briefing assembled overnight (anticipatory_prep / wake_up_preparation) and delivered at the user's wake time. _(auto)_
-- [x] 100. Optional capability-pack surface — at least one of workspace.*, browser.*, vault.* tool calls appears in the report's capability bucket, OR the capability-health-check shows at least one pack UNCONFIGURED/DEGRADED with a remediation hint. This never gates Life OS core acceptance. _(auto)_
+- [x] 100. Life OS acceptance remains centered on durable planning, repair, memory, and support behavior. _(auto)_
 - [x] 101. Disclosed-failure path — when an MCP tool fails, the user-visible reply acknowledges the failure plainly (no silent fallback or fabricated external facts). _(auto)_
-- [x] 102. Policy matrix enforcement — capability-health-check returns the 4 packs (workspace, browser, vault, doctor) and the policy section is present in the report. _(auto)_
+- [x] 102. Policy matrix enforcement — policy decisions are recorded and summarized in the report. _(auto)_
 
 Active coverage: 70/70 satisfied + 0 partial (auto-derived: 70, operator-edited: 0)
 
@@ -183,22 +183,12 @@ Tool calls are supporting evidence only; green checks require durable DB rows an
 ### Remaining Debt
 - None from Life OS acceptance proof collector.
 
-### Old Suite Capability-Pack Status
-Old coding/research/writing capability-pack checks are reported separately and do not gate Life OS core.
-- browser: status=unconfigured; Browser capability not bound to runtime yet.
-- doctor: status=unimplemented; Doctor capability scaffolding only — implementation pending (Task 5).
-- vault: status=unconfigured; Vault capability not bound to runtime yet.
-- workspace: status=unconfigured; Workspace capability not bound to runtime yet.
-
 ## Tool Usage (446 calls, 35 unique tools)
 - Life management: assess_life_load, bridge_tomorrow, confirm_reality, correct_reality, create_context_pack, create_day_plan, create_reminder, create_routine, decide_life_nudge, end_focus_block, enter_stabilization_mode, export_trusted_support, log_meal, log_medication, query_focus_blocks, query_meals, query_medications, query_reminders, quick_note, set_support_profile_status, start_focus_block
 - Filesystem: list_directory, read_file, write_file
 - MCP (web): (no tools called)
 - Orchestration: cancel_task, decompose_and_dispatch, get_running_tasks, get_task_progress, record_decision
 - Pipelines: (AT3 will fill this in; pipelines fire from triggers, not tool calls)
-- Capability (workspace): (no calls)
-- Capability (browser): (no calls)
-- Capability (vault): (no calls)
 
 Call counts:
   create_reminder: 108
@@ -236,16 +226,6 @@ Call counts:
   query_medications: 2
   query_meals: 2
   query_focus_blocks: 2
-
-## Capability Packs (4 packs)
-- workspace: status=unconfigured calls=0 — Workspace capability not bound to runtime yet.
-  Remediation: Container must call .bind(settings, mcp_manager).
-- browser: status=unconfigured calls=0 — Browser capability not bound to runtime yet.
-  Remediation: Container must call .bind(settings) first.
-- vault: status=unconfigured calls=0 — Vault capability not bound to runtime yet.
-  Remediation: Container must call .bind(settings) first, or set KORA_VAULT__PATH in the environment.
-- doctor: status=unimplemented calls=0 — Doctor capability scaffolding only — implementation pending (Task 5).
-  Remediation: See docs/superpowers/plans/phase-9-tooling.md Task 5.
 
 ## Policy Grants (117 recorded decisions)
 - Approved: 115

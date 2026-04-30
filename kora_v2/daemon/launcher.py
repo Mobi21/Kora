@@ -10,6 +10,7 @@ and read_state(). The spawned daemon owns lockfile.acquire().
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -671,13 +672,16 @@ def main() -> None:
 
     from kora_v2 import __version__
 
+    repo_root = Path(__file__).resolve().parents[2]
+    os.chdir(repo_root)
+
     parser = argparse.ArgumentParser(prog="kora", description="Kora V2 local-first Life OS")
     parser.add_argument("--version", action="version", version=f"kora {__version__}")
     parser.add_argument("--_daemon_internal", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["start", "chat", "status", "setup", "doctor", "stop", "restart"],
+        choices=["start", "chat", "status", "setup", "doctor", "stop", "restart", "gui"],
         default="start",
         help="Command to run. Default: start.",
     )
@@ -735,6 +739,10 @@ def main() -> None:
         _command_start(lockfile_path, settings.data_dir / "logs", __version__)
         return
 
+    if args.command == "gui":
+        _command_gui(settings)
+        return
+
 
 def _command_start(
     lockfile_path: Path,
@@ -787,7 +795,34 @@ def _command_setup(settings: Any, lockfile_path: Path, token_path: Path) -> None
     print(f"  memory_path: {settings.memory.kora_memory_path}")
     print(f"  daemon_host: {settings.daemon.host}")
     print(f"  daemon_port: {settings.daemon.port}")
-    print("  commands: kora start | kora chat | kora status | kora doctor | kora stop")
+    print("  commands: kora start | kora chat | kora status | kora doctor | kora stop | kora gui")
+
+
+def _command_gui(settings: Any) -> None:
+    """Launch the Electron desktop app from any current working directory."""
+    repo_root = Path(__file__).resolve().parents[2]
+    desktop_dir = repo_root / "apps" / "desktop"
+    package_json = desktop_dir / "package.json"
+    if not package_json.exists():
+        print(f"Desktop app not found at {desktop_dir}")
+        sys.exit(1)
+
+    npm = shutil.which("npm")
+    if npm is None:
+        print("npm is required to launch the Kora desktop GUI.")
+        sys.exit(1)
+
+    cli_path = shutil.which("kora") or sys.argv[0]
+    env = os.environ.copy()
+    env["KORA_DATA_DIR"] = str(settings.data_dir)
+    env["KORA_CLI_PATH"] = str(Path(cli_path).resolve())
+    env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{env.get('PATH', '')}"
+
+    try:
+        result = subprocess.run([npm, "run", "dev:all"], cwd=desktop_dir, env=env)
+    except KeyboardInterrupt:
+        return
+    sys.exit(result.returncode)
 
 
 def _command_doctor(lockfile_path: Path, token_path: Path) -> None:

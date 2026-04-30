@@ -62,6 +62,11 @@ function exec(cmd: string, args: readonly string[], timeoutMs = 3000): Promise<E
 }
 
 async function locateCli(): Promise<{ path?: string; available: boolean }> {
+  const configured = process.env.KORA_CLI_PATH;
+  if (configured) {
+    const probe = await exec(configured, ['--version']);
+    if (probe.ok) return { path: configured, available: true };
+  }
   const which = await exec(process.platform === 'win32' ? 'where' : 'which', ['kora']);
   if (which.ok) {
     const first = which.stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
@@ -71,7 +76,7 @@ async function locateCli(): Promise<{ path?: string; available: boolean }> {
 }
 
 async function readCliVersion(): Promise<string | undefined> {
-  const out = await exec('kora', ['--version']);
+  const out = await exec(process.env.KORA_CLI_PATH || 'kora', ['--version']);
   if (!out.ok) return undefined;
   const trimmed = out.stdout.trim() || out.stderr.trim();
   return trimmed || undefined;

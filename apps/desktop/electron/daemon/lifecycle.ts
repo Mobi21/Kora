@@ -49,7 +49,8 @@ export async function startDaemon(repoRoot: string): Promise<DaemonStatus> {
   const existing = await probeDaemon(repoRoot);
   if (existing.running) return existing;
 
-  const child = spawn('kora', [], {
+  const cliPath = process.env.KORA_CLI_PATH || 'kora';
+  const child = spawn(cliPath, [], {
     cwd: repoRoot,
     detached: true,
     stdio: 'ignore',
