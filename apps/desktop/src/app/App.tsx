@@ -9,6 +9,7 @@ import {
   pingDaemonOnce,
   readFirstRunCompleted,
 } from '@/features/first-run/queries';
+import { isDemoMode } from '@/lib/demo/mode';
 import { AppRoutes, FIRST_RUN_PATH } from './routes';
 
 type GateDecision = 'undetermined' | 'first-run' | 'app';
@@ -31,6 +32,15 @@ function useFirstRunGate(): GateDecision {
   const settledRef = useRef(false);
 
   useEffect(() => {
+    if (isDemoMode()) {
+      settledRef.current = true;
+      setDecision('app');
+      if (location.pathname === FIRST_RUN_PATH) {
+        navigate('/today', { replace: true });
+      }
+      return;
+    }
+
     // Once we've decided the app is healthy, never re-probe — navigation
     // around the app should not trigger more daemon probes. The wizard's
     // navigate('/today') resets the decision via state change naturally,

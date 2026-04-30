@@ -9,7 +9,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import tests.acceptance._report as report
-from tests.acceptance._report import _auto_mark_coverage, _with_startup_grace
+from tests.acceptance._report import (
+    _apply_persona_completion_gate,
+    _auto_mark_coverage,
+    _merge_auth_evidence,
+    _persona_run_completion,
+    _with_startup_grace,
+)
 
 
 def _base_kwargs() -> dict:
@@ -44,6 +50,43 @@ def test_decompose_tool_call_alone_is_only_partial_credit() -> None:
     assert 21 not in marks
 
 
+def test_incomplete_persona_run_downgrades_life_os_headline_markers() -> None:
+    markers = {1: "x", 2: "x", 15: "x", 18: "x", 67: "x"}
+
+    gated = _apply_persona_completion_gate(
+        markers,
+        {"present": True, "complete": False, "reason": "persona-run emitted run_failed"},
+    )
+
+    assert gated[1] == "~"
+    assert gated[2] == "~"
+    assert gated[67] == "~"
+    assert gated[15] == "x"
+    assert gated[18] == "x"
+
+
+def test_error_recovery_requires_all_probe_messages_to_survive() -> None:
+    kwargs = _base_kwargs()
+    kwargs["error_results"] = [
+        {"test": "malformed_json_frame", "survived": True},
+        {"test": "empty_chat_content", "survived": True},
+        {"test": "special_chars", "survived": False},
+        {"test": "long_message", "survived": True},
+        {"test": "unicode", "survived": False},
+        {"test": "normal_after_errors", "survived": True},
+    ]
+
+    marks = _auto_mark_coverage(**kwargs)
+
+    assert marks[18] == "~"
+
+    for result in kwargs["error_results"]:
+        result["survived"] = True
+    marks = _auto_mark_coverage(**kwargs)
+
+    assert marks[18] == "x"
+
+
 def test_filesystem_item_requires_read_write_and_list() -> None:
     kwargs = _base_kwargs()
     kwargs["tool_usage"]["tool_counts"] = {
@@ -67,7 +110,7 @@ def test_life_os_context_item_requires_support_and_local_first() -> None:
     kwargs["messages"] = [
         {
             "role": "user",
-            "content": "ADHD, Alex, and Mochi are established.",
+            "content": "ADHD, Talia, and Maya's school schedule are established.",
         }
     ]
 
@@ -79,7 +122,7 @@ def test_life_os_context_item_requires_support_and_local_first() -> None:
         {
             "role": "assistant",
             "content": (
-                "Jordan has ADHD support needs, Alex is trusted support, "
+                "Maya has ADHD support needs, Talia is trusted support, "
                 "and Kora should keep this local-first for privacy."
             ),
         }
@@ -385,14 +428,14 @@ def test_wrong_inference_repair_accepts_support_preference_correction() -> None:
         {
             "role": "user",
             "content": (
-                "wrong assumption: don't ask Alex automatically. correct that "
+                "wrong assumption: don't ask Talia automatically. correct that "
                 "support boundary and replan."
             ),
         },
         {
             "role": "assistant",
             "content": (
-                "Corrected: I will not contact Alex automatically. I updated "
+                "Corrected: I will not contact Talia automatically. I updated "
                 "the support boundary and replanned around asking only if you choose it."
             ),
         },
@@ -450,6 +493,31 @@ def test_weekly_review_scan_continues_past_earlier_summary() -> None:
     marks = _auto_mark_coverage(**kwargs)
 
     assert marks[14] == "x"
+
+
+def test_weekly_review_rejects_thursday_only_claim() -> None:
+    kwargs = _base_kwargs()
+    kwargs["messages"] = [
+        {
+            "role": "user",
+            "content": (
+                "weekly review: what actually happened this week, what got missed, "
+                "what got repaired, and what state backs it?"
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "What I can prove: this was a Thursday-only session. I have no "
+                "data for Monday through Wednesday. Lunch was missed and repaired; "
+                "the calendar has tomorrow's reminder and routine state."
+            ),
+        },
+    ]
+
+    marks = _auto_mark_coverage(**kwargs)
+
+    assert 14 not in marks
 
 
 def test_restart_scorer_requires_restart_prompt_and_continues_scan(
@@ -1414,6 +1482,28 @@ def test_routine_reminder_partial_requires_reminder_row() -> None:
     assert marks[66] == "~"
 
 
+def test_persona_run_completion_detects_incomplete_phase_set(tmp_path: Path) -> None:
+    output_dir = tmp_path / "acceptance_output"
+    output_dir.mkdir()
+    (output_dir / "persona_agent_summary.json").write_text(
+        json.dumps({"status": "completed", "selected_phase_count": 3}),
+        encoding="utf-8",
+    )
+    (output_dir / "persona_agent_events.jsonl").write_text(
+        "\n".join([
+            json.dumps({"event": "phase_complete", "phase_name": "one"}),
+            json.dumps({"event": "phase_complete", "phase_name": "two"}),
+        ]),
+        encoding="utf-8",
+    )
+
+    result = _persona_run_completion(output_dir)
+
+    assert result["present"] is True
+    assert result["complete"] is False
+    assert result["completed_phase_count"] == 2
+
+
 def test_vault_benchmark_evidence_marks_entity_and_session_items() -> None:
     kwargs = _base_kwargs()
     kwargs["benchmark_state"] = {
@@ -1435,7 +1525,7 @@ def test_current_vault_benchmark_state_counts_configured_memory_root(
 ) -> None:
     root = tmp_path / "memory"
     for relative in [
-        "Entities/People/Alex.md",
+        "Entities/People/Talia.md",
         "Entities/Places/Home.md",
         "Entities/Projects/Kora.md",
         "Maps of Content/Projects.md",
@@ -1480,6 +1570,36 @@ def test_auth_relay_can_be_marked_from_durable_permission_rows() -> None:
 
     marks = _auto_mark_coverage(**kwargs)
 
+    assert marks[17] == "x"
+
+
+def test_auth_evidence_merge_keeps_denied_log_with_approved_db_rows() -> None:
+    merged = _merge_auth_evidence(
+        [
+            {
+                "tool": "write_file",
+                "approved": False,
+                "decision": "denied",
+                "ts": "2026-04-30T08:00:00+00:00",
+                "source": "test_log",
+            }
+        ],
+        [
+            {
+                "tool": "write_file",
+                "approved": True,
+                "decision": "approved",
+                "ts": "2026-04-30T08:01:00+00:00",
+                "source": "permission_grants",
+            }
+        ],
+    )
+
+    kwargs = _base_kwargs()
+    kwargs["auth_results"] = merged
+    marks = _auto_mark_coverage(**kwargs)
+
+    assert [row["approved"] for row in merged] == [False, True]
     assert marks[17] == "x"
 
 

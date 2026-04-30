@@ -7,6 +7,7 @@ import { Badge } from '@/components/ui/badge';
 import { useConnection } from '@/lib/api/connection';
 import { createApiClient } from '@/lib/api/client';
 import type { DesktopStatusView } from '@/lib/api/types';
+import { isDemoMode } from '@/lib/demo/mode';
 import { cn } from '@/lib/utils';
 import { SectionCard, type DefinitionPair } from './SectionCard';
 import { ShutdownDialog } from './ShutdownDialog';
@@ -127,6 +128,7 @@ export function StatusTab(): JSX.Element {
   const conn = useConnection();
   const status = useRuntimeStatusSnapshot();
   const [shutdownOpen, setShutdownOpen] = useState(false);
+  const demoMode = isDemoMode();
 
   const uptime = useMemo(() => uptimeFromStarted(null), []);
 
@@ -188,17 +190,21 @@ export function StatusTab(): JSX.Element {
           footer={
             <div className="flex items-center justify-between gap-3">
               <span>
-                Stopping the daemon ends the active session for this device.
+                {demoMode
+                  ? 'This browser demo is static and cannot start or stop your local daemon.'
+                  : 'Stopping the daemon ends the active session for this device.'}
               </span>
-              <Button
-                variant="danger"
-                size="sm"
-                onClick={() => setShutdownOpen(true)}
-                aria-label="Stop the Kora daemon"
-              >
-                <Power className="h-4 w-4" strokeWidth={1.5} />
-                Stop daemon
-              </Button>
+              {!demoMode && (
+                <Button
+                  variant="danger"
+                  size="sm"
+                  onClick={() => setShutdownOpen(true)}
+                  aria-label="Stop the Kora daemon"
+                >
+                  <Power className="h-4 w-4" strokeWidth={1.5} />
+                  Stop daemon
+                </Button>
+              )}
             </div>
           }
         />

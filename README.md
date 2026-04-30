@@ -2,8 +2,8 @@
 
 A local-first Life OS agent for keeping a messy day believable.
 
-> ⚠️ **Pre-alpha — active development.**
-> APIs, file layouts, database schemas, and behavior change from week to week. There are no releases, no stability guarantees, and no support. Credentials, conversations, and memory all live on your machine, but the runtime itself is not considered safe for daily use. **Install at your own risk.**
+> **Beta-stage local-first release — active development.**
+> Kora now has a working Electron/React desktop GUI, a working Rich CLI, and a local daemon that powers both clients through the same REST/WebSocket runtime. It is generally ready for local use by developers and early users who are comfortable with setup, logs, and fast-moving code. APIs, file layouts, database schemas, and behavior can still change; packaged distribution and long-term stability hardening are ongoing.
 
 ## What Kora is
 

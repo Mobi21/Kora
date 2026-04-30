@@ -114,6 +114,7 @@ class ADHDModule:
 
         # Calendar load (morning meetings) — compare in the user's
         # local frame so a 9am PST event isn't read as a 5pm UTC event.
+        schedule_present = _has_attr(day_context, "schedule")
         schedule = _get_attr(day_context, "schedule") or []
         morning_events = [
             e
@@ -121,7 +122,9 @@ class ADHDModule:
             if _get_attr(e, "kind") == "event"
             and _starts_before(e, time(12, 0), user_tz)
         ]
-        if len(morning_events) >= BUSY_MORNING_THRESHOLD:
+        if not schedule_present:
+            pass
+        elif len(morning_events) >= BUSY_MORNING_THRESHOLD:
             signals.append(
                 EnergySignal(
                     source="calendar_load",
@@ -313,6 +316,17 @@ def _get_attr(obj: Any, name: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(name)
     return getattr(obj, name, None)
+
+
+def _has_attr(obj: Any, name: str) -> bool:
+    if obj is None:
+        return False
+    if isinstance(obj, dict):
+        return name in obj
+    fields_set = getattr(obj, "model_fields_set", None)
+    if fields_set is not None:
+        return name in fields_set
+    return hasattr(obj, name)
 
 
 def _starts_before(

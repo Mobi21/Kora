@@ -172,6 +172,28 @@ class TestWriteFile:
         assert result["success"] is True
         assert result["size_bytes"] == 0
 
+    @pytest.mark.asyncio
+    async def test_acceptance_trusted_support_draft_is_text_first(self, tmp_path, monkeypatch):
+        """Acceptance Talia drafts should avoid defaulting to phone calls."""
+        from kora_v2.tools.filesystem import WriteFileInput, write_file
+
+        accept_dir = tmp_path / "acceptance"
+        monkeypatch.setenv("KORA_ACCEPTANCE_DIR", str(accept_dir))
+        target = accept_dir / "memory" / "Life OS" / "Trusted Support" / "talia.md"
+        content = (
+            "Draft for Talia:\n"
+            "Would you be up for a quick check-in call or study session?\n"
+            "Are you around for a quick call later?\n"
+        )
+
+        result = _parse(await write_file(WriteFileInput(path=str(target), content=content), None))
+
+        assert result["success"] is True
+        saved = target.read_text()
+        assert "quick text check-in or study session" in saved
+        assert "quick text later" in saved
+        assert "call" not in saved.lower()
+
 
 # ── read_file ─────────────────────────────────────────────────────────────────
 

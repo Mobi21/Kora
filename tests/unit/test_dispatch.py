@@ -73,6 +73,18 @@ class TestSupervisorToolDefinitions:
 class TestExecuteTool:
     """Verify tool execution routing."""
 
+    def test_user_autonomous_task_goal_can_reference_cancel_probe(self) -> None:
+        from kora_v2.graph.dispatch import _is_cancel_probe_request
+
+        assert not _is_cancel_probe_request(
+            "user_autonomous_task",
+            "Prepare the useful doctor checklist and also mention cancel-probe.",
+        )
+        assert _is_cancel_probe_request(
+            "cancel_probe",
+            "Disposable broad generic prep helper.",
+        )
+
     @pytest.mark.asyncio
     async def test_get_running_tasks_returns_summary_and_acknowledges_terminal(
         self,
@@ -224,6 +236,49 @@ class TestExecuteTool:
 
         assert result["status"] == "ok"
         assert result["cancelled"] is False
+        engine.cancel_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancel_only_probe_reason_does_not_cancel_routine_task(
+        self,
+    ) -> None:
+        from kora_v2.graph.dispatch import _orch_cancel_task
+
+        task = SimpleNamespace(
+            id="task-routine",
+            stage_name="routine",
+            goal="routine_tiny_morning_reset: run the morning routine",
+            result_summary=None,
+            error_message=None,
+            pipeline_instance_id="pipe-routine",
+        )
+        instance = SimpleNamespace(
+            pipeline_name="routine_tiny_morning_reset",
+            goal="Tiny Morning Reset",
+        )
+        registry = SimpleNamespace(load=AsyncMock(return_value=instance))
+        engine = SimpleNamespace(
+            get_task=AsyncMock(return_value=task),
+            instance_registry=registry,
+            cancel_task=AsyncMock(return_value=True),
+        )
+
+        result = json.loads(
+            await _orch_cancel_task(
+                engine,
+                {
+                    "task_id": "task-routine",
+                    "reason": (
+                        "The cancel-probe helper is noisy now. Cancel only "
+                        "cancel-probe right now."
+                    ),
+                },
+            )
+        )
+
+        assert result["status"] == "ok"
+        assert result["cancelled"] is False
+        assert "protected system pipeline" in result["message"]
         engine.cancel_task.assert_not_awaited()
 
     @pytest.mark.asyncio

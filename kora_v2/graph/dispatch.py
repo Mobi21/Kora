@@ -183,12 +183,31 @@ def _explicitly_mentions_protected_pipeline(reason: str, pipeline_name: str) -> 
     return any(alias.lower() in lowered for alias in aliases)
 
 
+def _is_protected_system_pipeline_name(pipeline_name: str) -> bool:
+    """Return True for internal pipelines users should not cancel casually."""
+    normalized = str(pipeline_name or "").strip()
+    return normalized in _PROTECTED_SYSTEM_PIPELINES or normalized.startswith(
+        "routine_"
+    )
+
+
+def _reason_targets_cancel_probe(text: str) -> bool:
+    lowered = text.lower().replace("_", "-")
+    normalized = lowered.replace("-", " ")
+    return "cancel-probe" in lowered or "cancel probe" in normalized
+
+
+def _haystack_matches_cancel_probe(*values: Any) -> bool:
+    haystack = " ".join(str(value or "") for value in values).lower()
+    return _reason_targets_cancel_probe(haystack)
+
+
 # =====================================================================
 # Permission Grant Recording
 # =====================================================================
 
 
-def _record_permission_grant(
+async def _record_permission_grant(
     tool_name: str,
     auth_level: AuthLevel,
     decision: str,
@@ -196,44 +215,35 @@ def _record_permission_grant(
     session_id: str | None,
     container: Any,
 ) -> None:
-    """Fire-and-forget write to permission_grants for auth audit trail."""
-    import asyncio
-
-    async def _write() -> None:
-        try:
-            settings = getattr(container, "settings", None)
-            if settings is None:
-                return
-            db_path = getattr(settings, "data_dir", None)
-            if db_path is None:
-                return
-            op_db = db_path / "operational.db"
-            import aiosqlite
-
-            async with aiosqlite.connect(str(op_db)) as db:
-                await db.execute(
-                    "INSERT INTO permission_grants "
-                    "(id, tool_name, scope, risk_level, decision, granted_at, session_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        uuid.uuid4().hex[:12],
-                        tool_name,
-                        auth_level.value,
-                        risk_level,
-                        decision,
-                        datetime.now(UTC).isoformat(),
-                        session_id,
-                    ),
-                )
-                await db.commit()
-        except Exception:
-            log.debug("permission_grant_write_failed", tool=tool_name)
-
+    """Write permission_grants for auth audit trail."""
     try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(_write())
-    except RuntimeError:
-        pass
+        settings = getattr(container, "settings", None)
+        if settings is None:
+            return
+        db_path = getattr(settings, "data_dir", None)
+        if db_path is None:
+            return
+        op_db = db_path / "operational.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(str(op_db)) as db:
+            await db.execute(
+                "INSERT INTO permission_grants "
+                "(id, tool_name, scope, risk_level, decision, granted_at, session_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    uuid.uuid4().hex[:12],
+                    tool_name,
+                    auth_level.value,
+                    risk_level,
+                    decision,
+                    datetime.now(UTC).isoformat(),
+                    session_id,
+                ),
+            )
+            await db.commit()
+    except Exception:
+        log.debug("permission_grant_write_failed", tool=tool_name)
 
 
 # =====================================================================
@@ -908,7 +918,7 @@ async def execute_tool(
 
     # Persist the auth decision to permission_grants for audit.
     if auth_level != AuthLevel.ALWAYS_ALLOWED:
-        _record_permission_grant(
+        await _record_permission_grant(
             tool_name=tool_name,
             auth_level=auth_level,
             decision="approved" if approved else "denied",
@@ -1851,8 +1861,11 @@ def _life_admin_checklist_text(goal: str) -> str:
 
 
 def _is_cancel_probe_request(pipeline_name: str, goal: str) -> bool:
+    name = pipeline_name.strip().lower()
+    if name == "user_autonomous_task":
+        return False
     haystack = f"{pipeline_name} {goal}".lower()
-    return "cancel-probe" in haystack or "cancel_probe" in haystack
+    return _haystack_matches_cancel_probe(haystack)
 
 
 async def _orch_get_running_tasks(
@@ -1875,6 +1888,25 @@ async def _orch_get_running_tasks(
             or str(getattr(t, "state", ""))
         )
         task_id = getattr(t, "id", None)
+        pipeline_instance_id = getattr(t, "pipeline_instance_id", None)
+        pipeline_name = ""
+        if pipeline_instance_id:
+            try:
+                instance = await engine.instance_registry.load(pipeline_instance_id)
+                pipeline_name = str(getattr(instance, "pipeline_name", "") or "")
+            except Exception:  # noqa: BLE001
+                log.debug(
+                    "orchestration_get_running_tasks_instance_lookup_failed",
+                    task_id=task_id,
+                    exc_info=True,
+                )
+        if _is_protected_system_pipeline_name(
+            pipeline_name
+        ) and not _explicitly_mentions_protected_pipeline(
+            str(user_message or ""),
+            pipeline_name,
+        ):
+            continue
         out.append(
             {
                 "task_id": task_id,
@@ -1883,7 +1915,7 @@ async def _orch_get_running_tasks(
                 "goal": getattr(t, "goal", None),
                 "result_summary": getattr(t, "result_summary", None),
                 "error_message": getattr(t, "error_message", None),
-                "pipeline_instance_id": getattr(t, "pipeline_instance_id", None),
+                "pipeline_instance_id": pipeline_instance_id,
             }
         )
         if task_id and state_value in {"completed", "failed", "cancelled"}:
@@ -2003,10 +2035,9 @@ async def _orch_cancel_task(
             pipeline_tasks = []
 
     pipeline_name = str(getattr(instance, "pipeline_name", "") or "")
-    if (
-        pipeline_name in _PROTECTED_SYSTEM_PIPELINES
-        and not _explicitly_mentions_protected_pipeline(reason, pipeline_name)
-    ):
+    if _is_protected_system_pipeline_name(
+        pipeline_name
+    ) and not _explicitly_mentions_protected_pipeline(reason, pipeline_name):
         return json.dumps(
             {
                 "status": "ok",
@@ -2061,6 +2092,27 @@ async def _orch_cancel_task(
                 )
         except Exception:  # noqa: BLE001
             log.debug("cancel_task_preserve_research_check_failed", exc_info=True)
+
+    if _reason_targets_cancel_probe(reason) and not _haystack_matches_cancel_probe(
+        getattr(task, "id", None),
+        getattr(task, "stage_name", None),
+        getattr(task, "goal", None),
+        getattr(task, "result_summary", None),
+        getattr(task, "error_message", None),
+        pipeline_name,
+        getattr(instance, "goal", None),
+    ):
+        return json.dumps(
+            {
+                "status": "ok",
+                "task_id": task_id,
+                "cancelled": False,
+                "message": (
+                    "No cancellation applied: the user asked for cancel-probe, "
+                    "and this task is not cancel-probe."
+                ),
+            }
+        )
 
     if target_words and task is not None:
         task_haystack = " ".join(

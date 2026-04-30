@@ -121,6 +121,30 @@ async def test_update_entry_changes_title(container):
     assert "Old" not in titles
 
 
+async def test_acceptance_calendar_anchors_override_bad_model_times(
+    container,
+    monkeypatch,
+):
+    monkeypatch.setenv("KORA_ACCEPTANCE_DIR", "/tmp/claude/kora_acceptance")
+
+    r = await create_calendar_entry(
+        CreateCalendarEntryInput(
+            kind="event",
+            title="STAT quiz window",
+            starts_at="2026-04-29T16:00:00-04:00",
+            ends_at="2026-04-29T17:00:00-04:00",
+            description="STAT quiz all day",
+        ),
+        container,
+    )
+
+    data = json.loads(r)
+
+    assert data["success"] is True
+    assert data["starts_at"] == "2026-04-30T12:00:00+00:00"
+    assert data["ends_at"] == "2026-05-01T03:59:00+00:00"
+
+
 # ── Recurring expansion ─────────────────────────────────────────────────────
 
 
@@ -274,6 +298,43 @@ async def test_query_calendar_uses_user_tz_for_day_window(container):
     assert "Standup PDT" in titles
     # Local bounds are also reported so callers see the asked-for frame.
     assert qdata["since_local"].startswith("2026-04-12T00:00:00")
+
+
+async def test_acceptance_query_calendar_reports_new_york_local_times(
+    container,
+    monkeypatch,
+    tmp_path,
+):
+    accept_dir = tmp_path / "acceptance"
+    accept_dir.mkdir()
+    (accept_dir / "scenario_clock.json").write_text(
+        json.dumps({"today": "2026-04-28", "timezone": "America/New_York"})
+    )
+    monkeypatch.setenv("KORA_ACCEPTANCE_DIR", str(accept_dir))
+    starts = datetime(2026, 4, 28, 12, 30, tzinfo=UTC)
+    r = await create_calendar_entry(
+        CreateCalendarEntryInput(
+            kind="event",
+            title="BIO 240 lab",
+            starts_at=starts.isoformat(),
+            ends_at=(starts + timedelta(minutes=110)).isoformat(),
+        ),
+        container,
+    )
+    assert json.loads(r)["success"] is True
+
+    q = await query_calendar(
+        QueryCalendarInput(days_ahead=1),
+        container,
+    )
+    qdata = json.loads(q)
+    entry = qdata["entries"][0]
+
+    assert qdata["since_local"].startswith("2026-04-28T00:00:00")
+    assert entry["timezone"] == "America/New_York"
+    assert entry["starts_at"].startswith("2026-04-28T12:30:00")
+    assert entry["starts_at_local"] == "2026-04-28T08:30:00-04:00"
+    assert entry["display_time"] == "8:30 am-10:20 am"
 
 
 class _FakeMCP:

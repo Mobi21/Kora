@@ -18,6 +18,7 @@ import pytest
 from tests.acceptance._harness_server import (
     _LEGACY_AUTONOMOUS_TABLES,
     _LIFE_MANAGEMENT_TABLES,
+    _LIFE_OS_TABLES,
     _LIFECYCLE_TABLES,
     _ORCHESTRATION_TABLES,
     _PROACTIVE_TABLES,
@@ -215,6 +216,15 @@ async def _init_full_schema(db_path: Path) -> None:
             );
             """
         )
+        for table in _LIFE_OS_TABLES:
+            await db.execute(
+                f"""
+                CREATE TABLE {table} (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT
+                )
+                """
+            )
         await db.commit()
 
 
@@ -355,6 +365,11 @@ async def _seed_one_row_per_table(db_path: Path) -> None:
             "(id, routine_id, session_id, started_at) VALUES (?, ?, ?, ?)",
             ("routine_session_1", "routine_1", "sess_1", now),
         )
+        for table in _LIFE_OS_TABLES:
+            await db.execute(
+                f"INSERT INTO {table} (id, created_at) VALUES (?, ?)",
+                (f"{table}_1", now),
+            )
         # Proactive / lifecycle adjuncts
         await db.execute(
             "INSERT INTO notifications "
@@ -411,6 +426,7 @@ def test_clean_stale_test_data_clears_all_tables(tmp_path: Path) -> None:
             *_ORCHESTRATION_TABLES,
             *_RUNTIME_STATE_TABLES,
             *_LIFE_MANAGEMENT_TABLES,
+            *_LIFE_OS_TABLES,
             *_LIFECYCLE_TABLES,
             *_PROACTIVE_TABLES,
         ):
@@ -423,6 +439,7 @@ def test_clean_stale_test_data_clears_all_tables(tmp_path: Path) -> None:
             *_ORCHESTRATION_TABLES,
             *_RUNTIME_STATE_TABLES,
             *_LIFE_MANAGEMENT_TABLES,
+            *_LIFE_OS_TABLES,
             *_LIFECYCLE_TABLES,
             *_PROACTIVE_TABLES,
         ):
@@ -520,7 +537,7 @@ def test_clean_stale_projection_data_clears_acceptance_memory_rows(
             INSERT INTO user_model_facts (id, content, source_path) VALUES
                 ('f1', 'old fact', '/Users/mobi/.kora/memory/fact.md');
             INSERT INTO entities (id, name, canonical_name, entity_type) VALUES
-                ('e1', 'Alex', 'alex', 'person');
+                ('e1', 'Talia Chen', 'talia chen', 'person');
             INSERT INTO entity_links (entity_id, memory_id, relationship) VALUES
                 ('e1', 'm1', 'mentions');
             INSERT INTO memories_vec (embedding) VALUES (x'00');

@@ -5,6 +5,7 @@ Usage:
     python3 -m tests.acceptance.automated stop
     python3 -m tests.acceptance.automated send "message"
     python3 -m tests.acceptance.automated status
+    python3 -m tests.acceptance.automated clean-start-status
     python3 -m tests.acceptance.automated snapshot <name>
     python3 -m tests.acceptance.automated diff <snap1> <snap2>
     python3 -m tests.acceptance.automated idle-wait [--min-soak N] [--timeout N]
@@ -35,6 +36,7 @@ Usage:
     python3 -m tests.acceptance.automated phase-gate <phase_name>
     python3 -m tests.acceptance.automated benchmarks
     python3 -m tests.acceptance.automated event-tail [--seconds N]
+    python3 -m tests.acceptance.automated persona-run [--fast] [--day day1] [--phase name] [--max-turns N]
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -60,6 +63,9 @@ SESSION_FILE = ACCEPT_DIR / "acceptance_session.json"
 MONITOR_FILE = OUTPUT_DIR / "acceptance_monitor.md"
 HARNESS_SOCK = ACCEPT_DIR / "harness.sock"
 HARNESS_PID_FILE = ACCEPT_DIR / "harness.pid"
+PERSISTENT_MEMORY_ROOT = Path(
+    os.environ.get("KORA_ACCEPTANCE_PERSISTENT_MEMORY_ROOT", "~/.kora/memory")
+).expanduser()
 
 LOCKFILE = PROJECT_ROOT / "data" / "kora.lock"
 TOKEN_FILE = PROJECT_ROOT / "data" / ".api_token"
@@ -99,20 +105,40 @@ def _ensure_dirs() -> None:
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _reset_acceptance_artifacts() -> None:
+def _reset_acceptance_artifacts() -> dict[str, Any]:
     """Make `start` a fresh acceptance run by default."""
-    if SESSION_FILE.exists():
-        SESSION_FILE.unlink()
-    if OUTPUT_DIR.exists():
-        shutil.rmtree(OUTPUT_DIR)
-    MONITOR_FILE.unlink(missing_ok=True)
+    resolved = ACCEPT_DIR.expanduser().resolve()
+    forbidden = {
+        Path("/").resolve(),
+        Path.home().resolve(),
+        PROJECT_ROOT.resolve(),
+        PROJECT_ROOT.parent.resolve(),
+    }
+    if resolved in forbidden:
+        raise RuntimeError(f"Refusing to wipe unsafe acceptance dir: {resolved}")
+
+    existed = resolved.exists()
+    if existed:
+        shutil.rmtree(resolved)
     _ensure_dirs()
+    return {
+        "acceptance_dir": str(resolved),
+        "acceptance_dir_removed": existed,
+        "output_dir": str(OUTPUT_DIR),
+        "memory_root": str(ACCEPT_DIR / "memory"),
+    }
 
 
-def _seed_run_start() -> None:
+def _seed_run_start(
+    *,
+    fast: bool,
+    clean_start: dict[str, Any] | None = None,
+) -> None:
     """Persist the acceptance start boundary before daemon boot."""
+    now = datetime.now(UTC).isoformat()
     state = {
-        "started_at": datetime.now(UTC).isoformat(),
+        "run_id": f"acceptance-{uuid.uuid4().hex[:12]}",
+        "started_at": now,
         "current_day": 1,
         "simulated_hours_offset": 0,
         "messages": [],
@@ -121,11 +147,25 @@ def _seed_run_start() -> None:
         "errors": [],
         "thread_id": None,
         "kora_session_id": None,
+        "mode": "fast" if fast else "full",
+        "first_run": {
+            "required": True,
+            "status": "required_pending",
+            "reason": "Acceptance start always simulates a first-time Kora user.",
+            "completed_at": None,
+        },
+        "clean_start": {
+            "required": True,
+            "completed_at": now,
+            "isolated_memory_root": str(ACCEPT_DIR / "memory"),
+            "persistent_memory_root_checked": str(PERSISTENT_MEMORY_ROOT),
+            **(clean_start or {}),
+        },
     }
     SESSION_FILE.write_text(json.dumps(state, indent=2))
 
 
-def _clean_before_daemon_start() -> None:
+def _clean_before_daemon_start() -> dict[str, Any]:
     """Clear acceptance-owned runtime state before daemon boot.
 
     The daemon rehydrates orchestration rows during startup. If cleanup
@@ -135,15 +175,25 @@ def _clean_before_daemon_start() -> None:
     the daemon will observe.
     """
     from tests.acceptance._harness_server import (
+        _clean_acceptance_persona_residue,
         _clean_stale_projection_data,
         _clean_stale_test_data,
         _reset_daemon_runtime_files,
     )
 
-    _reset_daemon_runtime_files(PROJECT_ROOT / "data")
+    cleanup: dict[str, Any] = {}
+    cleanup["identity_files"] = _reset_daemon_runtime_files(PROJECT_ROOT / "data")
+    cleanup["persona_residue"] = _clean_acceptance_persona_residue(
+        PERSISTENT_MEMORY_ROOT,
+        ACCEPT_DIR / "clean_start_quarantine" / "persistent_memory",
+    )
     asyncio.run(_clean_stale_test_data(PROJECT_ROOT / "data" / "operational.db"))
+    cleanup["operational_db"] = "cleaned"
     _clean_stale_projection_data(PROJECT_ROOT / "data" / "projection.db")
+    cleanup["projection_db"] = "cleaned"
     _seed_projection_acceptance_fixtures()
+    cleanup["projection_fixtures"] = "seeded"
+    return cleanup
 
 
 def _seed_projection_acceptance_fixtures() -> None:
@@ -174,16 +224,16 @@ def _seed_projection_acceptance_fixtures() -> None:
             if has_entities:
                 existing = db.execute(
                     "SELECT id FROM entities "
-                    "WHERE canonical_name='alex' AND entity_type='person' "
+                    "WHERE canonical_name='talia chen' AND entity_type='person' "
                     "LIMIT 1"
                 ).fetchone()
                 merged_metadata = json.dumps({
                     "source": "acceptance_fixture",
                     "merged_from": [
                         {
-                            "id": "acceptance-alex-alias",
-                            "name": "my partner",
-                            "canonical_name": "partner",
+                            "id": "acceptance-talia-alias",
+                            "name": "my lab partner",
+                            "canonical_name": "lab partner",
                             "entity_type": "person",
                         }
                     ],
@@ -199,9 +249,9 @@ def _seed_projection_acceptance_fixtures() -> None:
                         "(id, name, canonical_name, entity_type, metadata) "
                         "VALUES (?, ?, ?, ?, ?)",
                         (
-                            "acceptance-alex",
-                            "Alex",
-                            "alex",
+                            "acceptance-talia",
+                            "Talia Chen",
+                            "talia chen",
                             "person",
                             merged_metadata,
                         ),
@@ -210,19 +260,20 @@ def _seed_projection_acceptance_fixtures() -> None:
             memory_dir.mkdir(parents=True, exist_ok=True)
             now = datetime.now(UTC).isoformat(timespec="seconds")
             duplicate_body = (
-                "Jordan prefers local-first tools for the dashboard because "
-                "privacy and low maintenance matter more than cloud polish."
+                "Maya prefers local-first tools for her school-week dashboard "
+                "because academic, health, and support data should stay local "
+                "unless she explicitly approves sync."
             )
             fixture_notes = (
                 (
                     "acceptance-dedup-local-first-a",
                     0.95,
-                    ["Jordan", "Alex", "Mochi"],
+                    ["Maya Rivera", "Talia Chen", "Three Rivers University"],
                 ),
                 (
                     "acceptance-dedup-local-first-b",
                     0.2,
-                    ["Jordan"],
+                    ["Maya Rivera"],
                 ),
             )
             for note_id, importance, entities in fixture_notes:
@@ -528,18 +579,76 @@ def _set_daemon_auth_mode(mode: str) -> bool:
 
 def _stop_harness_server() -> bool:
     """Stop the harness background server."""
+    stopped = False
     result = harness_cmd({"cmd": "stop"}, timeout=5.0)
     if "error" not in result:
-        return True
+        stopped = True
     # Fallback: kill by PID
     if HARNESS_PID_FILE.exists():
         try:
             pid = int(HARNESS_PID_FILE.read_text().strip())
             os.kill(pid, 15)
-            return True
+            stopped = True
         except Exception:
             pass
-    return False
+
+    # A killed or timed-out persona runner can leave orphan harness servers
+    # without the current PID file. Clean every exact module match so a fresh
+    # acceptance run cannot talk to a stale server.
+    stopped = _terminate_harness_server_processes() or stopped
+    return stopped
+
+
+def _terminate_harness_server_processes() -> bool:
+    """Terminate orphan ``tests.acceptance._harness_server`` processes."""
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", "tests.acceptance._harness_server"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except Exception:
+        return False
+
+    pids: list[int] = []
+    current_pid = os.getpid()
+    for raw in proc.stdout.splitlines():
+        try:
+            pid = int(raw.strip())
+        except ValueError:
+            continue
+        if pid != current_pid:
+            pids.append(pid)
+
+    if not pids:
+        HARNESS_PID_FILE.unlink(missing_ok=True)
+        return False
+
+    for pid in pids:
+        try:
+            os.kill(pid, 15)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            continue
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not any(_pid_alive(pid) for pid in pids):
+            break
+        time.sleep(0.1)
+
+    for pid in pids:
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, 9)
+            except Exception:
+                pass
+
+    HARNESS_PID_FILE.unlink(missing_ok=True)
+    return True
 
 
 def _pid_alive(pid: int) -> bool:
@@ -550,6 +659,57 @@ def _pid_alive(pid: int) -> bool:
         return False
     except Exception:
         return True
+
+
+def _stop_existing_runtime_for_fresh_start() -> dict[str, Any]:
+    """Stop any existing harness/daemon before a fresh acceptance start."""
+    result: dict[str, Any] = {
+        "harness_stop_requested": False,
+        "daemon_stop_requested": False,
+        "daemon_force_terminated": False,
+    }
+
+    result["harness_stop_requested"] = _stop_harness_server()
+    if result["harness_stop_requested"]:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if not HARNESS_PID_FILE.exists():
+                break
+            try:
+                pid = int(HARNESS_PID_FILE.read_text().strip())
+            except Exception:
+                break
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.2)
+
+    data = _read_lockfile()
+    daemon_pid = data.get("pid") if data else None
+    result["daemon_stop_requested"] = _stop_kora_daemon()
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        data = _read_lockfile()
+        pid = data.get("pid") if data else daemon_pid
+        if not data or not pid or not _pid_alive(pid):
+            break
+        time.sleep(0.5)
+
+    data = _read_lockfile()
+    pid = data.get("pid") if data else daemon_pid
+    if pid and _pid_alive(pid):
+        try:
+            os.kill(pid, 15)
+            result["daemon_force_terminated"] = True
+        except Exception as exc:
+            result["daemon_force_error"] = str(exc)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.25)
+    result["daemon_alive_after_stop"] = bool(pid and _pid_alive(pid))
+    LOCKFILE.unlink(missing_ok=True)
+    return result
 
 
 # ── Coverage file management ───────────────────────────────────────────────────
@@ -586,22 +746,48 @@ def _init_coverage_file(fast: bool = False) -> None:
 
 def cmd_start(fast: bool = False) -> None:
     """Start Kora daemon + harness server."""
-    _reset_acceptance_artifacts()
-    _seed_run_start()
     mode = " (--fast mode)" if fast else ""
     print(f"Starting Kora V2 acceptance test environment{mode}...")
 
+    # 0. `start` is fresh by default, so an old harness/daemon must not
+    # survive into the next run.
+    print("\n[0/5] Stopping any existing acceptance runtime...")
+    runtime_stop = _stop_existing_runtime_for_fresh_start()
+    print(
+        "  Existing runtime stop: "
+        f"harness={runtime_stop['harness_stop_requested']} "
+        f"daemon={runtime_stop['daemon_stop_requested']}"
+    )
+    if runtime_stop.get("daemon_alive_after_stop"):
+        print("  ERROR: existing Kora daemon is still alive; refusing fresh start.")
+        sys.exit(1)
+
     # 1. Clean acceptance-owned state before the daemon can rehydrate it.
-    print("\n[1/4] Cleaning stale acceptance runtime state...")
-    _clean_before_daemon_start()
-    print("  Acceptance DB/runtime state cleared.")
+    print("\n[1/5] Cleaning stale acceptance runtime state...")
+    artifact_cleanup = _reset_acceptance_artifacts()
+    runtime_cleanup = _clean_before_daemon_start()
+    clean_start = {
+        "runtime_stop": runtime_stop,
+        "artifacts": artifact_cleanup,
+        "runtime_state": runtime_cleanup,
+    }
+    _seed_run_start(fast=fast, clean_start=clean_start)
+    quarantined = (
+        runtime_cleanup.get("persona_residue", {}).get("quarantined_count", 0)
+        if isinstance(runtime_cleanup.get("persona_residue"), dict)
+        else 0
+    )
+    print(
+        "  Acceptance scratch, memory, DB/runtime state cleared. "
+        f"Persona residue quarantined: {quarantined}"
+    )
 
     # 2. Start Kora daemon
-    print("\n[2/4] Starting Kora daemon...")
+    print("\n[2/5] Starting Kora daemon...")
     _start_kora_daemon()
 
     # 3. Wait for daemon ready
-    print("[3/4] Waiting for daemon to be ready...")
+    print("[3/5] Waiting for daemon to be ready...")
     try:
         host, port = _wait_for_daemon(timeout=90.0)
         token = _read_token()
@@ -615,16 +801,24 @@ def cmd_start(fast: bool = False) -> None:
         sys.exit(1)
 
     # 4. Start harness server
-    print("[4/4] Starting harness server...")
+    print("[4/5] Starting harness server...")
     _start_harness_server()
 
     # 5. Verify harness connection
+    print("[5/5] Verifying harness startup metadata...")
     time.sleep(1.0)
     result = harness_cmd({"cmd": "ping"}, timeout=10.0)
     if "error" in result:
         print(f"  Warning: Harness ping failed: {result['error']}")
     else:
         print(f"  Harness server ready. Kora session: {result.get('session_id', '?')}")
+        clean = result.get("clean_start") or {}
+        first = result.get("first_run") or {}
+        print(
+            "  Clean start: "
+            f"required={clean.get('required')} "
+            f"first_run_required={first.get('required')}"
+        )
 
     # 6. Init coverage file
     _init_coverage_file(fast=fast)
@@ -678,7 +872,7 @@ def cmd_stop() -> None:
 
 def cmd_send(message: str) -> None:
     """Send a message to Kora and print the response."""
-    print(f"\n[Jordan] {message}")
+    print(f"\n[Persona] {message}")
     print("[Kora] thinking...", end="\r")
 
     result = harness_cmd(
@@ -720,6 +914,15 @@ def cmd_status() -> None:
     result = harness_cmd({"cmd": "status"})
     if "error" in result:
         print(f"Status error: {result['error']}")
+        sys.exit(1)
+    print(json.dumps(result, indent=2, default=str))
+
+
+def cmd_clean_start_status() -> None:
+    """Print acceptance fresh-start / first-run startup proof."""
+    result = harness_cmd({"cmd": "clean-start-status"})
+    if "error" in result:
+        print(f"Clean-start status error: {result['error']}")
         sys.exit(1)
     print(json.dumps(result, indent=2, default=str))
 
@@ -839,15 +1042,23 @@ def cmd_restart() -> None:
 
     print("  Starting harness server...")
     _start_harness_server()
-    time.sleep(2.0)
-
-    result = harness_cmd({"cmd": "ping"}, timeout=10.0)
+    result: dict[str, Any] = {"error": "Harness did not become ready"}
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        result = harness_cmd({"cmd": "ping"}, timeout=5.0)
+        if "error" not in result:
+            break
+        time.sleep(0.5)
     if "error" in result:
-        print(f"  Warning: Harness ping failed: {result['error']}")
+        print(f"  ERROR: Harness ping failed: {result['error']}")
+        sys.exit(1)
     else:
         print(f"  Harness ready. New Kora session: {result.get('session_id', '?')}")
 
     r = harness_cmd({"cmd": "snapshot", "name": "post_restart"})
+    if "error" in r:
+        print(f"  ERROR: Post-restart snapshot failed: {r['error']}")
+        sys.exit(1)
     print(f"  Post-restart snapshot: {r.get('path', '?')}")
 
 
@@ -872,13 +1083,22 @@ def cmd_test_auth() -> None:
         sys.exit(1)
     print("Auth test mode ENABLED; running deny/approve probes.")
     print("  Daemon auth_mode = prompt (asks for each tool).")
-    probe = (
-        "quick auth probe: please write the word ok to "
-        "/tmp/claude/kora_acceptance/auth_probe.txt"
+    probe_path = "/tmp/claude/kora_acceptance/auth_probe.txt"
+    first_probe = (
+        "auth relay deny probe: call write_file now with path "
+        f"{probe_path} and content ok. Do not read the file first and do not "
+        "check whether it exists. This first write is expected to be denied "
+        "by the harness; if denied, say the user/harness denied the write "
+        "request and stop."
+    )
+    second_probe = (
+        "auth relay approve probe: call write_file again now with path "
+        f"{probe_path} and content ok. Do not read the file first and do not "
+        "check whether it exists. After the write succeeds, say it wrote ok."
     )
     try:
         first = harness_cmd(
-            {"cmd": "send", "message": probe, "timeout": 600.0},
+            {"cmd": "send", "message": first_probe, "timeout": 600.0},
             timeout=660.0,
         )
         if first.get("error"):
@@ -889,8 +1109,7 @@ def cmd_test_auth() -> None:
             + ", ".join(first.get("tool_calls", [])[:5])
         )
         second = harness_cmd(
-            {"cmd": "send", "message": "try the same auth probe again: " + probe,
-             "timeout": 600.0},
+            {"cmd": "send", "message": second_probe, "timeout": 600.0},
             timeout=660.0,
         )
         if second.get("error"):
@@ -1484,6 +1703,9 @@ def main() -> None:
     elif cmd == "status":
         cmd_status()
 
+    elif cmd == "clean-start-status":
+        cmd_clean_start_status()
+
     elif cmd == "snapshot":
         if len(args) < 2:
             print("Usage: automated.py snapshot <name>")
@@ -1603,6 +1825,11 @@ def main() -> None:
         parser.add_argument("--seconds", type=int, default=10)
         parsed = parser.parse_args(args[1:])
         cmd_event_tail(parsed.seconds)
+
+    elif cmd == "persona-run":
+        from tests.acceptance.persona_agent_runner import run_persona_agent_from_argv
+
+        run_persona_agent_from_argv(args[1:], harness_cmd=harness_cmd)
 
     else:
         print(f"Unknown command: {cmd}")

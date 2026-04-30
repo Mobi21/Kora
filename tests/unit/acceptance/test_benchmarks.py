@@ -479,6 +479,31 @@ def test_append_benchmarks_csv_single_header_under_lock(
     assert len(data_rows) == 4
 
 
+def test_append_benchmarks_csv_uses_acceptance_output_when_env_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acceptance runs keep trend CSVs inside the acceptance scratch dir."""
+    from tests.acceptance import _harness_server as hs_mod
+    from tests.acceptance._harness_server import HarnessServer
+    from tests.acceptance.scenario.benchmarks import CSV_COLUMNS
+
+    accept_dir = tmp_path / "acceptance"
+    monkeypatch.setenv("KORA_ACCEPTANCE_DIR", str(accept_dir))
+    monkeypatch.setattr(hs_mod, "OUTPUT_DIR", accept_dir / "acceptance_output")
+    monkeypatch.setattr(hs_mod, "PROJECT_ROOT", tmp_path / "project")
+
+    HarnessServer._append_benchmarks_csv(
+        "snap-env",
+        {col: "v" for col in CSV_COLUMNS},
+    )
+
+    assert (accept_dir / "acceptance_output" / "benchmarks.csv").exists()
+    assert not (
+        tmp_path / "project" / "data" / "acceptance" / "benchmarks.csv"
+    ).exists()
+
+
 def test_phase_dwell_handles_mixed_timezone_formats() -> None:
     """_compute_phase_dwell must parse ``Z`` and ``+00:00`` offsets correctly.
 

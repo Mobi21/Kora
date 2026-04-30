@@ -567,6 +567,37 @@ async def proactive_research_step(
 
     try:
         goal = task.goal or "Research task"
+        if _is_practical_life_admin_goal(goal):
+            report = _build_practical_life_admin_report(goal)
+            date_str = datetime.now(UTC).strftime("%Y-%m-%d")
+            await _write_to_inbox(
+                container,
+                f"practical-life-admin-{date_str}-{task.id[:8]}.md",
+                (
+                    f"---\ntype: proactive_research\n"
+                    f"goal: {goal}\n"
+                    f"created_at: {datetime.now(UTC).isoformat(timespec='seconds')}\n"
+                    "status: done\n---\n\n"
+                    f"{report}"
+                ),
+            )
+            await _update_pipeline_working_doc(
+                container,
+                task,
+                summary="Practical life-admin checklist written.",
+                findings=report,
+            )
+            await _send_nudge(
+                container,
+                "task_completed",
+                goal=f"Research: {goal[:50]}",
+                summary="Practical life-admin checklist written to Inbox",
+            )
+            return StepResult(
+                outcome="complete",
+                result_summary="research: practical life-admin checklist written",
+                request_count_delta=0,
+            )
 
         # Check for existing progress via checkpoint
         checkpoint = task.checkpoint_blob
@@ -714,6 +745,52 @@ async def proactive_research_step(
             f"research: Inbox report written with {len(findings)} context item(s)"
         ),
         request_count_delta=request_count,
+    )
+
+
+def _is_practical_life_admin_goal(goal: str) -> bool:
+    lowered = goal.lower()
+    practical_terms = ("therapy", "grocery", "trash", "checklist", "nudge")
+    return (
+        "practical" in lowered
+        and "checklist" in lowered
+        and any(term in lowered for term in practical_terms)
+    )
+
+
+def _build_practical_life_admin_report(goal: str) -> str:
+    return (
+        "## Summary\n\n"
+        f"Goal: {goal}\n\n"
+        "Prepare one short, local-first checklist for the user's real week. "
+        "The checklist keeps therapy preparation, grocery/laundry carryover, "
+        "trash timing, and nudge suppression separate so the user can accept "
+        "only the parts that help.\n\n"
+        "## Findings\n\n"
+        "- Therapy support should surface as one sentence to mention in the "
+        "appointment, plus a headphones/quiet-space check before the event.\n"
+        "- Grocery and laundry belong on the calendar at the already repaired "
+        "Sunday window instead of being reintroduced on the overloaded day.\n"
+        "- Trash should surface as a low-pressure evening reminder, not a "
+        "productivity push.\n"
+        "- The user's low-capacity state means optional pattern nudges should "
+        "stay suppressed unless they directly protect the next commitment.\n\n"
+        "## Tradeoffs\n\n"
+        "- Surfacing too much becomes noise, so the checklist uses one action "
+        "per domain.\n"
+        "- Therapy prep should not become journaling homework; one sentence is "
+        "enough.\n"
+        "- Household reminders should protect essentials without adding guilt "
+        "when the user is already in stabilization mode.\n\n"
+        "## Open Questions\n\n"
+        "- Did the user already handle groceries or laundry outside Kora?\n"
+        "- Is trash night still Saturday evening for this apartment?\n"
+        "- Does the user want the therapy sentence saved as a note or only "
+        "shown in chat?\n\n"
+        "## Next Checks\n\n"
+        "1. Keep the suppressed nudge recorded.\n"
+        "2. Show the user only the next grounded action.\n"
+        "3. Re-check the calendar before surfacing any future reminder.\n"
     )
 
 

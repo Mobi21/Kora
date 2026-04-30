@@ -1,4 +1,6 @@
 import type { Connection } from './connection';
+import { createDemoApiClient } from '@/lib/demo/client';
+import { isDemoMode } from '@/lib/demo/mode';
 import type {
   AutonomousView,
   CalendarEditPreview,
@@ -107,6 +109,8 @@ export function createApiClient(
   conn: Connection,
   opts: CreateClientOptions = {},
 ): ApiClient {
+  if (isDemoMode()) return createDemoApiClient();
+
   const fetchImpl = opts.fetchImpl ?? fetch.bind(globalThis);
   const baseUrlPrefix = opts.baseUrlPrefix ?? '/api/v1';
   const baseUrl = `http://${conn.host}:${conn.port}${baseUrlPrefix}`;

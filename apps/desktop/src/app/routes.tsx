@@ -13,6 +13,7 @@ import { AutonomousScreen } from '@/features/autonomous/AutonomousScreen';
 import { IntegrationsScreen } from '@/features/integrations/IntegrationsScreen';
 import { SettingsScreen } from '@/features/settings/SettingsScreen';
 import { RuntimeScreen } from '@/features/runtime/RuntimeScreen';
+import { isDemoMode } from '@/lib/demo/mode';
 
 export const FIRST_RUN_PATH = '/first-run';
 
@@ -26,6 +27,7 @@ export function AppRoutes(): JSX.Element {
   const connection = useConnectionStore((s) => s.connection);
 
   if (
+    !isDemoMode() &&
     connStatus === 'error' &&
     !connection &&
     location.pathname !== '/runtime' &&

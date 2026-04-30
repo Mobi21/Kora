@@ -363,7 +363,18 @@ def add_messages_reducer(
             out.append(m)
         return out
 
-    return add_messages(_sanitize(existing or []), _sanitize(new or []))
+    new_messages = _sanitize(new or [])
+    if (
+        len(new_messages) == 1
+        and isinstance(new_messages[0], dict)
+        and new_messages[0].get("role") == "__replace_messages__"
+    ):
+        replacement = new_messages[0].get("messages")
+        if isinstance(replacement, list):
+            return _sanitize(replacement)
+        return []
+
+    return add_messages(_sanitize(existing or []), new_messages)
 
 
 # =============================================================================

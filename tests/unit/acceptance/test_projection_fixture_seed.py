@@ -30,13 +30,13 @@ def test_seed_projection_acceptance_fixtures_creates_missing_projection_db(
         (
             "acceptance-dedup-local-first-a",
             0.95,
-            '["Jordan", "Alex", "Mochi"]',
+            '["Maya Rivera", "Talia Chen", "Three Rivers University"]',
             "active",
         ),
         (
             "acceptance-dedup-local-first-b",
             0.2,
-            '["Jordan"]',
+            '["Maya Rivera"]',
             "active",
         ),
     ]

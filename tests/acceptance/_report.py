@@ -18,6 +18,95 @@ from typing import Any
 _PROJECT_ROOT = Path(__file__).parents[2].resolve()
 
 
+def _persona_run_completion(output_dir: Path) -> dict[str, Any]:
+    """Return completion evidence from the persona-run sidecars, if present."""
+    summary_path = output_dir / "persona_agent_summary.json"
+    events_path = output_dir / "persona_agent_events.jsonl"
+    if not summary_path.exists() and not events_path.exists():
+        return {"present": False, "complete": True, "reason": "no persona-run sidecars"}
+
+    summary: dict[str, Any] = {}
+    if summary_path.exists():
+        try:
+            loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                summary = loaded
+        except Exception as exc:
+            return {
+                "present": True,
+                "complete": False,
+                "reason": f"persona summary unreadable: {type(exc).__name__}",
+            }
+
+    completed_phases: set[str] = set()
+    failed = False
+    if events_path.exists():
+        try:
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    continue
+                if event.get("event") == "phase_complete":
+                    phase = str(event.get("phase_name") or "").strip()
+                    if phase:
+                        completed_phases.add(phase)
+                elif event.get("event") == "run_failed":
+                    failed = True
+        except Exception as exc:
+            return {
+                "present": True,
+                "complete": False,
+                "reason": f"persona events unreadable: {type(exc).__name__}",
+            }
+
+    selected_count = int(summary.get("selected_phase_count") or 0)
+    status = str(summary.get("status") or "").strip()
+    if failed:
+        return {
+            "present": True,
+            "complete": False,
+            "selected_phase_count": selected_count,
+            "completed_phase_count": len(completed_phases),
+            "reason": "persona-run emitted run_failed",
+        }
+    if status and status != "completed":
+        return {
+            "present": True,
+            "complete": False,
+            "selected_phase_count": selected_count,
+            "completed_phase_count": len(completed_phases),
+            "reason": f"persona-run status={status}",
+        }
+    if selected_count and len(completed_phases) < selected_count:
+        return {
+            "present": True,
+            "complete": False,
+            "selected_phase_count": selected_count,
+            "completed_phase_count": len(completed_phases),
+            "reason": (
+                f"persona-run completed {len(completed_phases)}/"
+                f"{selected_count} phases"
+            ),
+        }
+    if not status and not selected_count:
+        return {
+            "present": True,
+            "complete": False,
+            "selected_phase_count": selected_count,
+            "completed_phase_count": len(completed_phases),
+            "reason": "persona-run did not write a completion summary",
+        }
+    return {
+        "present": True,
+        "complete": True,
+        "selected_phase_count": selected_count,
+        "completed_phase_count": len(completed_phases),
+        "reason": "persona-run completed selected phases",
+    }
+
+
 # ── Tool buckets ──────────────────────────────────────────────────────────────
 # Single source of truth for the report and the harness ``tool-usage-summary``
 # command. ``tests/unit/acceptance/test_tool_buckets.py`` enforces both
@@ -57,6 +146,30 @@ TOOL_BUCKETS: dict[str, set[str]] = {
     "memory_tools": {"recall"},
 }
 
+_PERSONA_COMPLETION_GATED_ACTIVE_ITEMS = frozenset(
+    {
+        1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 14,
+        19, 21, 22, 23, 38, 40, 41, 42, 43, 44,
+        45, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+        56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
+        66, 67,
+    }
+)
+
+
+def _apply_persona_completion_gate(
+    markers: dict[int, str],
+    persona_completion: dict[str, Any],
+) -> dict[int, str]:
+    """Prevent active coverage from going green on an incomplete lived week."""
+    if not persona_completion.get("present") or persona_completion.get("complete"):
+        return markers
+    gated = dict(markers)
+    for item_id in _PERSONA_COMPLETION_GATED_ACTIVE_ITEMS:
+        if gated.get(item_id) == "x":
+            gated[item_id] = "~"
+    return gated
+
 
 def _normalize_tool_name(tc: Any) -> str:
     """Strip auth wrapper / bracket markers to get the real tool name.
@@ -92,6 +205,7 @@ def _auto_mark_coverage(
     messages: list[dict[str, Any]],
     auth_results: list[dict[str, Any]],
     latest_status: dict[str, Any] | None,
+    first_run: dict[str, Any] | None = None,
     orch_evidence: dict[str, Any] | None = None,
     benchmark_state: dict[str, Any] | None = None,
     error_results: list[dict[str, Any]] | None = None,
@@ -228,11 +342,17 @@ def _auto_mark_coverage(
                 return True
         return False
 
+    # Item 1: first-run onboarding. This is intentionally tied to the
+    # acceptance harness first_run boundary so a normal planning turn cannot
+    # satisfy setup unless the runner recorded completion evidence.
+    if first_run and first_run.get("status") == "completed":
+        auto[1] = "x"
+
     # Item 2: Life OS identity and support context.
     if (
-        _msg_mentions("jordan")
+        _msg_mentions("maya")
         and _msg_mentions("adhd", "autism", "sensory", "anxiety", "burnout")
-        and _msg_mentions("alex", "trusted support", "support")
+        and _msg_mentions("talia", "trusted support", "support")
         and _msg_mentions("local-first", "local first", "privacy")
     ):
         auto[2] = "x"
@@ -331,7 +451,27 @@ def _auto_mark_coverage(
 
     # Item 14: lived-week review. Credit only concrete stateful review
     # language, not a vague "nice week" summary.
-    if _assistant_after_user(
+    review_denial_patterns = (
+        "thursday-only session",
+        "thursday only session",
+        "no data for monday",
+        "cannot prove monday",
+        "can't prove monday",
+        "anything before this session started",
+    )
+    review_denied = _assistant_after_user(
+        (
+            "weekly review",
+            "week review",
+            "what actually happened",
+            "what state backs",
+            "before you end",
+        ),
+        review_denial_patterns,
+        require_all=False,
+    )
+    if not review_denied and (
+        _assistant_after_user(
         (
             "weekly review",
             "weekly_review",
@@ -346,7 +486,7 @@ def _auto_mark_coverage(
         ),
         ("missed", "repaired", "tomorrow", "reminder", "support", "open"),
         require_all=False,
-    ) or _assistant_after_user(
+        ) or _assistant_after_user(
         (
             "weekly review",
             "week review",
@@ -356,6 +496,7 @@ def _auto_mark_coverage(
         ),
         ("calendar", "reminder", "routine", "next week"),
         require_all=True,
+        )
     ):
         auto[14] = "x"
 
@@ -378,6 +519,8 @@ def _auto_mark_coverage(
         required = {
             "malformed_json_frame",
             "empty_chat_content",
+            "special_chars",
+            "unicode",
             "normal_after_errors",
         }
         passed = {
@@ -385,9 +528,12 @@ def _auto_mark_coverage(
             for r in error_results
             if r.get("survived") is True
         }
-        if required.issubset(passed):
+        attempted = {str(r.get("test")) for r in error_results}
+        if required.issubset(passed) and all(
+            r.get("survived") is True for r in error_results
+        ):
             auto[18] = "x"
-        elif passed:
+        elif attempted & required and passed:
             auto[18] = "~"
 
     # Item 19: emotional/energy adaptation. This is backed by durable
@@ -625,7 +771,7 @@ def _latest_benchmark_state(snapshots_dir: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _current_vault_benchmark_state() -> dict[str, Any] | None:
+def _current_vault_benchmark_state(output_dir: Path | None = None) -> dict[str, Any] | None:
     """Return direct vault counts for coverage items backed by files.
 
     Full acceptance runs usually collect these through a benchmark
@@ -633,12 +779,16 @@ def _current_vault_benchmark_state() -> dict[str, Any] | None:
     still be able to score vault coverage from the current configured
     memory root instead of leaving real entity/session files invisible.
     """
-    try:
-        from kora_v2.core.settings import get_settings
+    accept_root = output_dir.parent / "memory" if output_dir is not None else None
+    if accept_root is not None and accept_root.exists():
+        root = accept_root
+    else:
+        try:
+            from kora_v2.core.settings import get_settings
 
-        root = Path(get_settings().memory.kora_memory_path).expanduser()
-    except Exception:
-        root = _PROJECT_ROOT / "data" / "_KoraMemory"
+            root = Path(get_settings().memory.kora_memory_path).expanduser()
+        except Exception:
+            root = _PROJECT_ROOT / "data" / "_KoraMemory"
 
     if not root.exists():
         return None
@@ -658,6 +808,125 @@ def _current_vault_benchmark_state() -> dict[str, Any] | None:
         "vault_entity_pages": entity_pages,
         "vault_moc_pages": count_md("Maps of Content"),
         "vault_sessions": count_md("Sessions"),
+    }
+
+
+def _read_test_log_events(
+    output_dir: Path,
+    since: str | None = None,
+) -> list[dict[str, Any]]:
+    log_path = output_dir / "test_log.jsonl"
+    if not log_path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    try:
+        for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if since and str(event.get("ts") or "") < since:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+    except Exception:
+        return []
+    return events
+
+
+def _latest_event(
+    events: list[dict[str, Any]],
+    event_name: str,
+) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if event.get("event") == event_name:
+            return event
+    return None
+
+
+def _auth_events_from_log(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    auth_indices = [
+        idx for idx, event in enumerate(events) if event.get("event") == "auth_request"
+    ]
+    denied_auth_indices: set[int] = set()
+    for idx, event in enumerate(events):
+        if event.get("event") != "auth_denied_test":
+            continue
+        tool = event.get("tool")
+        prior = [
+            auth_idx
+            for auth_idx in auth_indices
+            if auth_idx < idx
+            and auth_idx not in denied_auth_indices
+            and events[auth_idx].get("tool") == tool
+        ]
+        if prior:
+            denied_auth_indices.add(prior[-1])
+
+    out: list[dict[str, Any]] = []
+    for idx in auth_indices:
+        event = events[idx]
+        denied = idx in denied_auth_indices
+        out.append(
+            {
+                "tool": event.get("tool"),
+                "tool_name": event.get("tool"),
+                "risk": event.get("risk"),
+                "decision": "denied" if denied else "approved",
+                "approved": not denied,
+                "ts": event.get("ts"),
+                "granted_at": event.get("ts"),
+                "source": "test_log",
+            }
+        )
+    return out
+
+
+def _merge_auth_evidence(
+    *groups: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
+) -> list[dict[str, Any]]:
+    """Merge auth evidence without letting durable approved rows hide denials."""
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for group in groups:
+        for row in group or []:
+            tool = str(row.get("tool") or row.get("tool_name") or "")
+            decision = str(row.get("decision") or "")
+            approved = row.get("approved")
+            timestamp = str(row.get("ts") or row.get("granted_at") or "")
+            source = str(row.get("source") or "")
+            key = (tool, decision, str(approved), timestamp, source)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized = dict(row)
+            if "tool" not in normalized and tool:
+                normalized["tool"] = tool
+            if "tool_name" not in normalized and tool:
+                normalized["tool_name"] = tool
+            if "ts" not in normalized and row.get("granted_at"):
+                normalized["ts"] = row.get("granted_at")
+            if "granted_at" not in normalized and row.get("ts"):
+                normalized["granted_at"] = row.get("ts")
+            merged.append(normalized)
+    return merged
+
+
+def _error_results_from_log(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    event = _latest_event(events, "error_recovery_complete")
+    results = event.get("results") if event else None
+    return results if isinstance(results, list) else []
+
+
+def _skill_gating_from_log(events: list[dict[str, Any]]) -> dict[str, Any]:
+    event = _latest_event(events, "skill_gating_check")
+    if not event:
+        return {}
+    return {
+        "passed": event.get("passed"),
+        "cases": event.get("cases") or {},
     }
 
 
@@ -894,6 +1163,31 @@ async def _query_life_management(output_dir: Path) -> dict[str, Any]:
         async with aiosqlite.connect(str(op_db)) as db:
             db.row_factory = aiosqlite.Row
 
+            async def _rows(
+                table: str,
+                *,
+                order_by: str | None = None,
+                limit: int = 50,
+            ) -> list[dict[str, Any]]:
+                """Best-effort row export for the sanitized demo snapshot."""
+
+                order_clause = f" ORDER BY {order_by}" if order_by else ""
+                try:
+                    cursor = await db.execute(
+                        f"SELECT * FROM {table}{order_clause} LIMIT ?",
+                        (limit,),
+                    )
+                    return [dict(row) for row in await cursor.fetchall()]
+                except Exception:
+                    try:
+                        cursor = await db.execute(
+                            f"SELECT * FROM {table} LIMIT ?",
+                            (limit,),
+                        )
+                        return [dict(row) for row in await cursor.fetchall()]
+                    except Exception:
+                        return []
+
             for table, key in [
                 ("medication_log", "medication"),
                 ("meal_log", "meal"),
@@ -954,6 +1248,74 @@ async def _query_life_management(output_dir: Path) -> dict[str, Any]:
                 result["correction_event_count"] = row[0] if row else 0
             except Exception:
                 result["correction_event_count"] = 0
+
+            result["records"] = {
+                "calendar_entries": await _rows(
+                    "calendar_entries",
+                    order_by="starts_at ASC, created_at ASC",
+                    limit=100,
+                ),
+                "day_plans": await _rows(
+                    "day_plans",
+                    order_by="plan_date ASC, revision DESC",
+                    limit=30,
+                ),
+                "day_plan_entries": await _rows(
+                    "day_plan_entries",
+                    order_by="COALESCE(intended_start, created_at) ASC",
+                    limit=120,
+                ),
+                "plan_repair_actions": await _rows(
+                    "plan_repair_actions",
+                    order_by="created_at ASC",
+                    limit=80,
+                ),
+                "life_events": await _rows(
+                    "life_events",
+                    order_by="event_time ASC, created_at ASC",
+                    limit=120,
+                ),
+                "domain_events": await _rows(
+                    "domain_events",
+                    order_by="created_at ASC",
+                    limit=160,
+                ),
+                "reminders": await _rows(
+                    "reminders",
+                    order_by="COALESCE(due_at, remind_at, created_at) ASC",
+                    limit=120,
+                ),
+                "focus_blocks": await _rows(
+                    "focus_blocks",
+                    order_by="started_at ASC",
+                    limit=80,
+                ),
+                "medication_log": await _rows(
+                    "medication_log",
+                    order_by="taken_at ASC",
+                    limit=80,
+                ),
+                "meal_log": await _rows(
+                    "meal_log",
+                    order_by="logged_at ASC",
+                    limit=80,
+                ),
+                "quick_notes": await _rows(
+                    "quick_notes",
+                    order_by="created_at ASC",
+                    limit=80,
+                ),
+                "routines": await _rows(
+                    "routines",
+                    order_by="created_at ASC",
+                    limit=60,
+                ),
+                "context_packs": await _rows(
+                    "context_packs",
+                    order_by="created_at ASC",
+                    limit=60,
+                ),
+            }
 
         return result
     except Exception:
@@ -2310,7 +2672,7 @@ def _render_benchmarks_dashboard(snapshots_dir: Path) -> list[str]:
                     f"| {r['working_docs']} |"
                 )
             out.append(
-                f"\n_Trend store: `data/acceptance/benchmarks.csv` "
+                f"\n_Trend store: `acceptance_output/benchmarks.csv` "
                 f"({len(bench_files)} sidecar(s) in snapshots/)_"
             )
 
@@ -2346,6 +2708,9 @@ async def build_report(
     cap_health = await _build_capability_health()
     life_data = await _query_life_management(output_dir)
     from tests.acceptance.life_os import (
+        LifeOSAcceptanceSummary,
+        LifeOSEvidence,
+        LifeOSScenarioProof,
         collect_life_os_acceptance,
         render_life_os_acceptance,
     )
@@ -2355,24 +2720,58 @@ async def build_report(
         messages=messages,
         capability_pack_status=cap_health,
     )
+    persona_completion = _persona_run_completion(output_dir)
+    if persona_completion.get("present") and not persona_completion.get("complete"):
+        completion_evidence = LifeOSEvidence(
+            label="complete lived-week persona run",
+            satisfied=False,
+            source="persona_agent_summary/persona_agent_events",
+            detail=str(persona_completion.get("reason") or "persona-run incomplete"),
+            required=True,
+        )
+        life_os_summary = LifeOSAcceptanceSummary(
+            available=life_os_summary.available,
+            db_path=life_os_summary.db_path,
+            scenarios=tuple(
+                LifeOSScenarioProof(
+                    key=scenario.key,
+                    title=scenario.title,
+                    evidence=(*scenario.evidence, completion_evidence),
+                    tool_calls=scenario.tool_calls,
+                )
+                for scenario in life_os_summary.scenarios
+            ),
+            capability_pack_status=life_os_summary.capability_pack_status,
+            error=life_os_summary.error,
+        )
     auto_state = await _query_autonomous_state()
     run_started_at = session_state.get("started_at")
     run_started_filter = run_started_at if isinstance(run_started_at, str) else None
+    test_log_events = _read_test_log_events(output_dir, run_started_filter)
     orch_evidence = await _query_orchestration_evidence(
         _with_startup_grace(run_started_filter)
     )
     auth_results = session_state.get("auth_test_results", [])
+    auth_log_results = _auth_events_from_log(test_log_events)
     tool_usage = _extract_tool_usage(messages, orch_evidence.get("turn_traces") or [])
     policy_grants = await _query_policy_grants(
         run_started_filter
     )
-    auth_evidence = auth_results or policy_grants
+    auth_evidence = _merge_auth_evidence(auth_results, auth_log_results, policy_grants)
+    error_results = (
+        session_state.get("error_recovery_results", [])
+        or _error_results_from_log(test_log_events)
+    )
+    skill_gating_check = (
+        session_state.get("skill_gating_check", {})
+        or _skill_gating_from_log(test_log_events)
+    )
     compaction_events_resolved = (
         compaction_events or session_state.get("compaction_events", [])
     )
     latest_status = _latest_snapshot_status(snapshots_dir)
     latest_benchmark = _latest_benchmark_state(snapshots_dir)
-    current_vault_benchmark = _current_vault_benchmark_state()
+    current_vault_benchmark = _current_vault_benchmark_state(output_dir)
     benchmark_state = dict(latest_benchmark or {})
     for key, value in (current_vault_benchmark or {}).items():
         if isinstance(value, int) and isinstance(benchmark_state.get(key), int):
@@ -2395,12 +2794,14 @@ async def build_report(
         messages=messages,
         auth_results=auth_evidence,
         latest_status=latest_status,
+        first_run=session_state.get("first_run", {}),
         orch_evidence=orch_evidence,
         benchmark_state=benchmark_state,
-        error_results=session_state.get("error_recovery_results", []),
+        error_results=error_results,
         snapshots_dir=snapshots_dir,
-        skill_gating_check=session_state.get("skill_gating_check", {}),
+        skill_gating_check=skill_gating_check,
     )
+    auto_markers = _apply_persona_completion_gate(auto_markers, persona_completion)
     from tests.acceptance.scenario.week_plan import COVERAGE_ITEMS, CoverageStatus
 
     active_items = {k: v for k, v in COVERAGE_ITEMS.items() if v.status == CoverageStatus.ACTIVE}
@@ -2410,6 +2811,7 @@ async def build_report(
     active_covered = 0
     active_partial = 0
     auto_applied = 0
+    coverage_rows: list[dict[str, Any]] = []
     for item_id, item in sorted(active_items.items()):
         operator = operator_markers.get(item_id)
         # Only treat an operator marker as authoritative when it carries
@@ -2430,6 +2832,18 @@ async def build_report(
             marker = " "
             provenance = ""
         lines.append(f"- [{marker}] {item_id}. {item.description}{provenance}")
+        coverage_rows.append(
+            {
+                "id": item_id,
+                "status": "active",
+                "marker": marker,
+                "description": item.description,
+                "category": item.category,
+                "provenance": "auto" if provenance else (
+                    "operator" if operator in ("x", "~") else "unmarked"
+                ),
+            }
+        )
         if marker == "x":
             active_covered += 1
         elif marker == "~":
@@ -2446,13 +2860,41 @@ async def build_report(
     for item_id, item in sorted(deferred_items.items()):
         lines.append(f"- [~] {item_id}. {item.description}")
         lines.append(f"      DEFERRED: {item.deferred_reason}")
+        coverage_rows.append(
+            {
+                "id": item_id,
+                "status": "deferred",
+                "marker": "~",
+                "description": item.description,
+                "category": item.category,
+                "deferred_reason": item.deferred_reason,
+                "provenance": "deferred",
+            }
+        )
 
     lines.append(f"\nDeferred: {len(deferred_items)} items (not tested, awaiting V2 implementation)")
+
+    coverage_summary = {
+        "active": {
+            "satisfied": active_covered,
+            "partial": active_partial,
+            "total": len(active_items),
+        },
+        "deferred": {"total": len(deferred_items)},
+        "auto_derived": auto_applied,
+        "operator_edited": sum(
+            1 for value in operator_markers.values() if value in ("x", "~")
+        ),
+        "items": coverage_rows,
+    }
 
     lines.extend(
         render_life_os_acceptance(
             life_os_summary,
-            manual_verification=session_state.get("life_os_manual_verification", {}),
+            manual_verification={
+                **(session_state.get("life_os_manual_verification", {}) or {}),
+                "persona_run_completion": persona_completion.get("reason"),
+            },
         )
     )
 
@@ -2529,10 +2971,9 @@ async def build_report(
         lines.append(line)
 
     # ── Policy Grants ──────────────────────────────────────────────────────
-    # Prefer durable permission_grants rows for the policy-matrix audit.
-    # The in-memory WebSocket auth test list is used only when the DB has
-    # no rows (for isolated report tests).
-    rendered_grants = policy_grants or auth_results
+    # Render the same merged evidence used for scoring so a denied WebSocket
+    # auth event is not hidden by durable approved rows from other turns.
+    rendered_grants = auth_evidence
     approval_prompts = len(rendered_grants)
     approved = sum(1 for ar in rendered_grants if ar.get("approved"))
     denied = sum(
@@ -2777,7 +3218,7 @@ async def build_report(
             content = (m.get("content") or "")[:300]
             ts = (m.get("ts") or "")[:19]
             if role == "user":
-                lines.append(f"\n**Jordan** [{ts}]: {content}")
+                lines.append(f"\n**Persona** [{ts}]: {content}")
             else:
                 tool_calls = m.get("tool_calls", [])
                 trace = m.get("trace_id", "")[:8] if m.get("trace_id") else ""
@@ -2791,7 +3232,26 @@ async def build_report(
                     header += f" [compaction:{compaction_tier}]"
                 lines.append(header + f": {content}")
 
+    lines.append("\n## Export Artifacts")
+    lines.append("- Full transcript JSON: `acceptance_conversation.json`")
+    lines.append("- Full transcript Markdown: `acceptance_conversation.md`")
+    lines.append("- GUI demo snapshot: `acceptance_demo_snapshot.json`")
+
     report_text = "\n".join(lines)
     report_path = output_dir / "acceptance_report.md"
     report_path.write_text(report_text)
+    from tests.acceptance.demo_snapshot import write_acceptance_exports
+
+    write_acceptance_exports(
+        session_state=session_state,
+        snapshots_dir=snapshots_dir,
+        output_dir=output_dir,
+        life_data=life_data,
+        orch_evidence=orch_evidence,
+        tool_usage=tool_usage,
+        cap_health=cap_health,
+        life_os_summary=life_os_summary,
+        coverage_summary=coverage_summary,
+        report_path=report_path,
+    )
     return report_path

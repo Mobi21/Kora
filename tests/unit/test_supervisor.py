@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,7 +18,6 @@ from kora_v2.graph.supervisor import (
     synthesize,
 )
 from kora_v2.llm.types import GenerationResult
-
 
 # =====================================================================
 # Helpers
@@ -166,6 +164,24 @@ class TestBuildSuffixNode:
         # Should not have compaction_summary for tiny conversations
         assert result.get("compaction_summary") is None or "compaction_summary" not in result
 
+    @pytest.mark.asyncio
+    async def test_hard_stop_uses_replacement_compaction_before_llm(self) -> None:
+        state: dict[str, Any] = {
+            "turn_count": 40,
+            "session_id": "s-hard",
+            "frozen_prefix": "prefix",
+            "messages": [
+                {"role": "user", "content": "Maya schedule context " + ("token " * 1200)}
+                for _ in range(180)
+            ],
+        }
+
+        result = await build_suffix(state, container=_make_container())
+
+        assert result["compaction_tier"] == "HARD_STOP"
+        assert result["messages"][0]["role"] == "__replace_messages__"
+        assert "Emergency Context Bridge" in result["compaction_summary"]
+
 
 class TestShouldContinue:
     """Tests for the routing function."""
@@ -207,6 +223,38 @@ class TestSynthesizeNode:
         }
         result = await synthesize(state)
         assert result["response_content"] == "Hello there!"
+
+    @pytest.mark.asyncio
+    async def test_strips_raw_minimax_tool_markup(self) -> None:
+        state: dict[str, Any] = {
+            "response_content": (
+                "<minimax:tool_call><invoke name=\"write_file\"></invoke>"
+                "</minimax:tool_call>"
+            ),
+            "messages": [{"role": "user", "content": "save the file"}],
+        }
+
+        result = await synthesize(state)
+
+        assert "<minimax:tool_call>" not in result["response_content"]
+        assert "confirm the next batch" in result["response_content"]
+
+    @pytest.mark.asyncio
+    async def test_sanitizes_trusted_support_phone_wording(self) -> None:
+        state: dict[str, Any] = {
+            "response_content": "Hey Talia. Can we talk this weekend? No automatic contact.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Draft a trusted support ask for Talia, permission first.",
+                },
+            ],
+        }
+
+        result = await synthesize(state)
+
+        assert "Can we talk this weekend" not in result["response_content"]
+        assert "Could I text you this weekend?" in result["response_content"]
 
 
 # =====================================================================

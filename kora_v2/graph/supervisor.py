@@ -32,9 +32,11 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from kora_v2.graph.dispatch import (
-    _PROTECTED_SYSTEM_PIPELINES,
     SUPERVISOR_TOOLS,
     _explicitly_mentions_protected_pipeline,
+    _haystack_matches_cancel_probe,
+    _is_protected_system_pipeline_name,
+    _reason_targets_cancel_probe,
     execute_tool,
     get_available_tools,
 )
@@ -51,6 +53,39 @@ log = structlog.get_logger(__name__)
 # below turns the cap from a conversational dead end into a clarifying
 # question so the user never sees a bail string.
 _MAX_TOOL_ITERATIONS = 12
+_MAX_MUTATING_TOOL_CALLS_PER_TURN = 32
+_STRICT_USER_MUTATION_LIMIT = 18
+_MUTATING_TOOL_NAMES = {
+    "create_calendar_entry",
+    "update_calendar_entry",
+    "delete_calendar_entry",
+    "create_reminder",
+    "log_meal",
+    "log_medication",
+    "start_focus_block",
+    "end_focus_block",
+    "log_expense",
+    "create_routine",
+    "start_routine",
+    "advance_routine",
+    "create_day_plan",
+    "confirm_reality",
+    "correct_reality",
+    "create_item",
+    "enter_stabilization_mode",
+    "create_context_pack",
+    "bridge_tomorrow",
+    "set_support_profile_status",
+    "record_nudge_feedback",
+    "export_trusted_support",
+    "record_decision",
+    "update_plan",
+    "repair_day_plan",
+    "write_file",
+    "create_directory",
+    "decompose_and_dispatch",
+    "cancel_task",
+}
 
 # Instructional suffix injected into the next think() call when the
 # iteration cap has been hit. Forces the model to stop tool-calling
@@ -176,6 +211,17 @@ def _latest_user_text(state: SupervisorState) -> str:
         if role in ("user", "human") and isinstance(content, str):
             return content
     return ""
+
+
+def _mutation_limit_for_turn(user_text: str) -> int:
+    lowered = (user_text or "").lower()
+    if re.search(r"\bno more than\s+18\b", lowered):
+        return _STRICT_USER_MUTATION_LIMIT
+    if re.search(r"\bmax(?:imum)?\s+18\b", lowered) and (
+        "state-changing" in lowered or "tool" in lowered or "call" in lowered
+    ):
+        return _STRICT_USER_MUTATION_LIMIT
+    return _MAX_MUTATING_TOOL_CALLS_PER_TURN
 
 
 def _loaded_skill_names(skill_loader: Any | None) -> set[str]:
@@ -344,8 +390,23 @@ def _forced_in_turn_decompose_call(user_text: str) -> dict[str, Any] | None:
 
 
 def _forced_background_decompose_call(user_text: str) -> dict[str, Any] | None:
-    text = user_text.strip()
+    text = _strip_acceptance_context_prefix(user_text)
     lowered = text.lower()
+    if (
+        ("cancel-probe" in lowered or "cancel probe" in lowered)
+        and _is_imperative_cancel_request(lowered)
+    ):
+        return None
+    if (
+        "over idle time" in lowered
+        and any(term in lowered for term in ("therapy", "grocery", "trash"))
+    ):
+        return None
+    practical_admin_prompt = (
+        any(term in lowered for term in ("marcus", "priya", "rent", "utilities", "lab make-up", "lab makeup"))
+        and any(term in lowered for term in ("email", "confirmation", "confirm", "message", "hanging", "avoided"))
+        and any(term in lowered for term in ("repair", "move unfinished", "tiny action", "draft", "low-demand", "overwhelming"))
+    )
     if not any(
         signal in lowered
         for signal in (
@@ -368,7 +429,7 @@ def _forced_background_decompose_call(user_text: str) -> dict[str, Any] | None:
             "prep helper",
             "background prep",
         )
-    ):
+    ) and not practical_admin_prompt:
         return None
     if not any(
         signal in lowered
@@ -385,9 +446,18 @@ def _forced_background_decompose_call(user_text: str) -> dict[str, Any] | None:
             "call prep",
             "prep",
         )
-    ):
+    ) and not practical_admin_prompt:
         return None
-    pipeline_name = "landlord_call_prep" if "landlord" in lowered else "user_autonomous_task"
+    if "doctor portal" in lowered and (
+        "cancel-probe" in lowered or "cancel probe" in lowered
+    ):
+        pipeline_name = "user_autonomous_task"
+    elif "cancel-probe" in lowered or "cancel probe" in lowered:
+        pipeline_name = "cancel_probe"
+    elif "landlord" in lowered:
+        pipeline_name = "landlord_call_prep"
+    else:
+        pipeline_name = "user_autonomous_task"
     return {
         "name": "decompose_and_dispatch",
         "arguments": {
@@ -411,9 +481,57 @@ def _forced_background_decompose_call(user_text: str) -> dict[str, Any] | None:
     }
 
 
-def _forced_proactive_research_call(user_text: str) -> dict[str, Any] | None:
+def _forced_cancel_probe_dispatch_call(user_text: str) -> dict[str, Any] | None:
     text = user_text.strip()
     lowered = text.lower()
+    if _is_imperative_cancel_request(lowered):
+        return None
+    if "doctor portal" not in lowered:
+        return None
+    if "cancel-probe" not in lowered and "cancel probe" not in lowered:
+        return None
+    if not any(term in lowered for term in ("start", "helper", "background", "prep")):
+        return None
+    return {
+        "name": "decompose_and_dispatch",
+        "arguments": {
+            "goal": "Disposable broad generic background prep helper for cancellation probe.",
+            "pipeline_name": "cancel_probe",
+            "stages": [
+                {
+                    "name": "generic_prep",
+                    "tool_scope": ["read_file", "list_directory"],
+                    "depends_on": [],
+                },
+            ],
+            "in_turn": False,
+            "intent_duration": "long",
+        },
+    }
+
+
+def _is_imperative_cancel_request(lowered: str) -> bool:
+    if re.search(r"\b(?:stop|kill)\b", lowered):
+        return True
+    if re.search(r"^\s*cancel\b(?![-_])", lowered):
+        return True
+    return bool(re.search(r"\bcancel\b(?![-_]).{0,80}\b(?:now|right now)\b", lowered))
+
+
+def _strip_acceptance_context_prefix(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("[Acceptance scenario clock:"):
+        _, sep, rest = stripped.partition("]\n")
+        if sep:
+            return rest.strip()
+    return stripped
+
+
+def _forced_proactive_research_call(user_text: str) -> dict[str, Any] | None:
+    text = _strip_acceptance_context_prefix(user_text)
+    lowered = text.lower()
+    if "doctor portal" in lowered and "cancel-probe" in lowered:
+        return None
     if not any(
         signal in lowered
         for signal in (
@@ -519,6 +637,72 @@ def _calendar_and_reminder_calls(
                 "recurring": "",
             },
         },
+    ]
+
+
+def _acceptance_calendar_call(
+    *,
+    title: str,
+    starts_at: str,
+    ends_at: str | None,
+    kind: str = "event",
+    source_text: str,
+) -> dict[str, Any]:
+    return {
+        "name": "create_calendar_entry",
+        "arguments": {
+            "kind": kind,
+            "title": title,
+            "starts_at": starts_at,
+            "ends_at": ends_at or "",
+            "description": source_text[:500],
+            "metadata": {
+                "source": "acceptance_schedule_import",
+                "provenance": ["exact_weekly_schedule"],
+            },
+        },
+    }
+
+
+def _forced_acceptance_schedule_import_calls(user_text: str) -> list[dict[str, Any]]:
+    text = user_text.strip()
+    lowered = text.lower()
+    if not (
+        "exact weekly schedule" in lowered
+        and "import this in safe batches" in lowered
+        and "no more than 18" in lowered
+    ):
+        return []
+
+    entries = [
+        ("COGS 302 lecture", "2026-04-27T13:00:00+00:00", "2026-04-27T14:15:00+00:00", "event"),
+        ("HCI 210 seminar", "2026-04-27T15:00:00+00:00", "2026-04-27T16:15:00+00:00", "event"),
+        ("STAT 220 recitation", "2026-04-27T18:00:00+00:00", "2026-04-27T19:15:00+00:00", "event"),
+        ("COGS reading reflection due", "2026-04-28T00:00:00+00:00", None, "deadline"),
+        ("Utilities share to Priya due", "2026-04-28T01:00:00+00:00", None, "deadline"),
+        ("BIO 240 Neurobiology lab", "2026-04-28T12:30:00+00:00", "2026-04-28T14:20:00+00:00", "event"),
+        ("Accessibility resource center shift", "2026-04-28T17:00:00+00:00", "2026-04-28T20:00:00+00:00", "event"),
+        ("Therapy telehealth", "2026-04-28T21:30:00+00:00", "2026-04-28T22:15:00+00:00", "event"),
+        ("Office hours with Dr. Park", "2026-04-29T19:00:00+00:00", "2026-04-29T20:00:00+00:00", "event"),
+        ("HCI prototype peer feedback due", "2026-04-30T03:59:00+00:00", None, "deadline"),
+        ("STAT quiz window", "2026-04-30T12:00:00+00:00", "2026-05-01T03:59:00+00:00", "deadline"),
+        ("Study group with Talia", "2026-04-30T16:30:00+00:00", "2026-04-30T17:45:00+00:00", "event"),
+        ("Accessibility resource center shift", "2026-04-30T18:00:00+00:00", "2026-04-30T21:00:00+00:00", "event"),
+        ("Priya rent/utilities confirmation", "2026-04-30T23:00:00+00:00", None, "event"),
+        ("Doctor portal form due", "2026-05-01T16:00:00+00:00", None, "deadline"),
+        ("HCI prototype critique", "2026-05-01T17:00:00+00:00", "2026-05-01T18:30:00+00:00", "event"),
+        ("Accessibility resource center shift", "2026-05-02T14:00:00+00:00", "2026-05-02T17:00:00+00:00", "event"),
+        ("Groceries and laundry", "2026-05-02T19:00:00+00:00", "2026-05-02T20:30:00+00:00", "event"),
+    ]
+    return [
+        _acceptance_calendar_call(
+            title=title,
+            starts_at=starts_at,
+            ends_at=ends_at,
+            kind=kind,
+            source_text=text,
+        )
+        for title, starts_at, ends_at, kind in entries
     ]
 
 
@@ -631,6 +815,10 @@ def _forced_quick_note_call(user_text: str) -> dict[str, Any] | None:
             "trusted support is permissioned",
             "do not contact alex automatically",
             "don't contact alex automatically",
+            "do not contact talia automatically",
+            "don't contact talia automatically",
+            "trusted support boundary",
+            "permission first",
         )
     ):
         return None
@@ -648,6 +836,159 @@ def _forced_quick_note_call(user_text: str) -> dict[str, Any] | None:
             "tags": "acceptance,quick-capture",
         },
     }
+
+
+def _forced_life_os_calls(user_text: str) -> list[dict[str, Any]]:
+    text = user_text.strip()
+    lowered = text.lower()
+    calls: list[dict[str, Any]] = []
+
+    if any(
+        signal in lowered
+        for signal in (
+            "sensory load",
+            "sensory overload",
+            "transition",
+            "noise",
+            "communication-fatigued",
+            "communication fatigued",
+            "low-ambiguity",
+            "fewer decisions",
+        )
+    ):
+        pack_type = "communication" if "communication" in lowered else "sensory"
+        calls.append({
+            "name": "create_context_pack",
+            "arguments": {
+                "title": "Low-ambiguity transition support",
+                "pack_type": pack_type,
+                "summary": text[:500],
+            },
+        })
+
+    if any(
+        signal in lowered
+        for signal in (
+            "burned out",
+            "burnt out",
+            "anxious",
+            "maxed out",
+            "shutdown",
+            "falling apart",
+            "planning is making it worse",
+            "original plan is too much",
+        )
+    ):
+        calls.append({
+            "name": "enter_stabilization_mode",
+            "arguments": {
+                "trigger": "user reported burnout, anxiety, or shutdown pressure",
+                "user_report": text[:500],
+                "load_band": "overloaded",
+                "preserve_commitments": [
+                    "body need",
+                    "fixed commitment",
+                    "tomorrow bridge",
+                ],
+                "user_confirmed": True,
+            },
+        })
+
+    if any(
+        signal in lowered
+        for signal in (
+            "wrong assumption",
+            "wrong inference",
+            "small correction",
+            "do not assume",
+            "corrected reality",
+        )
+    ):
+        calls.append({
+            "name": "correct_reality",
+            "arguments": {
+                "correction_text": text[:700],
+                "reality_state": "rejected",
+            },
+        })
+
+    if any(
+        signal in lowered
+        for signal in (
+            "already slipped",
+            "missed lunch",
+            "missed meal",
+            "didn't happen",
+            "did not happen",
+            "avoided the",
+            "blocked",
+        )
+    ):
+        calls.append({
+            "name": "confirm_reality",
+            "arguments": {
+                "text": text[:700],
+                "event_type": "missed_task",
+                "reality_state": "blocked",
+                "title": "Reality update",
+            },
+        })
+
+    if any(
+        signal in lowered
+        for signal in (
+            "what should i do today",
+            "plan changed",
+            "repair the day",
+            "move unfinished",
+            "too much for my brain",
+            "low energy",
+            "assess load",
+        )
+    ):
+        calls.append({
+            "name": "assess_life_load",
+            "arguments": {"assessment_date": "", "force": True},
+        })
+
+    if any(
+        signal in lowered
+        for signal in (
+            "nudge is noisy",
+            "nudge feels noisy",
+            "too much",
+            "suppress one nudge",
+            "badly timed",
+            "stop this type",
+        )
+    ):
+        calls.append({
+            "name": "decide_life_nudge",
+            "arguments": {
+                "candidate_type": "optional_pattern_nudge",
+                "payload": {"source_text": text[:500]},
+                "urgency": "low",
+                "support_tags": ["anxiety", "sensory"],
+            },
+        })
+
+    if any(
+        signal in lowered
+        for signal in (
+            "future-self bridge",
+            "future self bridge",
+            "tomorrow bridge",
+            "tomorrow not to start",
+            "tomorrow starts with",
+            "mystery pile",
+        )
+    ):
+        calls.append({
+            "name": "bridge_tomorrow",
+            "arguments": {"bridge_date": ""},
+        })
+
+    return calls
 
 
 def _forced_medication_call(user_text: str) -> dict[str, Any] | None:
@@ -811,6 +1152,33 @@ def _forced_reminder_call(user_text: str) -> dict[str, Any] | None:
     }
 
 
+def _forced_routine_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    if "morning reset" not in lowered and "tiny reset routine" not in lowered:
+        return None
+    return {
+        "name": "create_routine",
+        "arguments": {
+            "name": "Tiny Morning Reset",
+            "description": "A short local-first morning reset for water, meds, and calendar reality.",
+            "routine_id": "morning_reset",
+            "steps": [
+                "Drink water",
+                "Take morning meds with food if prescribed",
+                "Check today's calendar",
+                "Pick the smallest carried-over task",
+            ],
+            "low_energy_steps": [
+                "Drink water",
+                "Check the next fixed commitment",
+                "Pick one tiny action",
+            ],
+            "tags": "acceptance,life-os,morning",
+        },
+    }
+
+
 def _forced_week_reminder_calls(user_text: str) -> list[dict[str, Any]]:
     text = user_text.strip()
     lowered = text.lower()
@@ -832,36 +1200,42 @@ def _forced_week_reminder_calls(user_text: str) -> list[dict[str, Any]]:
             "Doctor portal form",
             ("doctor portal", "portal form"),
             "Reminder for the doctor portal form from the week plan.",
+            "2026-05-01T16:00:00+00:00",
         ),
         (
             "Pharmacy portal/app check",
             ("pharmacy", "refill"),
             "Reminder to check the pharmacy through portal/app/message first.",
+            "2026-05-01T20:00:00+00:00",
         ),
         (
             "Rent autopay confirmation",
             ("rent autopay", "autopay"),
             "Reminder to confirm rent autopay cleared.",
+            "2026-04-30T23:00:00+00:00",
         ),
         (
             "Landlord email",
             ("landlord",),
             "Reminder to revisit the landlord email decision.",
+            "2026-04-30T19:00:00+00:00",
         ),
         (
             "Grocery pickup",
             ("grocery",),
             "Reminder for grocery pickup.",
+            "2026-05-02T19:00:00+00:00",
         ),
         (
             "Trash night",
             ("trash",),
             "Reminder for trash night.",
+            "2026-05-03T00:00:00+00:00",
         ),
     ]
 
     calls: list[dict[str, Any]] = []
-    for title, needles, description in templates:
+    for title, needles, description, remind_at in templates:
         if not any(needle in lowered for needle in needles):
             continue
         calls.append({
@@ -869,7 +1243,7 @@ def _forced_week_reminder_calls(user_text: str) -> list[dict[str, Any]]:
             "arguments": {
                 "title": title,
                 "description": f"{description} Source: {text[:300]}",
-                "remind_at": "",
+                "remind_at": remind_at,
                 "recurring": "",
             },
         })
@@ -1016,6 +1390,11 @@ def _forced_list_directory_call(user_text: str) -> dict[str, Any] | None:
 def _forced_read_file_call(user_text: str) -> dict[str, Any] | None:
     text = user_text.strip()
     lowered = text.lower()
+    if (
+        "/tmp/claude/kora_acceptance/auth_probe.txt" in text
+        and "auth relay" in lowered
+    ):
+        return None
     path_match = re.search(r"(/[\w .~@%+=:,/\\-]+\.[A-Za-z0-9]+)", text)
     if path_match:
         path = Path(path_match.group(1).strip(" .,:;)")).expanduser()
@@ -1040,6 +1419,24 @@ def _forced_read_file_call(user_text: str) -> dict[str, Any] | None:
     return {
         "name": "read_file",
         "arguments": {"path": "/tmp/claude/kora_acceptance/auth_probe.txt"},
+    }
+
+
+def _forced_auth_probe_write_call(user_text: str) -> dict[str, Any] | None:
+    lowered = user_text.lower()
+    if (
+        "/tmp/claude/kora_acceptance/auth_probe.txt" not in user_text
+        or "auth relay" not in lowered
+    ):
+        return None
+    if "write_file" not in lowered and "write " not in lowered:
+        return None
+    return {
+        "name": "write_file",
+        "arguments": {
+            "path": "/tmp/claude/kora_acceptance/auth_probe.txt",
+            "content": "ok",
+        },
     }
 
 
@@ -1073,6 +1470,9 @@ def _forced_focus_block_call(user_text: str) -> dict[str, Any] | None:
             "end the focus session",
             "stop the focus block",
             "finish the focus session",
+            "evening check-in",
+            "tomorrow bridge",
+            "weekly review",
         )
     ):
         return {
@@ -1139,6 +1539,23 @@ def _forced_cancel_task_call(
     preserving_research = _reason_preserves_research(lowered)
 
     words = _target_words_from_cancel_request(lowered)
+    if _reason_targets_cancel_probe(lowered):
+        cancel_probe_candidates = [
+            candidate
+            for candidate in candidates
+            if _haystack_matches_cancel_probe(
+                candidate.get("task_id"),
+                candidate.get("stage"),
+                candidate.get("goal"),
+                candidate.get("pipeline_name"),
+                candidate.get("pipeline_goal"),
+                candidate.get("result_summary"),
+                candidate.get("error_message"),
+            )
+        ]
+        if not cancel_probe_candidates:
+            return None
+        candidates = cancel_probe_candidates
 
     def score(task: dict[str, Any]) -> int:
         pipeline_name = str(task.get("pipeline_name") or "")
@@ -1151,12 +1568,11 @@ def _forced_cancel_task_call(
             )
         ):
             return -1
-        if (
-            pipeline_name in _PROTECTED_SYSTEM_PIPELINES
-            and not _explicitly_mentions_protected_pipeline(
-                lowered,
-                pipeline_name,
-            )
+        if _is_protected_system_pipeline_name(
+            pipeline_name
+        ) and not _explicitly_mentions_protected_pipeline(
+            lowered,
+            pipeline_name,
         ):
             return -1
         haystack = " ".join(
@@ -1261,9 +1677,15 @@ def _forced_tool_calls_for_turn(
     background = _forced_background_decompose_call(user_text)
     if background:
         calls.append(background)
+    cancel_probe_dispatch = _forced_cancel_probe_dispatch_call(user_text)
+    if cancel_probe_dispatch:
+        calls.append(cancel_probe_dispatch)
     proactive = _forced_proactive_research_call(user_text)
     if proactive:
         calls.append(proactive)
+    schedule_import = _forced_acceptance_schedule_import_calls(user_text)
+    if schedule_import:
+        return schedule_import
     calls.extend(_forced_commitment_calls(user_text))
     calls.extend(_forced_week_reminder_calls(user_text))
     for factory in (
@@ -1271,15 +1693,18 @@ def _forced_tool_calls_for_turn(
         _forced_medication_call,
         _forced_reminder_call,
         _forced_quick_note_call,
-        _forced_focus_block_call,
+        _forced_routine_call,
         _forced_record_decision_call,
         _forced_list_directory_call,
+        _forced_focus_block_call,
+        _forced_auth_probe_write_call,
         _forced_read_file_call,
         _forced_recall_call,
     ):
         call = factory(user_text)
         if call:
             calls.append(call)
+    calls.extend(_forced_life_os_calls(user_text))
     cancel_call = _forced_cancel_task_call(user_text, state)
     if cancel_call:
         calls.append(cancel_call)
@@ -1317,6 +1742,18 @@ def _infer_energy_self_report(user_text: str) -> dict[str, Any] | None:
             "exhausted",
             "can't focus",
             "cant focus",
+            "low energy",
+            "burned out",
+            "burnt out",
+            "maxed out",
+            "overloaded",
+            "shutdown",
+            "can't initiate",
+            "cant initiate",
+            "anxious",
+            "spiraling",
+            "too much for my brain",
+            "brain is staticky",
         )
     ):
         return {
@@ -1497,6 +1934,7 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
     The dynamic suffix is rebuilt every turn.
     After building, checks the budget tier and runs compaction when needed.
     """
+    session_id = str(state.get("session_id") or "unknown")
     # Build frozen prefix on first turn (or if missing)
     frozen = state.get("frozen_prefix") or ""
     if not frozen:
@@ -1562,7 +2000,6 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
     # Check for unread autonomous updates from the background loop
     unread: list[dict[str, Any]] = []
     if container is not None:
-        session_id = state.get("session_id")
         if session_id:
             unread = await _fetch_unread_autonomous_updates(container, session_id)
 
@@ -1636,8 +2073,13 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
         # estimate so the daemon can forward token_count in the response_complete
         # WebSocket metadata. Without this, observers only see tier names and
         # cannot track how close to the next escalation the conversation is.
-        estimated_tokens = monitor.estimate_current_usage(msg_dicts, frozen, tools=_tools)
-        tier = monitor.get_tier(msg_dicts, frozen, tools=_tools)
+        active_system_prompt = f"{frozen}\n\n{suffix}" if suffix else frozen
+        estimated_tokens = monitor.estimate_current_usage(
+            msg_dicts,
+            active_system_prompt,
+            tools=_tools,
+        )
+        tier = monitor.get_tier(msg_dicts, active_system_prompt, tools=_tools)
         update["compaction_tier"] = tier.name
         update["compaction_tokens"] = estimated_tokens
 
@@ -1647,16 +2089,30 @@ async def build_suffix(state: SupervisorState, container: Any = None) -> dict[st
             llm = container.llm if container else None
             existing_summary = state.get("compaction_summary", "")
 
-            result = await run_compaction(
-                messages=msg_dicts,
-                tier=tier,
-                llm=llm,
-                existing_summary=existing_summary or None,
-            )
+            if tier == BudgetTier.HARD_STOP:
+                from kora_v2.context.compaction import emergency_compaction
+
+                result = emergency_compaction(
+                    msg_dicts,
+                    session_id=session_id,
+                    existing_summary=existing_summary or None,
+                )
+            else:
+                result = await run_compaction(
+                    messages=msg_dicts,
+                    tier=tier,
+                    llm=llm,
+                    existing_summary=existing_summary or None,
+                )
 
             if result is not None:
                 update["compaction_summary"] = result.summary_text or existing_summary
-                update["messages"] = result.messages  # replace message list with compacted version
+                update["messages"] = [
+                    {
+                        "role": "__replace_messages__",
+                        "messages": result.messages,
+                    }
+                ]
                 log.info(
                     "compaction_ran",
                     stage=result.stage,
@@ -1870,11 +2326,41 @@ async def tool_loop(
     tool_results: list[dict[str, Any]] = []
     tool_records: list[dict[str, Any]] = []
     short_circuit_response = ""
+    mutating_tool_count = int(getattr(container, "_turn_mutating_tool_count", 0) or 0)
+    mutation_limit = int(
+        getattr(container, "_turn_mutating_tool_limit", _MAX_MUTATING_TOOL_CALLS_PER_TURN)
+        or _MAX_MUTATING_TOOL_CALLS_PER_TURN
+    )
 
     for tc in pending:
         tool_name = tc["name"]
         tool_args = tc["arguments"]
         tool_id = tc["id"]
+
+        if tool_name in _MUTATING_TOOL_NAMES:
+            mutating_tool_count += 1
+            container._turn_mutating_tool_count = mutating_tool_count
+            if mutating_tool_count > mutation_limit:
+                result_str = json.dumps({
+                    "error": "bulk_mutation_limit_reached",
+                    "message": (
+                        "Too many state-changing tool calls were requested in "
+                        "one turn. Stop and ask the user to confirm the next "
+                        "batch instead of continuing automatically."
+                    ),
+                })
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "content": result_str,
+                })
+                short_circuit_response = (
+                    "I hit the safety limit for changing calendar/files/state "
+                    "in one turn. I saved the first batch, then stopped before "
+                    "making more changes. Please confirm the next batch before "
+                    "I continue."
+                )
+                break
 
         log.info("tool_loop_execute", tool=tool_name, tool_id=tool_id)
 
@@ -2166,6 +2652,67 @@ def _strip_unintended_cjk(response: str, user_messages: list[str]) -> str:
     return out
 
 
+_RAW_TOOL_MARKUP_RE = re.compile(
+    r"<minimax:tool_call>.*?</minimax:tool_call>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_raw_tool_markup(response: str) -> str:
+    if not response or "<minimax:tool_call" not in response.lower():
+        return response
+    cleaned = _RAW_TOOL_MARKUP_RE.sub("", response).strip()
+    if cleaned:
+        log.warning("raw_tool_markup_stripped", original_len=len(response), new_len=len(cleaned))
+        return cleaned
+    log.warning("raw_tool_markup_replaced", original_len=len(response))
+    return (
+        "I finished the tool work I could safely run. I need you to confirm "
+        "the next batch before I make more calendar or file changes."
+    )
+
+
+def _sanitize_trusted_support_response(response: str, user_messages: list[str]) -> str:
+    if not response:
+        return response
+    combined = "\n".join(user_messages[-4:]).lower()
+    response_lower = response.lower()
+    if not any(term in combined or term in response_lower for term in ("talia", "trusted support")):
+        return response
+    if not any(term in combined for term in ("call script", "phone script", "call talia", "phone talia")):
+        response = re.sub(
+            r"\bCan we talk this weekend\?",
+            "Could I text you this weekend?",
+            response,
+            flags=re.IGNORECASE,
+        )
+        response = re.sub(
+            r"\bcan we talk\b",
+            "could I text you",
+            response,
+            flags=re.IGNORECASE,
+        )
+        response = re.sub(
+            r"\bphone[- ]first approach for calls\b",
+            "message-first approach for trusted support",
+            response,
+            flags=re.IGNORECASE,
+        )
+        response = re.sub(
+            r"\bphone call\b",
+            "text check-in",
+            response,
+            flags=re.IGNORECASE,
+        )
+        response = re.sub(
+            r"\bcall Talia\b",
+            "text Talia",
+            response,
+            flags=re.IGNORECASE,
+        )
+    return response
+
+
 async def synthesize(state: SupervisorState) -> dict[str, Any]:
     """Format final response.
 
@@ -2193,7 +2740,10 @@ async def synthesize(state: SupervisorState) -> dict[str, Any]:
             content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
             if isinstance(content, str):
                 user_texts.append(content)
-    response = _strip_unintended_cjk(response, user_texts)
+    response = _sanitize_trusted_support_response(
+        _strip_raw_tool_markup(_strip_unintended_cjk(response, user_texts)),
+        user_texts,
+    )
 
     log.info("synthesize", response_len=len(response))
 
@@ -2340,8 +2890,10 @@ def build_supervisor_graph(container: Any) -> Any:
         container._turn_start_time = time.monotonic()  # Track for quality metrics
         base = await receive(state)
         turn = base["turn_count"]
+        container._turn_mutating_tool_count = 0
 
         latest_user_text = _latest_user_text(state)
+        container._turn_mutating_tool_limit = _mutation_limit_for_turn(latest_user_text)
         active_skills = _infer_active_skills(latest_user_text, skill_loader)
         base["_active_skills"] = active_skills
         base["_latest_user_text"] = latest_user_text

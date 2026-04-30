@@ -6,11 +6,10 @@ skips when db_path is None, and handles DB errors gracefully.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 import pytest
 
-from kora_v2.core.models import QualityGateResult, QualityTurnMetrics
+from kora_v2.core.models import QualityGateResult
 from kora_v2.quality.tier1 import QualityCollector
 
 
@@ -20,7 +19,7 @@ def db_path(tmp_path):
     from kora_v2.core.db import init_operational_db
 
     path = tmp_path / "operational.db"
-    asyncio.get_event_loop().run_until_complete(init_operational_db(path))
+    asyncio.run(init_operational_db(path))
     return path
 
 
@@ -133,8 +132,8 @@ class TestPersistTurn:
     async def test_in_memory_still_works(self, db_path):
         """In-memory storage should work alongside DB persistence."""
         collector = QualityCollector(db_path=db_path)
-        m1 = collector.record_turn(session_id="sess-mem", turn=1, latency_ms=100)
-        m2 = collector.record_turn(session_id="sess-mem", turn=2, latency_ms=200)
+        collector.record_turn(session_id="sess-mem", turn=1, latency_ms=100)
+        collector.record_turn(session_id="sess-mem", turn=2, latency_ms=200)
 
         assert len(collector.get_session_metrics("sess-mem")) == 2
         assert collector.average_latency("sess-mem") == 150.0

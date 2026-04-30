@@ -25,6 +25,7 @@ except ImportError:
     pass
 
 import aiosqlite
+import pytest
 
 from kora_v2.core.db import init_operational_db
 from kora_v2.life.reminders import Reminder, ReminderStore
@@ -185,6 +186,29 @@ class TestMarkDeliveredDismissed:
         assert row is not None
         assert row["status"] == "delivered"
         assert row["delivered_at"] is not None
+
+    async def test_mark_delivered_uses_due_time_in_acceptance_mode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store, db_path = await _make_store(tmp_path)
+        due_at = datetime.now(UTC) - timedelta(hours=3)
+        rid = await store.create_reminder(title="Simulated due", due_at=due_at)
+        monkeypatch.setenv("KORA_ACCEPTANCE_DIR", str(tmp_path / "acceptance"))
+
+        await store.mark_delivered(rid)
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT delivered_at FROM reminders WHERE id = ?",
+                (rid,),
+            )
+            row = await cursor.fetchone()
+
+        assert row is not None
+        assert datetime.fromisoformat(row["delivered_at"]) == due_at
 
     async def test_mark_dismissed_updates_status(self, tmp_path: Path) -> None:
         store, db_path = await _make_store(tmp_path)

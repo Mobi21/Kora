@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -44,6 +45,33 @@ TOKEN_FILE = PROJECT_ROOT / "data" / ".api_token"
 # maintainers cannot accidentally extend the f-string interpolation in
 # that helper to an attacker-controlled name.
 _ALLOWED_LIFECYCLE_TABLES = frozenset({"memories", "user_model_facts"})
+
+_ACCEPTANCE_PERSONA_EXPLICIT_MARKERS: tuple[str, ...] = (
+    "acceptance-fixture",
+    "kora acceptance",
+    "acceptance test",
+    "acceptance harness",
+)
+
+_ACCEPTANCE_PERSONA_FINGERPRINTS: tuple[str, ...] = (
+    "maya",
+    "maya rivera",
+    "talia",
+    "talia chen",
+    "three rivers university",
+    "accessibility resource center",
+    "cognitive science",
+    "adderall xr",
+    "jordan",
+    "alex",
+    "mochi",
+    "adderall",
+    "trusted support",
+    "doctor portal",
+    "portal form",
+    "local-first",
+    "local first",
+)
 
 
 def _ensure_dirs() -> None:
@@ -226,6 +254,26 @@ _LIFE_MANAGEMENT_TABLES: tuple[str, ...] = (
     "routines",
 )
 
+_LIFE_OS_TABLES: tuple[str, ...] = (
+    "day_plan_entries",
+    "day_plans",
+    "life_events",
+    "load_assessments",
+    "plan_repair_actions",
+    "support_profile_signals",
+    "support_profiles",
+    "future_self_bridges",
+    "trusted_support_exports",
+    "safety_boundary_records",
+    "nudge_feedback",
+    "nudge_decisions",
+    "context_pack_feedback",
+    "context_packs",
+    "energy_log",
+    "notification_engagement",
+    "calendar_entries",
+)
+
 _LIFECYCLE_TABLES: tuple[str, ...] = (
     "notifications",
     "session_transcripts",
@@ -274,6 +322,7 @@ async def _clean_stale_test_data(db_path: Path) -> None:
                 *_ORCHESTRATION_TABLES,
                 *_RUNTIME_STATE_TABLES,
                 *_LIFE_MANAGEMENT_TABLES,
+                *_LIFE_OS_TABLES,
                 *_LIFECYCLE_TABLES,
             ):
                 try:
@@ -350,7 +399,7 @@ def _clean_stale_projection_data(db_path: Path) -> None:
         _remove_projection_file()
 
 
-def _reset_daemon_runtime_files(data_dir: Path) -> None:
+def _reset_daemon_runtime_files(data_dir: Path) -> dict[str, str]:
     """Drop persisted conversation identity files between acceptance runs.
 
     The daemon persists ``thread_id`` / ``session_id`` on disk so the
@@ -359,11 +408,88 @@ def _reset_daemon_runtime_files(data_dir: Path) -> None:
     every run; otherwise a stale checkpoint can be replayed into the first
     turn and break the clean-room test session before any new message lands.
     """
+    result: dict[str, str] = {}
     for name in ("thread_id", "session_id"):
+        path = data_dir / name
         try:
-            (data_dir / name).unlink(missing_ok=True)
+            existed = path.exists()
+            path.unlink(missing_ok=True)
+            result[name] = "removed" if existed else "absent"
         except Exception:
-            pass
+            result[name] = "error"
+    return result
+
+
+def _looks_like_acceptance_persona_residue(text: str) -> bool:
+    """Return true only for old acceptance persona notes.
+
+    This intentionally requires either an explicit acceptance marker or a
+    dense cluster of the old Jordan persona fingerprints. A random real
+    note mentioning one name should not be touched.
+    """
+    lowered = text.lower()
+    if any(marker in lowered for marker in _ACCEPTANCE_PERSONA_EXPLICIT_MARKERS):
+        return True
+    hits = sum(1 for term in _ACCEPTANCE_PERSONA_FINGERPRINTS if term in lowered)
+    return ("jordan" in lowered or "maya" in lowered) and hits >= 4
+
+
+def _clean_acceptance_persona_residue(
+    memory_root: Path,
+    quarantine_root: Path,
+) -> dict[str, Any]:
+    """Move stale acceptance-persona notes out of persistent memory.
+
+    Acceptance normally runs with ``KORA_MEMORY__KORA_MEMORY_PATH`` pointed at
+    ``/tmp/claude/kora_acceptance/memory``. Prior runs can still leave old
+    persona notes in the default ``~/.kora/memory`` tree. Those files can leak
+    into a "fresh" run through fallback settings or projection rebuilding, so
+    quarantine only files that are clearly acceptance-owned.
+    """
+    memory_root = memory_root.expanduser()
+    quarantine_root = quarantine_root.expanduser()
+    summary: dict[str, Any] = {
+        "memory_root": str(memory_root),
+        "quarantine_root": str(quarantine_root),
+        "scanned_files": 0,
+        "quarantined_files": [],
+        "errors": [],
+    }
+    if not memory_root.exists():
+        summary["status"] = "memory_root_missing"
+        return summary
+    if not memory_root.is_dir():
+        summary["status"] = "memory_root_not_directory"
+        return summary
+
+    suffixes = {".md", ".markdown", ".txt", ".json", ".yaml", ".yml"}
+    for path in memory_root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in suffixes:
+            continue
+        summary["scanned_files"] += 1
+        try:
+            if path.stat().st_size > 1_000_000:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if not _looks_like_acceptance_persona_residue(text):
+                continue
+            relative = path.relative_to(memory_root)
+            target = quarantine_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+                target = target.with_name(f"{target.stem}.{stamp}{target.suffix}")
+            shutil.move(str(path), str(target))
+            summary["quarantined_files"].append({
+                "from": str(path),
+                "to": str(target),
+            })
+        except Exception as exc:
+            summary["errors"].append({"path": str(path), "error": str(exc)})
+
+    summary["status"] = "ok"
+    summary["quarantined_count"] = len(summary["quarantined_files"])
+    return summary
 
 
 # Backward-compat alias — one slice of grace before removal.
@@ -726,6 +852,8 @@ class HarnessServer:
             "session_id": self._kora_session_id,
             "simulated_hours": self._state.get("simulated_hours_offset", 0),
             "messages_count": len(self._state.get("messages", [])),
+            "first_run": self._state.get("first_run", {}),
+            "clean_start": self._state.get("clean_start", {}),
         }
 
         status = _rest_get("/api/v1/status", self._kora_port, self._kora_host, self._token)
@@ -753,6 +881,8 @@ class HarnessServer:
             "name": name,
             "captured_at": datetime.now(UTC).isoformat(),
             "simulated_hours": self._state.get("simulated_hours_offset", 0),
+            "first_run": self._state.get("first_run", {}),
+            "clean_start": self._state.get("clean_start", {}),
             "conversation": {
                 "message_count": len(self._state.get("messages", [])),
                 "last_3": self._state.get("messages", [])[-3:],
@@ -813,7 +943,7 @@ class HarnessServer:
     def _append_benchmarks_csv(
         snapshot_name: str, row: dict[str, Any],
     ) -> None:
-        """Append one benchmark row to ``data/acceptance/benchmarks.csv``.
+        """Append one benchmark row to the acceptance-local trend CSV.
 
         Creates the file + header if it doesn't yet exist. Rows are
         keyed by the snapshot name and an ISO timestamp so trending
@@ -829,7 +959,10 @@ class HarnessServer:
 
         from tests.acceptance.scenario.benchmarks import CSV_COLUMNS
 
-        out_dir = PROJECT_ROOT / "data" / "acceptance"
+        if os.environ.get("KORA_ACCEPTANCE_DIR"):
+            out_dir = OUTPUT_DIR
+        else:
+            out_dir = PROJECT_ROOT / "data" / "acceptance"
         out_dir.mkdir(parents=True, exist_ok=True)
         csv_path = out_dir / "benchmarks.csv"
 
@@ -2509,13 +2642,70 @@ class HarnessServer:
         """
         from tests.acceptance._report import build_report
         finalization = await self._drain_report_finalization()
+        vault_finalization = await self._drain_vault_session_artifacts()
         path = await build_report(
             self._state,
             SNAPSHOTS_DIR,
             OUTPUT_DIR,
             compaction_events=list(self._compaction_events),
         )
-        return {"path": str(path), "finalization": finalization}
+        exports = {
+            "conversation_json": OUTPUT_DIR / "acceptance_conversation.json",
+            "conversation_markdown": OUTPUT_DIR / "acceptance_conversation.md",
+            "demo_snapshot": OUTPUT_DIR / "acceptance_demo_snapshot.json",
+        }
+        return {
+            "path": str(path),
+            "exports": {
+                key: str(export_path)
+                for key, export_path in exports.items()
+                if export_path.exists()
+            },
+            "finalization": finalization,
+            "vault_finalization": vault_finalization,
+        }
+
+    @staticmethod
+    def _acceptance_vault_session_state() -> dict[str, Any]:
+        """Return the filesystem evidence used by coverage item 57."""
+        vault_root = ACCEPT_DIR / "memory"
+        sessions_dir = vault_root / "Sessions"
+        index_file = sessions_dir / "index.md"
+        session_notes = [
+            path
+            for path in sessions_dir.rglob("*.md")
+            if path.name != "index.md"
+        ] if sessions_dir.exists() else []
+        return {
+            "root": str(vault_root),
+            "index_exists": index_file.exists(),
+            "session_note_count": len(session_notes),
+        }
+
+    async def _drain_vault_session_artifacts(self) -> dict[str, Any]:
+        """Wait briefly for post-vault files that coverage reads directly.
+
+        The protected pipeline drain observes DB task state. The final
+        filesystem writes for ``Sessions/index.md`` can land a few seconds
+        later, so the report boundary also waits for the concrete vault
+        artifacts that item 57 scores from.
+        """
+        timeout = float(
+            os.environ.get("KORA_ACCEPTANCE_VAULT_DRAIN_SECONDS", "60")
+        )
+        timeout = max(0.0, min(timeout, 90.0))
+        deadline = time.monotonic() + timeout
+        state = self._acceptance_vault_session_state()
+        if state["index_exists"] and state["session_note_count"] >= 1:
+            return {"status": "ready", "timeout_s": timeout, **state}
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            state = self._acceptance_vault_session_state()
+            if state["index_exists"] and state["session_note_count"] >= 1:
+                return {"status": "ready", "timeout_s": timeout, **state}
+
+        return {"status": "timeout", "timeout_s": timeout, **state}
 
     async def _drain_report_finalization(self) -> dict[str, Any]:
         """Give protected memory/vault pipelines a bounded chance to finish.
@@ -2559,34 +2749,10 @@ class HarnessServer:
         else:
             status = "timeout"
 
-        if disconnected:
-            try:
-                await self._reconnect_after_idle()
-            except Exception as exc:  # noqa: BLE001
-                _log_event({"event": "report_finalization_reconnect_failed", "error": str(exc)})
-            else:
-                # Reconnecting can flush SESSION_END / sequence-complete work
-                # that was queued while the harness was disconnected. Take a
-                # second quiet pass so the report does not snapshot the narrow
-                # gap before those protected pipelines appear in the DB.
-                post_reconnect_quiet = 0
-                while time.monotonic() < deadline:
-                    last_state = await self._query_protected_finalization_state(
-                        started
-                    )
-                    active = int(last_state.get("active_count", 0) or 0)
-                    if active == 0:
-                        post_reconnect_quiet += 1
-                        if post_reconnect_quiet >= 3:
-                            break
-                    else:
-                        post_reconnect_quiet = 0
-                    _update_monitor(
-                        self._state,
-                        "report finalization post-reconnect drain: "
-                        f"active protected pipelines={active}",
-                    )
-                    await asyncio.sleep(2.0)
+        # Do not reconnect before building the report. A reconnect opens a new
+        # chat session; the next disconnect then creates fresh post-session and
+        # post-vault work, so report generation can chase work it just caused.
+        # Report generation only needs persisted snapshots and databases.
 
         elapsed = (datetime.now(UTC) - started).total_seconds()
         result = {
@@ -2611,7 +2777,13 @@ class HarnessServer:
         except ImportError:
             return {"active_count": 0, "error": "aiosqlite_missing"}
 
-        names = ("post_session_memory", "post_memory_vault")
+        names = (
+            "post_session_memory",
+            "post_memory_vault",
+            "proactive_research",
+            "user_autonomous_task",
+            "cancel_probe",
+        )
         active_states = ("pending", "running", "paused")
         task_active_states = (
             "pending",
@@ -2694,6 +2866,27 @@ class HarnessServer:
         """Run error recovery tests: send malformed inputs, verify session survives."""
         results = []
 
+        async def _reset_ws_after_probe() -> None:
+            # Raw protocol-error probes can leave the websocket in a
+            # half-closed state while the daemon restarts the service side.
+            # Drop the harness connection and reconnect before the next
+            # user-visible chat probe so recovery is measured from a clean
+            # post-error session rather than a stale socket.
+            if self._recv_task is not None:
+                self._recv_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._recv_task
+                self._recv_task = None
+            if self._ws is not None:
+                with contextlib.suppress(Exception):
+                    await self._ws.close()
+                self._ws = None
+            self._response_data = None
+            self._response_ready = None
+            self._busy = False
+            await asyncio.sleep(0.5)
+            await self._ensure_ws_connected()
+
         async def _raw_ws_probe(test_name: str, payload: str) -> None:
             if not await self._ensure_ws_connected():
                 results.append({
@@ -2742,10 +2935,12 @@ class HarnessServer:
                 self._response_ready = None
 
         await _raw_ws_probe("malformed_json_frame", "{not valid json")
+        await _reset_ws_after_probe()
         await _raw_ws_probe(
             "empty_chat_content",
             json.dumps({"type": "chat", "content": ""}),
         )
+        await _reset_ws_after_probe()
 
         test_cases = [
             ("special_chars", "!@#$%^&*(){}[]|\\/<>?~`"),
@@ -2756,7 +2951,7 @@ class HarnessServer:
 
         for test_name, message in test_cases:
             try:
-                result = await self.cmd_send(message or " ", timeout=60.0)
+                result = await self.cmd_send(message or " ", timeout=240.0)
                 survived = "error" not in result or not result.get("error")
                 response = result.get("response", "")
                 results.append({
@@ -2765,12 +2960,15 @@ class HarnessServer:
                     "response": response[:120] if response else "(empty)",
                     "error": result.get("error"),
                 })
+                if not survived:
+                    await _reset_ws_after_probe()
             except Exception as e:
                 results.append({
                     "test": test_name,
                     "survived": False,
                     "error": str(e),
                 })
+                await _reset_ws_after_probe()
 
         all_survived = all(r.get("survived", False) for r in results)
         self._state["error_recovery_results"] = results
@@ -3481,6 +3679,59 @@ class HarnessServer:
             "events": captured,
         }
 
+    async def cmd_clean_start_status(self) -> dict[str, Any]:
+        """Return fresh-start and first-run acceptance startup metadata."""
+        clean_start = dict(self._state.get("clean_start") or {})
+        first_run = dict(self._state.get("first_run") or {})
+        memory_root = Path(
+            str(clean_start.get("isolated_memory_root") or ACCEPT_DIR / "memory")
+        )
+        resolved_accept_dir = ACCEPT_DIR.expanduser().resolve()
+        resolved_memory_root = memory_root.expanduser().resolve()
+        return {
+            "run_id": self._state.get("run_id"),
+            "started_at": self._state.get("started_at"),
+            "mode": self._state.get("mode"),
+            "first_run": first_run,
+            "clean_start": clean_start,
+            "checks": {
+                "acceptance_dir_exists": ACCEPT_DIR.exists(),
+                "output_dir_exists": OUTPUT_DIR.exists(),
+                "session_file_exists": SESSION_FILE.exists(),
+                "memory_root": str(memory_root),
+                "memory_root_exists": memory_root.exists(),
+                "memory_root_is_isolated": (
+                    resolved_accept_dir in resolved_memory_root.parents
+                    or resolved_memory_root == resolved_accept_dir
+                ),
+                "messages_count": len(self._state.get("messages", [])),
+            },
+        }
+
+    async def cmd_mark_first_run_complete(
+        self,
+        evidence: str = "persona onboarding phase completed",
+    ) -> dict[str, Any]:
+        """Mark the simulated first-run setup complete with explicit evidence."""
+        first_run = dict(self._state.get("first_run") or {})
+        first_run.update(
+            {
+                "required": True,
+                "status": "completed",
+                "completed_at": datetime.now(UTC).isoformat(),
+                "evidence": evidence,
+            }
+        )
+        self._state["first_run"] = first_run
+        _save_session(self._state)
+        _log_event(
+            {
+                "event": "first_run_complete",
+                "evidence": evidence,
+            }
+        )
+        return {"first_run": first_run}
+
     async def cmd_stop_server(self) -> dict[str, Any]:
         """Shut down the harness server."""
         self._running = False
@@ -3580,10 +3831,24 @@ class HarnessServer:
                 result = await self.cmd_event_tail(
                     seconds=int(request.get("seconds", 10)),
                 )
+            elif cmd == "clean-start-status":
+                result = await self.cmd_clean_start_status()
+            elif cmd == "mark-first-run-complete":
+                result = await self.cmd_mark_first_run_complete(
+                    evidence=str(
+                        request.get("evidence")
+                        or "persona onboarding phase completed"
+                    )
+                )
             elif cmd == "stop":
                 result = await self.cmd_stop_server()
             elif cmd == "ping":
-                result = {"pong": True, "session_id": self._kora_session_id}
+                result = {
+                    "pong": True,
+                    "session_id": self._kora_session_id,
+                    "first_run": self._state.get("first_run", {}),
+                    "clean_start": self._state.get("clean_start", {}),
+                }
             else:
                 result = {"error": f"Unknown command: {cmd}"}
 

@@ -536,7 +536,10 @@ class LifeOSProofCollector:
                     conn,
                     label="low-energy load assessment",
                     table="load_assessments",
-                    where="band IN ('high', 'overloaded', 'low_energy', 'shutdown')",
+                    where=(
+                        "band IN ('high', 'overloaded', 'stabilization', "
+                        "'low_energy', 'shutdown')"
+                    ),
                     columns=("band",),
                     source="load_assessments.band",
                 ),

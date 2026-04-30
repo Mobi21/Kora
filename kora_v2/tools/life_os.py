@@ -174,6 +174,7 @@ async def confirm_reality(input: ConfirmRealityInput, container: Any) -> str:
             )
     if input.reality_state in {"partial", "skipped", "blocked", "rejected", "not_done"}:
         await _attempt_day_repair(container)
+    await _ensure_profile_from_reality(container, input)
     return _ok({"life_event": _dump(event), "day_plan_entry": _dump(entry)})
 
 
@@ -361,6 +362,14 @@ async def create_context_pack(input: ContextPackInput, container: Any) -> str:
                 "pack_type": input.pack_type,
             },
         ))
+    if input.pack_type in {"sensory", "communication", "appointment"}:
+        await _ensure_support_profile_signal(
+            container,
+            "autism_sensory",
+            "sensory_or_transition_need",
+            source="context_pack",
+            metadata={"pack_type": input.pack_type, "title": input.title},
+        )
     return _ok({"context_pack": _dump(pack)})
 
 
@@ -527,6 +536,8 @@ def _normalize_reality_state(value: str) -> str:
         "done": "confirmed_done",
         "complete": "confirmed_done",
         "completed": "confirmed_done",
+        "confirmed": "confirmed_done",
+        "corrected": "rejected_inference",
         "partial": "confirmed_partial",
         "half": "confirmed_partial",
         "skipped": "confirmed_skipped",
@@ -598,6 +609,67 @@ async def _attempt_day_repair(container: Any) -> None:
         action_ids = [getattr(action, "id", None) for action in actions]
         if action_ids:
             await engine.apply([action_id for action_id in action_ids if action_id])
+    except Exception:
+        return
+
+
+async def _ensure_profile_from_reality(
+    container: Any,
+    input: ConfirmRealityInput,
+) -> None:
+    text = " ".join(
+        part for part in (input.event_type, input.title, input.text) if part
+    ).lower()
+    if any(
+        signal in text
+        for signal in (
+            "adhd",
+            "time got slippery",
+            "time blindness",
+            "missed lunch",
+            "missed meal",
+            "forgot",
+            "avoided",
+            "avoidance",
+            "task initiation",
+            "first tiny action",
+        )
+    ):
+        await _ensure_support_profile_signal(
+            container,
+            "adhd",
+            "executive_function_need",
+            source="reality_confirmation",
+            metadata={"event_type": input.event_type, "reality_state": input.reality_state},
+        )
+
+
+async def _ensure_support_profile_signal(
+    container: Any,
+    profile_key: str,
+    signal_type: str,
+    *,
+    source: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    registry = getattr(container, "support_registry", None)
+    if registry is None:
+        return
+    try:
+        await registry.set_profile_status(
+            profile_key,
+            "active",
+            source=source,
+            reason=f"{signal_type} observed",
+        )
+        await registry.record_signal(
+            profile_key,
+            signal_type,
+            weight=0.8,
+            source=source,
+            confidence=1.0,
+            metadata=metadata or {},
+        )
     except Exception:
         return
 

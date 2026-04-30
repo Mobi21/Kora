@@ -75,7 +75,9 @@ class TestDayContextBuilder:
         """
         today = date.today()
         async with aiosqlite.connect(str(engine._db_path)) as db:
-            now = datetime.now(UTC).isoformat()
+            now = datetime.combine(
+                date.today(), datetime.min.time(), tzinfo=UTC
+            ).isoformat()
             await db.execute(
                 "INSERT INTO items "
                 "(id, type, owner, title, status, due_date, "
@@ -241,7 +243,9 @@ class TestLifeContextAggregation:
         await init_operational_db(db_path)
         # Insert finance rows
         async with aiosqlite.connect(str(db_path)) as db:
-            now = datetime.now(UTC).isoformat()
+            now = datetime.combine(
+                date.today(), datetime.min.time(), tzinfo=UTC
+            ).isoformat()
             for amt, cat in [(50, "food"), (200, "tech"), (30, "food")]:
                 await db.execute(
                     "INSERT INTO finance_log (id, amount, category, logged_at, created_at) "

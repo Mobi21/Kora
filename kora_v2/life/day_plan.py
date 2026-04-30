@@ -162,7 +162,7 @@ class DayPlanService:
         await self._ledger.record_event(
             RecordLifeEventInput(
                 event_type="day_plan_created",
-                event_time=now,
+                event_time=datetime.combine(day, time.min, tzinfo=UTC),
                 source="tool",
                 title="Day plan created",
                 details=summary,
@@ -273,7 +273,7 @@ class DayPlanService:
         await self._ledger.record_event(
             RecordLifeEventInput(
                 event_type="day_plan_created",
-                event_time=now,
+                event_time=datetime.combine(day, time.min, tzinfo=UTC),
                 source="tool",
                 title="Reduced day plan created",
                 details=summary,

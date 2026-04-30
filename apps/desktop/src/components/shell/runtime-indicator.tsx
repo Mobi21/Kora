@@ -1,6 +1,7 @@
 import { useConnectionStore } from '@/lib/api/connection';
 import { Pill, type PillStatus } from '@/components/ui/pill';
 import type { RuntimeState } from '@/lib/api/types';
+import { isDemoMode } from '@/lib/demo/mode';
 
 const RUNTIME_TO_PILL: Record<RuntimeState, PillStatus> = {
   starting: 'warn',
@@ -21,6 +22,10 @@ const RUNTIME_LABEL: Record<RuntimeState, string> = {
 export function RuntimeIndicator(): JSX.Element {
   const connStatus = useConnectionStore((s) => s.status);
   const connection = useConnectionStore((s) => s.connection);
+
+  if (isDemoMode()) {
+    return <Pill status="unknown" label="Demo snapshot" />;
+  }
 
   if (connStatus !== 'ready') {
     const fallback: PillStatus = connStatus === 'error' ? 'degraded' : 'unknown';

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from kora_v2.graph.reducers import add_messages_reducer
 from kora_v2.graph.state import SupervisorState
 
 
@@ -42,7 +43,7 @@ class TestSupervisorState:
             "hyperfocus_mode",
             "topic_tracker",
         }
-        assert expected == keys
+        assert expected <= keys
 
     def test_state_is_total_false(self) -> None:
         """SupervisorState uses total=False so all fields are optional."""
@@ -71,3 +72,24 @@ class TestSupervisorState:
         assert state["session_id"] == "abc123"
         assert state["turn_count"] == 1
         assert len(state["messages"]) == 1
+
+
+class TestMessageReducer:
+    """Message reducer behavior that normal graph compaction depends on."""
+
+    def test_compaction_replacement_sentinel_replaces_history(self) -> None:
+        existing = [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old reply"},
+        ]
+        compacted = [
+            {"role": "system", "content": "summary"},
+            {"role": "user", "content": "recent"},
+        ]
+
+        merged = add_messages_reducer(
+            existing,
+            [{"role": "__replace_messages__", "messages": compacted}],
+        )
+
+        assert merged == compacted

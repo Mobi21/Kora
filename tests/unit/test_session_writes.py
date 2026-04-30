@@ -6,13 +6,14 @@ and everything degrades gracefully when DB is unavailable.
 """
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kora_v2.core.db import init_operational_db
 from kora_v2.core.models import EmotionalState
 from kora_v2.daemon.session import SessionManager
 
@@ -38,8 +39,8 @@ def _make_container(tmp_path: Path, *, with_memory: bool = False, with_scanner: 
         container.memory_store = None
 
     if with_scanner:
-        scanner = AsyncMock()
-        scanner.scan = AsyncMock()
+        scanner = MagicMock()
+        scanner.scan = MagicMock(return_value=MagicMock(has_signal=False))
         container.signal_scanner = scanner
     else:
         container.signal_scanner = None
@@ -50,11 +51,8 @@ def _make_container(tmp_path: Path, *, with_memory: bool = False, with_scanner: 
 @pytest.fixture
 def db_path(tmp_path):
     """Create operational.db with the sessions schema."""
-    import asyncio
-    from kora_v2.core.db import init_operational_db
-
     path = tmp_path / "operational.db"
-    asyncio.get_event_loop().run_until_complete(init_operational_db(path))
+    asyncio.run(init_operational_db(path))
     return path
 
 
@@ -131,7 +129,7 @@ class TestEndSessionWrites:
             {"role": "assistant", "content": "Hi there!"},
         ]
 
-        bridge = await mgr.end_session(messages, emotional_state)
+        await mgr.end_session(messages, emotional_state)
 
         # Verify DB was updated
         import aiosqlite

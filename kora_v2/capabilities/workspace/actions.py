@@ -381,6 +381,10 @@ async def calendar_create_event(
         }
         if args_with_provenance.get("description") is not None:
             current_args["description"] = args_with_provenance["description"]
+        if args_with_provenance.get("extendedProperties") is not None:
+            current_args["extendedProperties"] = args_with_provenance[
+                "extendedProperties"
+            ]
         if attendees is not None:
             current_args["attendees"] = attendees
         return await _call_action(ctx, action_name, current_args, approved=approved)

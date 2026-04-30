@@ -201,3 +201,4 @@ dashboard/
 
 # Acceptance test run outputs
 tests/acceptance/output_*/
+output/

@@ -583,6 +583,61 @@ def build_hard_stop_bridge(messages: list[dict], session_id: str) -> SessionBrid
     )
 
 
+def emergency_compaction(
+    messages: list[dict],
+    *,
+    session_id: str,
+    existing_summary: str | None = None,
+    preserve_first_n: int = 2,
+    preserve_last_n: int = 8,
+) -> CompactionResult:
+    """Compact at HARD_STOP without making another LLM call.
+
+    This is intentionally heuristic: when the provider is already near
+    context capacity, asking the model to summarize the full transcript can
+    fail with the same overflow we are trying to avoid. Keep a small anchor,
+    a bridge note, and the most recent complete tool-safe tail.
+    """
+    tokens_before = count_messages_tokens(messages)
+    total = len(messages)
+    start_keep = min(preserve_first_n, total)
+    tail_start = max(start_keep, total - preserve_last_n)
+    tail_start = _tool_pair_safe_boundary(messages, tail_start, direction="back")
+
+    bridge = build_hard_stop_bridge(messages, session_id)
+    summary_parts = [
+        "## Emergency Context Bridge",
+        bridge.summary,
+    ]
+    if existing_summary:
+        summary_parts.extend(["", "## Prior Compaction Summary", existing_summary[:6000]])
+    if bridge.open_threads:
+        summary_parts.append("")
+        summary_parts.append("## Open Threads")
+        summary_parts.extend(f"- {thread}" for thread in bridge.open_threads[:6])
+
+    summary_msg: dict[str, Any] = {
+        "role": "system",
+        "content": "\n".join(summary_parts),
+    }
+    new_messages = messages[:start_keep] + [summary_msg] + messages[tail_start:]
+    tokens_after = count_messages_tokens(new_messages)
+    logger.warning(
+        "compaction.emergency",
+        tokens_before=tokens_before,
+        tokens_after=tokens_after,
+        messages_removed=max(0, total - len(new_messages)),
+    )
+    return CompactionResult(
+        stage="hard_stop",
+        messages=new_messages,
+        tokens_before=tokens_before,
+        tokens_after=tokens_after,
+        messages_removed=max(0, total - len(new_messages)),
+        summary_text=summary_msg["content"],
+    )
+
+
 # ── Main Entry Point ────────────────────────────────────────────────────────────
 
 
@@ -614,8 +669,11 @@ async def run_compaction(
         return None
 
     if tier == BudgetTier.HARD_STOP:
-        # HARD_STOP is handled by the session manager; they call build_hard_stop_bridge
-        return None
+        return emergency_compaction(
+            messages,
+            session_id="unknown",
+            existing_summary=existing_summary,
+        )
 
     if tier == BudgetTier.PRUNE:
         tokens_before = count_messages_tokens(messages)

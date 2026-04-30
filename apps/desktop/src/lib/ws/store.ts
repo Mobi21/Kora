@@ -40,6 +40,7 @@ export interface ChatState {
   detachClient: () => void;
   applyEvent: (event: ChatEvent) => void;
   appendUserMessage: (content: string) => void;
+  loadReadOnlyTranscript: (messages: ChatMessage[]) => void;
   setPanelOpen: (open: boolean) => void;
   togglePanel: () => void;
   setPanelWidth: (width: number) => void;
@@ -91,6 +92,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({ messages: [...s.messages, message] }));
     const c = get().client;
     c?.send(content);
+  },
+
+  loadReadOnlyTranscript: (messages) => {
+    set({
+      client: null,
+      connectionState: 'closed',
+      messages,
+      pendingDecisions: [],
+      pendingAuthPrompts: [],
+      lastError: null,
+    });
   },
 
   applyEvent: (event) => {

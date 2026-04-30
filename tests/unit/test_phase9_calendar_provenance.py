@@ -34,7 +34,7 @@ def _make_mock_mcp_manager(return_data: dict[str, Any] | None = None) -> MagicMo
 
 
 def _make_ctx(mcp_manager: Any) -> WorkspaceActionContext:
-    config = WorkspaceConfig()
+    config = WorkspaceConfig(user_google_email="user@example.com")
     policy = build_default_policy(account="personal")
     return WorkspaceActionContext(
         config=config,
@@ -208,6 +208,7 @@ async def test_calendar_create_event_uses_config_provenance_value() -> None:
     from kora_v2.capabilities.workspace.actions import calendar_create_event
 
     custom_config = WorkspaceConfig(
+        user_google_email="user@example.com",
         provenance_metadata_key="kora_origin",
         provenance_metadata_value="kora-v2",  # confirm it's the real value
         provenance_marker="[Created by Kora]",

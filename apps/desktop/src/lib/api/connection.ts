@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { DEMO_CONNECTION, isDemoMode } from '@/lib/demo/mode';
 
 export interface Connection {
   host: string;
@@ -50,6 +51,10 @@ export const useConnectionStore = create<ConnectionStore>((set) => ({
   status: 'idle',
   error: null,
   load: async () => {
+    if (isDemoMode()) {
+      set({ connection: DEMO_CONNECTION, status: 'ready', error: null });
+      return;
+    }
     set({ status: 'loading', error: null });
     try {
       const resolved = await resolveConnection();
@@ -64,5 +69,6 @@ export const useConnectionStore = create<ConnectionStore>((set) => ({
 }));
 
 export function useConnection(): Connection | null {
-  return useConnectionStore((s) => s.connection);
+  const connection = useConnectionStore((s) => s.connection);
+  return isDemoMode() ? DEMO_CONNECTION : connection;
 }

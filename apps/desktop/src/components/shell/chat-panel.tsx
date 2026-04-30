@@ -5,6 +5,7 @@ import { Pill } from '@/components/ui/pill';
 import { ChatStream } from '@/components/chat/chat-stream';
 import { ChatInput } from '@/components/chat/chat-input';
 import { useChatStore } from '@/lib/ws/store';
+import { DEMO_LABEL, isDemoMode } from '@/lib/demo/mode';
 import { cn } from '@/lib/utils';
 
 const MIN_WIDTH = 320;
@@ -16,6 +17,7 @@ export function ChatPanel(): JSX.Element | null {
   const setWidth = useChatStore((s) => s.setPanelWidth);
   const setOpen = useChatStore((s) => s.setPanelOpen);
   const connectionState = useChatStore((s) => s.connectionState);
+  const demo = isDemoMode();
 
   const [dragging, setDragging] = useState(false);
   const startX = useRef<number>(0);
@@ -77,13 +79,19 @@ export function ChatPanel(): JSX.Element | null {
           </h2>
           <Pill
             status={
-              connectionState === 'open'
-                ? 'ok'
-                : connectionState === 'connecting'
-                  ? 'warn'
-                  : 'degraded'
+              demo
+                ? 'unknown'
+                : connectionState === 'open'
+                  ? 'ok'
+                  : connectionState === 'connecting'
+                    ? 'warn'
+                    : 'degraded'
             }
-            label={connectionState}
+            label={
+              demo
+                ? 'demo'
+                : connectionState
+            }
           />
         </div>
         <Button
@@ -101,7 +109,18 @@ export function ChatPanel(): JSX.Element | null {
       </div>
 
       <div className="border-t border-[var(--border)] p-3">
-        <ChatInput />
+        {demo ? (
+          <div
+            className={cn(
+              'rounded-[var(--r-2)] border border-[var(--border)] bg-[var(--surface-2)]',
+              'px-3 py-2 text-[var(--fs-xs)] text-[var(--fg-muted)]',
+            )}
+          >
+            Conversation disabled. {DEMO_LABEL}
+          </div>
+        ) : (
+          <ChatInput />
+        )}
       </div>
     </aside>
   );

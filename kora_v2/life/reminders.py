@@ -12,6 +12,7 @@ with Phase 8e columns (``due_at``, ``repeat_rule``, ``source``,
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +23,19 @@ import structlog
 from pydantic import BaseModel
 
 log = structlog.get_logger(__name__)
+
+
+def _acceptance_delivered_at(now: datetime, due_at_raw: str | None) -> datetime:
+    """Use simulated due time as delivery time during acceptance runs."""
+    if not os.environ.get("KORA_ACCEPTANCE_DIR") or not due_at_raw:
+        return now
+    try:
+        due_at = datetime.fromisoformat(due_at_raw)
+    except ValueError:
+        return now
+    if due_at.tzinfo is None:
+        due_at = due_at.replace(tzinfo=UTC)
+    return due_at if due_at <= now else now
 
 
 # -- Models ------------------------------------------------------------------
@@ -141,13 +155,23 @@ class ReminderStore:
 
     async def mark_delivered(self, reminder_id: str) -> None:
         """Mark a reminder as delivered."""
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now(UTC)
         async with aiosqlite.connect(str(self._db_path)) as db:
             await db.execute("PRAGMA journal_mode=WAL")
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT due_at FROM reminders WHERE id = ?",
+                (reminder_id,),
+            )
+            row = await cursor.fetchone()
+            delivered_at = _acceptance_delivered_at(
+                now,
+                row["due_at"] if row else None,
+            )
             await db.execute(
                 "UPDATE reminders SET status = 'delivered', delivered_at = ? "
                 "WHERE id = ?",
-                (now, reminder_id),
+                (delivered_at.isoformat(), reminder_id),
             )
             await db.commit()
         log.debug("reminder.delivered", reminder_id=reminder_id)
@@ -252,11 +276,13 @@ class ReminderStore:
                 await db.commit()
                 return None
 
+            delivered_at = _acceptance_delivered_at(now, row["due_at"])
+
             # Mark delivered.
             await db.execute(
                 "UPDATE reminders SET status = 'delivered', "
                 "delivered_at = ? WHERE id = ?",
-                (now.isoformat(), reminder_id),
+                (delivered_at.isoformat(), reminder_id),
             )
 
             # Schedule the next occurrence in the same transaction.

@@ -1,9 +1,8 @@
 """Tests for kora_v2.core.db — Operational database schema and init."""
 
-import pytest
 import aiosqlite
 
-from kora_v2.core.db import init_operational_db, get_db
+from kora_v2.core.db import get_db, init_operational_db
 
 
 class TestInitOperationalDb:
@@ -43,18 +42,23 @@ class TestInitOperationalDb:
         """Call init twice, should not raise errors."""
         db_path = tmp_path / "test_idempotent.db"
         await init_operational_db(db_path)
+        async with aiosqlite.connect(str(db_path)) as db:
+            cursor = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+            first_tables = [row[0] for row in await cursor.fetchall()]
+
         await init_operational_db(db_path)  # Second call should be fine
 
         async with aiosqlite.connect(str(db_path)) as db:
             cursor = await db.execute(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%'"
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
             )
-            count = (await cursor.fetchone())[0]
-        # Phase 5 added calendar_entries, finance_log, energy_log -> 27.
-        # Phase 8a added signal_queue, session_transcripts -> 29.
-        # Phase 8b added dedup_rejected_pairs -> 30.
-        assert count == 30
+            second_tables = [row[0] for row in await cursor.fetchall()]
+        assert second_tables == first_tables
+        assert second_tables
 
     async def test_sessions_table_schema(self, tmp_path):
         """Verify column names for sessions table."""

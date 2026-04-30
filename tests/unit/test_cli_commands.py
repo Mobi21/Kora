@@ -42,7 +42,12 @@ async def test_status_displays_table():
         }
         await cli._cmd_status()
 
-    mock_get.assert_awaited_once_with("/api/v1/status")
+    assert mock_get.await_args_list[0].args == ("/api/v1/status",)
+    assert [call.args[0] for call in mock_get.await_args_list] == [
+        "/api/v1/status",
+        "/api/v1/inspect/tools",
+        "/api/v1/orchestration/status",
+    ]
     # Should have printed a Rich Table (not a plain string error)
     from rich.table import Table
     assert any(isinstance(p, Table) for p in printed)

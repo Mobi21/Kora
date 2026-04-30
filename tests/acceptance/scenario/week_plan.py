@@ -67,28 +67,29 @@ COVERAGE_ITEMS: dict[int, CoverageItem] = {
     #         items.  They should be exercised through a realistic week, not
     #         through category-focused demo days.
     1: CoverageItem(
-        description="First-run onboarding completes naturally (identity / vault path / "
-        "schedule confirmed inside the first session).",
-        status=CoverageStatus.DEFERRED,
+        description="Fresh first-run onboarding completes naturally from a clean Kora state: "
+        "identity, local-first boundary, support tracks, school schedule, work, "
+        "commute, routines, and vault/demo-export expectations are confirmed "
+        "before ordinary planning starts.",
+        status=CoverageStatus.ACTIVE,
         category="core",
-        deferred_reason=(
-            "V2 has no first-run wizard — neither kora_v2/daemon/server.py "
-            "nor kora_v2/cli/ exposes one. Jordan establishes context "
-            "through conversation instead."
+        evidence_query=(
+            "fresh-run marker plus first-session messages or setup records include "
+            "identity, local-first boundary, schedule, support tracks, and export intent"
         ),
     ),
     2: CoverageItem(
-        description="User identity and local-first Life OS context established: name, "
-        "home/work reality, privacy preference, trusted support, support needs, "
-        "and ordinary life obligations.",
+        description="User identity and local-first Life OS context established: Maya's "
+        "school, major, housing/commute, work shifts, privacy preference, trusted "
+        "support boundary, support needs, and ordinary life obligations.",
         status=CoverageStatus.ACTIVE,
         category="core",
         evidence_query="messages mention user identity, support needs, trusted support, and local-first preference",
     ),
     3: CoverageItem(
-        description="Internal calendar is the spine of the run: dated events, "
-        "deadlines, routines, reminders, conflicts, reschedules, and carryover "
-        "are represented and updated across the week.",
+        description="Internal calendar is the spine of the run: exact class schedule, "
+        "work shifts, commute buffers, deadlines, routines, reminders, conflicts, "
+        "reschedules, and carryover are represented and updated across the week.",
         status=CoverageStatus.ACTIVE,
         category="core",
         evidence_query="calendar/day-plan/reminder rows exist and messages reference dated commitments",
@@ -258,7 +259,7 @@ COVERAGE_ITEMS: dict[int, CoverageItem] = {
         evidence_query="distinct phase values in system_state_log >= 3",
     ),
     25: CoverageItem(
-        description="LONG_BACKGROUND task dispatch — Jordan asks for overnight "
+        description="LONG_BACKGROUND task dispatch — Maya asks for overnight "
         "research; supervisor calls decompose_and_dispatch with the "
         "long preset and replies with a templated acknowledgment.",
         status=CoverageStatus.ACTIVE,
@@ -355,7 +356,7 @@ COVERAGE_ITEMS: dict[int, CoverageItem] = {
     ),
     37: CoverageItem(
         description="Merge on re-engagement: after a long task completes during "
-        "idle, Jordan starts a new session and the supervisor surfaces "
+        "idle, Maya starts a new session and the supervisor surfaces "
         "the completed result automatically (via get_running_tasks "
         "relevant_to_session).",
         status=CoverageStatus.ACTIVE,
@@ -379,7 +380,7 @@ COVERAGE_ITEMS: dict[int, CoverageItem] = {
     ),
     40: CoverageItem(
         description="WAKE_UP_WINDOW phase derived correctly + wake_up_preparation "
-        "pipeline runs before Jordan's simulated wake time.",
+        "pipeline runs before Maya's simulated wake time.",
         status=CoverageStatus.ACTIVE,
         category="orchestration",
         evidence_query=(
@@ -460,7 +461,7 @@ COVERAGE_ITEMS: dict[int, CoverageItem] = {
     ),
     50: CoverageItem(
         description="Entity resolution (entities_step) merges fuzzy variants "
-        "(e.g. 'Alex' / 'alex' / 'my partner') across sessions.",
+        "(e.g. 'Talia' / 'talia' / 'my lab partner') across sessions.",
         status=CoverageStatus.ACTIVE,
         category="memory_steward",
         evidence_query="entities_step ran AND entity row count decreased OR canonical_id assigned",
@@ -640,39 +641,230 @@ IDLE_DEFAULTS = {
     "post_deep_idle":             {"min_soak": 15, "timeout": 30},
     "post_long_background_idle":  {"min_soak": 45, "timeout": 120},
     "post_revision_idle":         {"min_soak": 15, "timeout": 30},
-    "memory_steward_idle":        {"min_soak": 30, "timeout": 90},
-    "vault_organizer_idle":       {"min_soak": 30, "timeout": 90},
+    "memory_steward_idle":        {"min_soak": 75, "timeout": 150},
+    "vault_organizer_idle":       {"min_soak": 75, "timeout": 150},
     "late_idle":                  {"min_soak": 85, "timeout": 130},
     "post_restart_idle":          {"min_soak": 15, "timeout": 30},
 }
+
+# ── College-student schedule and demo snapshot contracts ─────────────────────
+
+ACCEPTANCE_RUN_MODE = {
+    "persona": "Maya Rivera",
+    "runner_style": "scenario-guided persona agent",
+    "transcript_policy": (
+        "The week plan defines goals, disruptions, and gates. The persona-agent "
+        "must adapt to Kora's actual replies instead of replaying fixed text."
+    ),
+    "fresh_start_policy": "Every full acceptance run starts from clean Kora state and exercises first-run setup.",
+}
+
+FRESH_START_REQUIREMENTS = [
+    "stop the acceptance harness and daemon before a full run",
+    "remove /tmp/claude/kora_acceptance output and scratch state",
+    "use an isolated KORA_MEMORY__KORA_MEMORY_PATH for the run",
+    "clear acceptance-owned thread_id/session_id/runtime lock artifacts",
+    "remove matching old persona memories or projection rows before trusting first-run evidence",
+    "record a fresh-run marker in the acceptance output before the first user turn",
+]
+
+FIRST_RUN_SETUP_REQUIREMENTS = [
+    "capture identity: Maya Rivera, pronouns, school, year, major, city, and timezone",
+    "capture local-first/privacy boundary and the sanitized-demo export boundary",
+    "capture ADHD support needs separately from autism/sensory support needs",
+    "capture anxiety/burnout stabilization preferences without medical overclaiming",
+    "capture trusted support Talia plus the no-automatic-contact boundary",
+    "capture class schedule, work shifts, commute buffers, meds/routines, meals, and sleep anchors",
+    "ask the user to confirm the imported schedule before building Today",
+]
+
+EXACT_WEEKLY_SCHEDULE = {
+    "monday": [
+        {"time": "07:30", "title": "wake, food, Adderall XR 15mg, water bottle"},
+        {"time": "08:20", "title": "leave apartment for campus bus"},
+        {"time": "09:00-10:15", "title": "COGS 302 Cognitive Neuroscience lecture"},
+        {"time": "11:00-12:15", "title": "HCI 210 Interaction Design seminar"},
+        {"time": "12:30", "title": "quiet lunch, not dining hall if overloaded"},
+        {"time": "14:00-15:15", "title": "STAT 220 Methods recitation"},
+        {"time": "16:00-16:30", "title": "decompression buffer before homework"},
+        {"time": "20:00", "title": "COGS reading reflection due"},
+        {"time": "21:00", "title": "utilities share to Priya due"},
+    ],
+    "tuesday": [
+        {"time": "07:10", "title": "wake, breakfast, Adderall, pack lab goggles"},
+        {"time": "08:30-10:20", "title": "BIO 240 Neurobiology lab"},
+        {"time": "12:00", "title": "lunch before work shift"},
+        {"time": "13:00-16:00", "title": "Accessibility resource center shift"},
+        {"time": "17:30-18:15", "title": "therapy telehealth from apartment"},
+        {"time": "20:00", "title": "trash/recycling before dark if possible"},
+    ],
+    "wednesday": [
+        {"time": "07:45", "title": "wake, food, Adderall, quiet transition"},
+        {"time": "09:00-10:15", "title": "COGS 302 lecture"},
+        {"time": "11:00-12:15", "title": "HCI 210 seminar"},
+        {"time": "13:00", "title": "library quiet-room lunch"},
+        {"time": "15:00-16:00", "title": "office hours with Dr. Park"},
+        {"time": "18:30", "title": "sensory recovery before Noah's game night"},
+        {"time": "23:59", "title": "HCI prototype peer feedback due"},
+    ],
+    "thursday": [
+        {"time": "08:00", "title": "STAT quiz opens"},
+        {"time": "10:00-11:15", "title": "STAT 220 Methods lecture"},
+        {"time": "12:30-13:45", "title": "study group with Talia"},
+        {"time": "14:00-17:00", "title": "Accessibility resource center shift"},
+        {"time": "19:00", "title": "confirm rent autopay with Priya"},
+        {"time": "23:59", "title": "STAT quiz closes"},
+    ],
+    "friday": [
+        {"time": "07:45", "title": "wake, breakfast, Adderall, prototype link check"},
+        {"time": "09:00-10:15", "title": "COGS 302 lecture"},
+        {"time": "12:00", "title": "COGS exam review sheet due"},
+        {"time": "13:00-14:30", "title": "HCI prototype critique"},
+        {"time": "16:00-17:00", "title": "advisor check-in, remote"},
+        {"time": "18:00", "title": "decompression before social or chores"},
+    ],
+    "saturday": [
+        {"time": "09:00", "title": "wake, food, Adderall if using, pack work badge"},
+        {"time": "10:00-13:00", "title": "Accessibility resource center shift"},
+        {"time": "15:00-16:30", "title": "groceries and laundry start"},
+        {"time": "19:00", "title": "short text to mom, no automatic call"},
+    ],
+    "sunday": [
+        {"time": "11:00-12:00", "title": "meal prep for two class mornings"},
+        {"time": "13:00", "title": "laundry finish and backpack reset"},
+        {"time": "15:00-17:00", "title": "COGS exam review block"},
+        {"time": "20:30-21:00", "title": "weekly reset and Monday bridge"},
+    ],
+}
+
+SCHEDULE_UPDATE_EVENTS = [
+    {
+        "phase": "schedule_update_conflict",
+        "change": "Thursday accessibility shift moves from 2:00pm-5:00pm to 3:00pm-6:00pm this week.",
+        "must_update": [
+            "work event time",
+            "dinner/recovery timing",
+            "STAT quiz plan",
+            "study group transition buffer",
+        ],
+    },
+    {
+        "phase": "missed_lab_repair",
+        "change": "Tuesday lab is at risk because Maya wakes late and misses the first bus.",
+        "must_update": [
+            "confirm whether lab was missed or partially attended",
+            "email Marcus if needed",
+            "preserve therapy and work shift",
+            "repair meal and sensory recovery",
+        ],
+    },
+    {
+        "phase": "hci_critique_prep",
+        "change": "Friday HCI critique needs a prototype link and three questions.",
+        "must_update": [
+            "create critique checklist",
+            "schedule prep before Friday noon",
+            "carry proof into demo snapshot",
+        ],
+    },
+]
+
+GUI_EXPORT_EXPECTATIONS = {
+    "label": "Demo mode · sanitized acceptance snapshot · not connected to your local daemon",
+    "required_sections": [
+        "demo_meta",
+        "persona",
+        "today",
+        "calendar",
+        "confirm_reality",
+        "repair",
+        "tomorrow_bridge",
+        "memory",
+        "conversation",
+        "acceptance_proof",
+    ],
+    "calendar_requirements": [
+        "full seven-day class/work/life calendar",
+        "original schedule plus accepted updates",
+        "missed/confirmed/changed status per important event",
+        "carryover and tomorrow bridge fields",
+    ],
+    "conversation_requirements": [
+        "full sanitized transcript, not last-three messages",
+        "persona-agent turns marked separately from Kora turns",
+        "phase and day labels attached to turns where possible",
+    ],
+    "proof_requirements": [
+        "fresh-run marker",
+        "calendar import confirmation",
+        "schedule update reconciliation",
+        "repair actions and confirmed reality",
+        "memory/proof records backing GUI cards",
+    ],
+}
+
 
 # ── Week plan ────────────────────────────────────────────────────────────────
 
 WEEK_PLAN = {
     "day1": {
+        "date_label": "Monday",
+        "day_theme": "fresh first-run setup, exact schedule import, and first repair",
+        "calendar_focus": EXACT_WEEKLY_SCHEDULE["monday"],
         "phases": [
             {
-                "name": "life_os_onboarding",
+                "name": "fresh_kora_first_run_setup",
                 "type": "active",
-                "description": "Jordan establishes a local-first Life OS context and calendar spine",
+                "description": "Maya starts from clean Kora state and completes first-run Life OS setup",
                 "goals": [
-                    "Establish identity, home/work reality, privacy preference, and trusted support",
-                    "State ADHD support needs without making the whole persona a productivity demo",
-                    "Mention meds/health routine, meal uncertainty, and ordinary obligations",
-                    "Provide dated commitments: appointment, bill, trash, laundry, message, and deadline",
-                    "Ask for a realistic week plan around the internal calendar",
+                    "Verify the run is fresh before the persona gives private setup facts",
+                    "Establish identity, school, year, major, city, timezone, housing, commute, and work",
+                    "Set local-first and sanitized-demo export boundaries",
+                    "Record trusted support Talia with explicit no-automatic-contact boundary",
+                    "Capture meds, meals, sleep, morning/evening anchors, and support preferences",
+                    "Keep this as onboarding/setup, not ordinary productivity planning yet",
                 ],
-                "coverage_items": [2, 3, 4, 7, 24, 32],
-                "notes": "Item #1 remains deferred because V2 has no first-run wizard. "
-                         "The acceptance opening must feel like a real overwhelmed person "
-                         "setting up the week, not a QA script.",
+                "operator_prompts": [
+                    "Ask Kora what setup information it needs before planning.",
+                    "If Kora skips setup and jumps to advice, redirect it to first-run profile capture.",
+                    "Ask Kora to summarize what it saved and what remains unsaved.",
+                ],
+                "acceptance_gates": [
+                    "fresh-run marker exists before first persona turn",
+                    "first-run profile includes identity, local-first boundary, support tracks, schedule intent, and export label",
+                    "Kora does not assume cloud sync, outreach, or medical authority",
+                ],
+                "coverage_items": [1, 2, 4, 5, 6, 7, 19, 23, 24, 32],
+            },
+            {
+                "name": "weekly_schedule_import",
+                "type": "active",
+                "description": "Maya provides an exact class/work/life schedule and asks Kora to make it the calendar spine",
+                "goals": [
+                    "Import the full seven-day schedule with exact times, locations, commute buffers, and deadlines",
+                    "Ask Kora to distinguish recurring classes/work from one-time obligations",
+                    "Confirm Monday Today view as now/next/later/carryover",
+                    "Ask Kora to read the schedule back before using it for repair or proactivity",
+                    "Record GUI export expectations for the calendar and Today views",
+                ],
+                "operator_prompts": [
+                    "Provide the exact weekly schedule in one dense turn or two structured turns.",
+                    "Correct any missing time, location, commute buffer, deadline, or support distinction.",
+                    "Ask for a calendar-shaped summary, not just a prose plan.",
+                ],
+                "acceptance_gates": [
+                    "calendar contains all class, work, deadline, commute, and routine anchors",
+                    "Kora can answer what is on Monday without re-asking for the schedule",
+                    "demo snapshot contract has enough fields for Today and Calendar views",
+                ],
+                "coverage_items": [2, 3, 7, 10, 16, 23],
             },
             {
                 "name": "planning_idle",
                 "type": "idle",
                 "min_soak_seconds": IDLE_DEFAULTS["planning_idle"]["min_soak"],
                 "timeout_seconds": IDLE_DEFAULTS["planning_idle"]["timeout"],
-                "description": "Health-check soak; calendar/reminder state should survive ACTIVE_IDLE",
+                "description": "Health-check soak; imported calendar/reminder state should survive ACTIVE_IDLE",
                 "goals": [
                     "Verify daemon stays healthy",
                     "Verify SystemStatePhase moves CONVERSATION -> ACTIVE_IDLE",
@@ -681,38 +873,42 @@ WEEK_PLAN = {
                 "coverage_items": [24],
             },
             {
-                "name": "missed_plan_repair",
+                "name": "monday_missed_plan_repair",
                 "type": "active",
-                "description": "Jordan already fell behind; Kora repairs the day instead of scolding",
+                "description": "Maya falls behind on dinner, utilities, and reading reflection; Kora repairs the evening",
                 "goals": [
-                    "Return after a gap and admit a missed meal, missed message, and task avoidance",
-                    "Ask for one concrete next action, not a full productivity lecture",
-                    "Trigger repair_day / plan-repair behavior where available",
-                    "Verify Kora carries unfinished items forward on the calendar",
+                    "Return after a gap and admit she skipped lunch, avoided the reading reflection, and has utilities due",
+                    "Ask for one concrete next action before a full evening plan",
+                    "Trigger repair-day behavior using confirmed reality, not the original plan",
+                    "Carry unfinished or downshifted items to a precise calendar slot",
+                    "Keep shame language out of the repair",
                 ],
-                "coverage_items": [4, 7, 8, 11, 19, 23],
+                "disruptions": [
+                    "Maya has not eaten since breakfast.",
+                    "Utilities payment to Priya is still open.",
+                    "COGS reading reflection is due by 8:00pm and feels too big.",
+                ],
+                "acceptance_gates": [
+                    "repair distinguishes missed, still-possible, and carry-forward items",
+                    "meal/med/routine support is logged or explicitly planned",
+                    "Today/Repair GUI sections can show before and after states",
+                ],
+                "coverage_items": [3, 4, 7, 8, 11, 19, 23],
             },
             {
-                "name": "wrong_inference_correction",
+                "name": "monday_tomorrow_bridge",
                 "type": "active",
-                "description": "Kora makes or inherits a plausible wrong assumption and must repair it",
+                "description": "End-of-day bridge protects Tuesday lab, commute, breakfast, and therapy",
                 "goals": [
-                    "Correct a support-preference assumption explicitly",
-                    "Verify Kora acknowledges the correction briefly",
-                    "Verify the corrected preference changes the plan and future language",
-                    "Check recall/state if needed so this is not only conversational politeness",
+                    "Ask what must be protected tomorrow morning for 8:30am lab",
+                    "Create a pack-list and departure-time bridge based on the exact schedule",
+                    "Ask Kora to preserve what happened Monday and what still needs proof",
+                    "Set up a concise future-self note for Tuesday",
                 ],
-                "coverage_items": [11, 16, 23],
-            },
-            {
-                "name": "evening_bridge",
-                "type": "active",
-                "description": "End-of-day bridge from unfinished reality into tomorrow",
-                "goals": [
-                    "Mention evening routine and low energy",
-                    "Ask what absolutely needs to be protected tomorrow morning",
-                    "Create a reminder or routine for a real calendar moment",
-                    "Request a short future-self bridge that is based on actual state",
+                "acceptance_gates": [
+                    "bridge references lab goggles, breakfast/Adderall, bus buffer, work shift, therapy, and trash",
+                    "tomorrow bridge is grounded in Monday's confirmed misses and repairs",
+                    "export fields exist for Tomorrow Bridge view",
                 ],
                 "coverage_items": [3, 7, 14, 23, 44],
             },
@@ -720,40 +916,54 @@ WEEK_PLAN = {
         "advance_hours": 14,
     },
     "day2": {
+        "date_label": "Tuesday",
+        "day_theme": "lab morning disruption, ADHD repair, and life-admin background work",
+        "calendar_focus": EXACT_WEEKLY_SCHEDULE["tuesday"],
         "phases": [
             {
-                "name": "adhd_morning_recovery",
+                "name": "missed_lab_confirm_reality",
                 "type": "active",
-                "description": "ADHD/time-blind morning with real carryover and task initiation friction",
+                "description": "Maya wakes late for lab and asks Kora to confirm reality before repairing",
                 "goals": [
-                    "Ask Kora what is actually on the calendar today",
-                    "Test recall of yesterday's missed/unfinished commitments",
-                    "Mention morning meds or health routine and breakfast status",
-                    "Ask Kora to pick the first tiny action for an avoided task",
+                    "Ask Kora what is actually on the Tuesday calendar",
+                    "Introduce waking late, missing the first bus, and not eating enough with Adderall",
+                    "Decide whether lab is missed, partial, or salvageable without moralizing",
+                    "Preserve work shift, therapy, trash, and food as separate obligations",
+                    "Ask what state Kora changed after confirming reality",
                 ],
-                "life_context": "took morning meds, not sure what time it is, already behind, needs one next action",
-                "coverage_items": [3, 4, 7, 16, 19],
+                "life_context": "woke late, lab at risk, Adderall without enough food, needs exact repair",
+                "acceptance_gates": [
+                    "Confirm Reality view can mark lab risk/miss and unaffected obligations",
+                    "ADHD support is initiation/time repair, not sensory support",
+                    "calendar updates distinguish original event from confirmed reality",
+                ],
+                "coverage_items": [3, 4, 7, 11, 16, 19, 23],
             },
             {
-                "name": "admin_decomposition",
+                "name": "lab_email_admin_decomposition",
                 "type": "active",
-                "description": "Overwhelming life-admin task decomposes into practical steps",
+                "description": "Ambiguous lab make-up email becomes a practical background/admin task",
                 "goals": [
-                    "Bring a messy admin task: bill, appointment prep, landlord message, or insurance call",
-                    "Ask for a plan that can be executed with low energy",
-                    "Use optional artifact support only if it creates a real note/script/checklist",
-                    "Do not let this become a coding/research showcase",
+                    "Ask for a short email to Marcus about lab make-up policy",
+                    "Break the task into low-energy steps with a draft, send/no-send decision, and follow-up reminder",
+                    "Use optional artifact support only if it creates a useful local note or checklist",
+                    "Keep Kora from turning this into generic research or a school-policy lecture",
+                ],
+                "acceptance_gates": [
+                    "admin decomposition creates concrete steps and a durable follow-up",
+                    "the task can be represented in Repair and Memory/Proof GUI sections",
+                    "optional capability use is disclosed honestly",
                 ],
                 "coverage_items": [8, 9, 20, 21, 22, 25, 26, 27, 46],
             },
             {
                 "name": "mid_flight_life_admin",
                 "type": "active",
-                "description": "Jordan checks a background admin-prep task and edits the working doc",
+                "description": "Maya checks background admin-prep and changes the constraints",
                 "goals": [
-                    "Ask how the admin-prep task is going",
+                    "Ask how the lab-email/admin-prep task is going",
                     "Use get_task_progress/get_working_doc where available",
-                    "Add a new constraint to the working doc or plan",
+                    "Add a new constraint: keep the email under 90 words and do not overexplain disability details",
                     "Verify the system picks up the change instead of ignoring user reality",
                 ],
                 "coverage_items": [29, 31, 38],
@@ -761,12 +971,12 @@ WEEK_PLAN = {
             {
                 "name": "cancel_noisy_help",
                 "type": "active",
-                "description": "Jordan cancels a too-broad or badly-timed helper task",
+                "description": "Maya cancels only a too-broad helper task without losing useful partial output",
                 "goals": [
-                    "Start a disposable helper task and cancel only that task",
-                    "Verify cancel_task targets the right pipeline",
+                    "Start or identify a disposable helper task that became too broad",
+                    "Cancel only that task",
                     "Verify partial useful output is preserved",
-                    "Verify cancellation does not cancel unrelated life-admin support",
+                    "Verify cancellation does not cancel lab email, therapy, or calendar repair support",
                 ],
                 "coverage_items": [30],
             },
@@ -787,29 +997,42 @@ WEEK_PLAN = {
         "advance_hours": 18,
     },
     "day3": {
+        "date_label": "Wednesday",
+        "day_theme": "sensory disruption, office hours, communication fatigue, and quiet recovery",
+        "calendar_focus": EXACT_WEEKLY_SCHEDULE["wednesday"],
         "phases": [
             {
                 "name": "autism_sensory_disruption",
                 "type": "active",
                 "description": "Routine disruption and sensory load require a distinct support response",
                 "goals": [
-                    "Introduce a disrupted plan, noise/sensory strain, and transition difficulty",
+                    "Introduce bus crowding, lab-light hangover, and transition difficulty",
                     "Ask for a low-ambiguity plan with fewer decisions and clearer sequence",
-                    "Avoid social/productivity pressure and preserve predictability",
+                    "Preserve lecture, HCI, office hours, peer feedback, and recovery block",
                     "Verify autism/sensory support is not treated as generic ADHD support",
                 ],
-                "life_context": "routine changed, noise is too much, transition feels hard, wants predictable steps",
+                "life_context": "noise and light hangover, routine changed, transition feels hard, wants predictable steps",
+                "acceptance_gates": [
+                    "plan includes quiet-room lunch and sensory recovery before Noah's game night",
+                    "Kora's language changes for sensory support rather than only task initiation",
+                    "calendar carries office hours and peer feedback with realistic buffers",
+                ],
                 "coverage_items": [3, 5, 7, 11, 19, 23, 41, 62],
             },
             {
                 "name": "communication_fatigue",
                 "type": "active",
-                "description": "Ambiguous social/admin communication becomes a low-demand script",
+                "description": "Ambiguous academic/social communication becomes a low-demand script",
                 "goals": [
-                    "Ask for help sending a clear message without overexplaining",
-                    "Use optional file/artifact support for a message draft if useful",
-                    "Check Kora asks before involving trusted support",
-                    "Track the follow-up on the calendar",
+                    "Ask for help preparing a concise office-hours agenda and HCI peer feedback",
+                    "Use optional file/artifact support for a message draft or prep note if useful",
+                    "Check Kora asks before involving Talia or any support person",
+                    "Track follow-up on the calendar",
+                ],
+                "acceptance_gates": [
+                    "communication output is short, concrete, and consent-aware",
+                    "trusted support remains permissioned",
+                    "Memory view can show preference for low-overexplanation scripts",
                 ],
                 "coverage_items": [5, 8, 22, 23, 43],
             },
@@ -829,29 +1052,63 @@ WEEK_PLAN = {
         "advance_hours": 20,
     },
     "day4": {
+        "date_label": "Thursday",
+        "day_theme": "schedule update, quiz avoidance, work-shift conflict, and consented support",
+        "calendar_focus": EXACT_WEEKLY_SCHEDULE["thursday"],
         "phases": [
             {
-                "name": "burnout_anxiety_collapse",
+                "name": "schedule_update_conflict",
                 "type": "active",
-                "description": "Plan collapse with anxiety and low energy; Kora stabilizes before planning",
+                "description": "Maya gives Kora a schedule change and requires exact calendar reconciliation",
                 "goals": [
-                    "User reports dread, low energy, and being behind",
-                    "Kora narrows to essentials without fake reassurance or pressure",
-                    "Kora avoids reassurance-loop behavior and avoids medical overclaiming",
-                    "Downshift the calendar realistically and preserve non-negotiables",
+                    "Update Thursday work shift from 2:00pm-5:00pm to 3:00pm-6:00pm",
+                    "Ask Kora to show every affected calendar item and what changed",
+                    "Preserve STAT lecture, study group, quiz close, dinner, and commute/recovery buffers",
+                    "Verify the internal schedule matches the update exactly before planning",
                 ],
-                "life_context": "burned out, anxious, behind, cannot do the original plan",
-                "coverage_items": [3, 6, 7, 11, 19, 23],
+                "disruptions": [
+                    "Denise moved the shift later only for this week.",
+                    "The later shift compresses dinner and the STAT quiz window.",
+                ],
+                "acceptance_gates": [
+                    "calendar shows original and updated shift correctly",
+                    "downstream plan changes reflect the new shift time",
+                    "GUI export can render schedule update diff/reconciliation",
+                ],
+                "coverage_items": [3, 10, 11, 16, 23],
+            },
+            {
+                "name": "quiz_avoidance_repair",
+                "type": "active",
+                "description": "STAT quiz avoidance tests ADHD, anxiety, and repair sequencing",
+                "goals": [
+                    "User reports avoiding the quiz portal because opening it feels like proof of failure",
+                    "Kora stabilizes anxiety briefly before planning",
+                    "Kora decomposes the quiz start into a tiny first action, timed around the updated shift",
+                    "Kora preserves food and sensory recovery instead of filling every gap",
+                ],
+                "life_context": "anxious, avoiding, schedule changed, cannot do the original plan",
+                "acceptance_gates": [
+                    "ADHD initiation support and anxiety stabilization are both visible",
+                    "repair does not erase the updated work shift",
+                    "Confirm Reality and Repair views can show quiz status and next action",
+                ],
+                "coverage_items": [3, 4, 6, 7, 8, 11, 19, 23],
             },
             {
                 "name": "trusted_support_boundary",
                 "type": "active",
                 "description": "Trusted support is permissioned, not automatic escalation",
                 "goals": [
-                    "Discuss whether to contact Alex or another trusted person",
+                    "Discuss whether to ask Talia for study-group accountability",
                     "Kora helps draft or plan the ask only with user consent",
                     "Kora records support preference without sending anything automatically",
                     "Kora distinguishes trusted support from crisis response",
+                ],
+                "acceptance_gates": [
+                    "no automatic outreach is implied",
+                    "support ask is optional, consented, and calendar-aware",
+                    "trusted-support boundary persists for future turns",
                 ],
                 "coverage_items": [2, 6, 20, 22, 23],
             },
@@ -871,7 +1128,27 @@ WEEK_PLAN = {
         "advance_hours": 18,
     },
     "day5": {
+        "date_label": "Friday",
+        "day_theme": "critique prep, advisor check-in, memory/proof, and optional runtime checks",
+        "calendar_focus": EXACT_WEEKLY_SCHEDULE["friday"],
         "phases": [
+            {
+                "name": "hci_critique_prep",
+                "type": "active",
+                "description": "Friday's prototype critique turns into a practical checklist and proof moment",
+                "goals": [
+                    "Confirm COGS review sheet, HCI critique, advisor check-in, and decompression block",
+                    "Ask Kora to prepare a prototype critique checklist in the background if useful",
+                    "Require three questions and a prototype-link check",
+                    "Ask what will appear in the GUI demo proof for this preparation",
+                ],
+                "acceptance_gates": [
+                    "calendar and working note agree on critique obligations",
+                    "background support is grounded in the HCI critique, not abstract research",
+                    "proof can show artifact, reminder, or checklist evidence",
+                ],
+                "coverage_items": [8, 9, 21, 22, 25, 26, 28, 37, 46, 61, 65],
+            },
             {
                 "name": "mechanical_safety_checks",
                 "type": "active",
@@ -889,10 +1166,10 @@ WEEK_PLAN = {
                 "type": "idle",
                 "min_soak_seconds": IDLE_DEFAULTS["memory_steward_idle"]["min_soak"],
                 "timeout_seconds": IDLE_DEFAULTS["memory_steward_idle"]["timeout"],
-                "description": "Memory Steward stages run during DEEP_IDLE; verify support-profile memory quality",
+                "description": "Memory Steward stages run during DEEP_IDLE; verify school-week memory quality",
                 "goals": [
                     "Wait for post_session_memory pipeline",
-                    "Verify support needs, corrections, and real commitments become typed facts",
+                    "Verify support needs, schedule corrections, and real commitments become typed facts",
                     "Verify near-duplicates soft-deleted and fuzzy trusted-support entities resolved",
                     "Verify support-profile refinement updates the User Model",
                     "Verify post_session_memory triggers post_memory_vault via sequence_complete",
@@ -907,7 +1184,7 @@ WEEK_PLAN = {
                 "description": "Vault Organizer stages run; verify life notes, links, MOC pages, and sessions",
                 "goals": [
                     "Wait for post_memory_vault pipeline",
-                    "Verify Inbox files move into a useful life-support folder hierarchy",
+                    "Verify Inbox files move into a useful school/life-support folder hierarchy",
                     "Verify wikilinks and entity pages do not corrupt notes",
                     "Verify session index and MOC pages reflect lived-week state",
                 ],
@@ -917,13 +1194,33 @@ WEEK_PLAN = {
         "advance_hours": 18,
     },
     "day6": {
+        "date_label": "Saturday",
+        "day_theme": "weekend work, household repair, proactivity, and suppressible nudges",
+        "calendar_focus": EXACT_WEEKLY_SCHEDULE["saturday"],
         "phases": [
+            {
+                "name": "weekend_household_repair",
+                "type": "active",
+                "description": "Work shift, groceries, laundry, and family text require realistic weekend planning",
+                "goals": [
+                    "Confirm work shift, groceries, laundry, and short text to mom",
+                    "Handle low energy after work without erasing household essentials",
+                    "Keep family contact user-controlled and short",
+                    "Carry any unfinished laundry/grocery tasks into Sunday explicitly",
+                ],
+                "acceptance_gates": [
+                    "Saturday plan protects rest after work",
+                    "chores are concrete but not moralized",
+                    "family contact remains consented and bounded",
+                ],
+                "coverage_items": [3, 4, 6, 7, 11, 14, 23],
+            },
             {
                 "name": "proactive_right_time",
                 "type": "active",
                 "description": "Proactivity is useful, timed, and suppressible",
                 "goals": [
-                    "Mention an upcoming appointment or household task",
+                    "Mention upcoming groceries, laundry, Sunday exam review, or Monday bag check",
                     "Verify anticipatory prep appears before it is useful",
                     "Verify commitment tracking surfaces yesterday's promise",
                     "Verify stuck detection offers help without shaming",
@@ -931,21 +1228,13 @@ WEEK_PLAN = {
                 ],
                 "coverage_items": [40, 42, 58, 59, 60, 63, 64, 66, 67],
             },
-            {
-                "name": "practical_background_followup",
-                "type": "active",
-                "description": "Optional background work supports life admin, not abstract research",
-                "goals": [
-                    "Ask Kora to prepare a practical checklist or appointment note over idle time",
-                    "Verify proactive_research or equivalent background path is grounded in life friction",
-                    "Verify completion summary is visible on re-engagement",
-                ],
-                "coverage_items": [28, 37, 61, 65],
-            },
         ],
         "advance_hours": 14,
     },
     "day7": {
+        "date_label": "Sunday",
+        "day_theme": "restart resilience, weekly review, next-week bridge, and demo snapshot readiness",
+        "calendar_focus": EXACT_WEEKLY_SCHEDULE["sunday"],
         "phases": [
             {
                 "name": "restart_resilience",
@@ -973,15 +1262,21 @@ WEEK_PLAN = {
                 "coverage_items": [40, 67],
             },
             {
-                "name": "weekly_review",
+                "name": "weekly_review_and_demo_export_contract",
                 "type": "active",
-                "description": "Comprehensive lived-week review with evidence-backed pass/fail claims",
+                "description": "Comprehensive lived-week review and GUI-shaped snapshot readiness check",
                 "goals": [
-                    "Ask what actually happened this week, including misses and repairs",
+                    "Ask what actually happened this week, including misses, updates, repairs, and carryover",
                     "Ask what state backs each claim: calendar, reminders, routines, DB rows, events, artifacts",
-                    "Ask what remains open for tomorrow and next week",
+                    "Ask what remains open for Monday and next week",
                     "Reject vague or inflated claims",
-                    "Final snapshot for report comparison",
+                    "Verify the export can fill Today, Calendar, Confirm Reality, Repair, Tomorrow Bridge, Memory, Conversation, and Acceptance Proof views",
+                    "Confirm the demo label says sanitized snapshot and not connected to local daemon",
+                ],
+                "acceptance_gates": [
+                    "weekly review reflects the actual lived week rather than idealized plan",
+                    "conversation transcript is complete enough for a reviewer-facing demo",
+                    "demo snapshot sections map to GUI_EXPORT_EXPECTATIONS",
                 ],
                 "coverage_items": [14, 23],
             },
@@ -997,24 +1292,28 @@ WEEK_PLAN = {
 
 FAST_PLAN = {
     "day1": {
+        "date_label": "fast smoke",
+        "day_theme": "compressed first-run, schedule import, repair, and proof",
         "phases": [
             {
-                "name": "establish_context",
+                "name": "fresh_setup_and_schedule_import",
                 "type": "active",
-                "description": "Establish Jordan's local-first Life OS context and calendar spine",
+                "description": "Establish Maya's local-first college Life OS context and exact calendar spine",
                 "goals": [
-                    "Introduce identity, support needs, privacy preference, and trusted support",
+                    "Confirm fresh-run setup state",
+                    "Introduce identity, school, support needs, privacy preference, and trusted support boundary",
                     "Mention health routine or meds plus meal uncertainty",
-                    "Create dated commitments and ask for a realistic day/week plan",
+                    "Import a compressed but exact class/work/deadline schedule",
+                    "Ask Kora to read back the schedule before planning",
                 ],
-                "coverage_items": [2, 3, 4, 7, 24, 32],
+                "coverage_items": [1, 2, 3, 4, 5, 7, 24, 32],
             },
             {
                 "name": "messy_day_repair",
                 "type": "active",
                 "description": "Missed plan, wrong inference, and low-energy repair",
                 "goals": [
-                    "Admit a missed task/meal/message and ask for one realistic next action",
+                    "Admit a missed class/task/meal/message and ask for one realistic next action",
                     "Correct a wrong support assumption and verify the plan changes",
                     "Show low-energy or anxious state and require stabilization before planning",
                     "Push toward compaction threshold",
@@ -1023,22 +1322,23 @@ FAST_PLAN = {
                 "coverage_items": [4, 6, 10, 11, 15, 19, 23],
             },
             {
-                "name": "sensory_or_transition_support",
+                "name": "schedule_update_and_sensory_support",
                 "type": "active",
-                "description": "Autism/sensory or transition-load support gets a separate check",
+                "description": "Schedule update plus autism/sensory transition-load support get separate checks",
                 "goals": [
+                    "Change one work/class event and require exact calendar reconciliation",
                     "Introduce sensory strain, routine disruption, or transition difficulty",
                     "Ask for low-ambiguity sequencing and fewer decisions",
                     "Verify this is not treated as generic productivity advice",
                 ],
-                "coverage_items": [5, 7, 19],
+                "coverage_items": [3, 5, 7, 11, 19, 23],
             },
             {
                 "name": "life_admin_background",
                 "type": "active",
-                "description": "Dispatch practical life-admin support and verify templated ack",
+                "description": "Dispatch practical school/life-admin support and verify templated ack",
                 "goals": [
-                    "Ask Kora to prepare an appointment/admin checklist in the background",
+                    "Ask Kora to prepare a critique, lab email, or quiz-start checklist in the background",
                     "Verify decompose_and_dispatch fires with intent_duration='long'",
                     "Verify templated ack ends the turn",
                     "Optional web/filesystem use is scoped to practical life friction",
@@ -1046,15 +1346,16 @@ FAST_PLAN = {
                 "coverage_items": [8, 9, 21, 22, 25, 26, 46, 100, 101, 102],
             },
             {
-                "name": "recall_and_life",
+                "name": "recall_life_and_export_contract",
                 "type": "active",
-                "description": "Verify memory recall + life management records",
+                "description": "Verify memory recall, life records, and GUI-shaped export expectations",
                 "goals": [
                     "Test recall of established facts",
                     "Mention a meal or snack (triggers log_meal)",
                     "Query life management records (harness: life-management-check)",
+                    "Ask what data would fill Today, Calendar, Repair, Memory, Conversation, and Acceptance Proof demo views",
                 ],
-                "coverage_items": [7, 16, 23],
+                "coverage_items": [7, 14, 16, 23],
             },
             {
                 "name": "mechanical_tests",
@@ -1067,8 +1368,9 @@ FAST_PLAN = {
                 "type": "active",
                 "description": "Quick lived-day review covering actual state and tomorrow",
                 "goals": [
-                    "Review actual misses, repairs, reminders, and tomorrow commitments",
+                    "Review actual misses, repairs, reminders, schedule changes, and tomorrow commitments",
                     "Capture a quick note for tomorrow (triggers quick_note)",
+                    "Confirm the demo snapshot label is sanitized and not daemon-connected",
                 ],
                 "coverage_items": [7, 14, 23],
             },

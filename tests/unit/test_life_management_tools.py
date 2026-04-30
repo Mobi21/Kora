@@ -214,6 +214,57 @@ async def test_create_due_soon_reminder_triggers_continuity_check(
 
 
 @pytest.mark.asyncio
+async def test_create_due_soon_reminder_coalesces_active_continuity_check(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    container = await make_container(tmp_path)
+    engine = type(
+        "FakeEngine",
+        (),
+        {"start_triggered_pipeline": AsyncMock()},
+    )()
+    container.orchestration_engine = engine
+    monkeypatch.setenv("KORA_CONTINUITY_REMINDER_WINDOW_HOURS", "1")
+
+    db_path = tmp_path / "operational.db"
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pipeline_instances (
+                id TEXT PRIMARY KEY,
+                pipeline_name TEXT NOT NULL,
+                state TEXT NOT NULL,
+                started_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO pipeline_instances
+                (id, pipeline_name, state, started_at, updated_at)
+            VALUES
+                ('continuity_check-active', 'continuity_check', 'running', ?, ?)
+            """,
+            (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+        )
+        await db.commit()
+
+    result = await create_reminder(
+        CreateReminderInput(
+            title="Eat lunch",
+            remind_at=datetime.now(UTC).isoformat(),
+        ),
+        container,
+    )
+    data = json.loads(result)
+
+    assert data["success"] is True
+    engine.start_triggered_pipeline.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_reminder_sets_due_at_from_natural_time(
     tmp_path: Path,
 ) -> None:
@@ -237,6 +288,244 @@ async def test_create_reminder_sets_due_at_from_natural_time(
     assert row is not None
     assert row["due_at"] == data["due_at"]
     assert "T09:00:00" in row["due_at"]
+
+
+@pytest.mark.asyncio
+async def test_create_reminder_sets_due_at_from_acceptance_week_deadline(
+    tmp_path: Path,
+) -> None:
+    container = await make_container(tmp_path)
+    result = await create_reminder(
+        CreateReminderInput(
+            title="Doctor portal form",
+            description="Form is due Friday noon in the scenario week.",
+        ),
+        container,
+    )
+
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["due_at"] == "2026-05-01T16:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_create_reminder_sets_due_at_from_acceptance_week_title(
+    tmp_path: Path,
+) -> None:
+    container = await make_container(tmp_path)
+    result = await create_reminder(
+        CreateReminderInput(title="STAT quiz window"),
+        container,
+    )
+
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["due_at"] == "2026-04-30T12:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_known_reminder_title_wins_over_long_schedule_source(
+    tmp_path: Path,
+) -> None:
+    container = await make_container(tmp_path)
+    result = await create_reminder(
+        CreateReminderInput(
+            title="Email Marcus re: lab make-up",
+            description=(
+                "Source includes monday 9:00am, thursday 7pm, and friday noon, "
+                "but this reminder is the Marcus lab make-up email."
+            ),
+        ),
+        container,
+    )
+
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["due_at"] == "2026-04-28T13:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_known_reminder_title_overrides_bad_raw_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KORA_ACCEPTANCE_DIR", str(tmp_path / "acceptance"))
+    container = await make_container(tmp_path)
+    result = await create_reminder(
+        CreateReminderInput(
+            title="Email Marcus re: lab make-up",
+            description="Follow up with Marcus about the missed lab.",
+            remind_at="2026-05-01T10:00:00-04:00",
+        ),
+        container,
+    )
+
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["due_at"] == "2026-04-28T13:00:00+00:00"
+    assert data["remind_at"] == "2026-04-28T13:00:00+00:00"
+    assert data["due_at_label"] == "Tuesday Apr 28, 9:00am ET"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_create_reminder_strips_scenario_context_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KORA_ACCEPTANCE_DIR", str(tmp_path / "acceptance"))
+    container = await make_container(tmp_path)
+    result = await create_reminder(
+        CreateReminderInput(
+            title="Doctor portal form",
+            description=(
+                "Reminder for the doctor portal form. Source: "
+                "[Acceptance scenario clock: the lived week is Monday April 27 "
+                "through Sunday May 3, 2026.]"
+            ),
+        ),
+        container,
+    )
+
+    data = json.loads(result)
+
+    assert data["success"] is True
+    db_path = container.settings.data_dir / "operational.db"
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT description FROM reminders WHERE id = ?",
+            (data["id"],),
+        ) as cur:
+            row = await cur.fetchone()
+    assert row is not None
+    assert row["description"] == "Reminder for the doctor portal form."
+
+
+@pytest.mark.asyncio
+async def test_acceptance_create_reminder_deduplicates_same_title_and_due_at(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KORA_ACCEPTANCE_DIR", str(tmp_path / "acceptance"))
+    container = await make_container(tmp_path)
+    first = json.loads(await create_reminder(
+        CreateReminderInput(title="Doctor portal form"),
+        container,
+    ))
+    second = json.loads(await create_reminder(
+        CreateReminderInput(title="Doctor portal form"),
+        container,
+    ))
+
+    assert first["success"] is True
+    assert second["success"] is True
+    assert second["deduplicated"] is True
+    assert second["id"] == first["id"]
+
+    db_path = container.settings.data_dir / "operational.db"
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM reminders WHERE title = 'Doctor portal form'"
+        ) as cur:
+            row = await cur.fetchone()
+    assert row == (1,)
+
+
+@pytest.mark.asyncio
+async def test_acceptance_create_reminder_deduplicates_anchor_despite_bad_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KORA_ACCEPTANCE_DIR", str(tmp_path / "acceptance"))
+    container = await make_container(tmp_path)
+    first = json.loads(await create_reminder(
+        CreateReminderInput(
+            title="Doctor portal form",
+            description="Reminder for the doctor portal form from the week plan.",
+            remind_at="2026-05-01T16:00:00+00:00",
+        ),
+        container,
+    ))
+    second = json.loads(await create_reminder(
+        CreateReminderInput(
+            title="Doctor portal form",
+            description="Reminder for the doctor portal form from the week plan.",
+            remind_at="2026-05-01T02:00:00+00:00",
+        ),
+        container,
+    ))
+
+    assert first["success"] is True
+    assert second["success"] is True
+    assert second["deduplicated"] is True
+    assert second["id"] == first["id"]
+
+    db_path = container.settings.data_dir / "operational.db"
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM reminders WHERE lower(title) = 'doctor portal form'"
+        ) as cur:
+            row = await cur.fetchone()
+    assert row == (1,)
+
+
+@pytest.mark.asyncio
+async def test_acceptance_grocery_due_honors_explicit_moved_sunday(
+    tmp_path: Path,
+) -> None:
+    container = await make_container(tmp_path)
+    result = await create_reminder(
+        CreateReminderInput(
+            title="Grocery + laundry run",
+            description="Moved groceries and laundry to Sunday morning.",
+        ),
+        container,
+    )
+
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["due_at"] == "2026-05-03T14:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_grocery_due_ignores_unrelated_weekdays(
+    tmp_path: Path,
+) -> None:
+    container = await make_container(tmp_path)
+    result = await create_reminder(
+        CreateReminderInput(
+            title="Groceries & laundry",
+            description=(
+                "Tuesday shift, Thursday rent, and Friday form are in the "
+                "setup context. Also remember groceries/laundry."
+            ),
+        ),
+        container,
+    )
+
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["due_at"] == "2026-05-02T19:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_text_mom_due_is_saturday_evening(tmp_path: Path) -> None:
+    container = await make_container(tmp_path)
+    result = await create_reminder(
+        CreateReminderInput(title="Text mom a short check-in"),
+        container,
+    )
+
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["due_at"] == "2026-05-02T23:00:00+00:00"
 
 
 # ── query_reminders ───────────────────────────────────────────────────────────
@@ -418,6 +707,50 @@ async def test_end_focus_block_no_open_block_returns_error(tmp_path: Path) -> No
     data = json.loads(result)
     assert data["success"] is False
     assert "no open focus block" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_acceptance_end_focus_block_without_open_block_is_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KORA_ACCEPTANCE_DIR", str(tmp_path / "acceptance"))
+    container = await make_container(tmp_path)
+    result = await end_focus_block(
+        EndFocusBlockInput(notes="", completed=True),
+        container,
+    )
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["ended"] is False
+    assert data["message"] == "No open focus block to end."
+
+
+@pytest.mark.asyncio
+async def test_stabilization_rest_block_auto_closes(tmp_path: Path) -> None:
+    container = await make_container(tmp_path)
+    result = await start_focus_block(
+        StartFocusBlockInput(label="Stabilization rest block"),
+        container,
+    )
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["ended_at"] is not None
+    assert data["completed"] is True
+
+    db_path = tmp_path / "operational.db"
+    async with aiosqlite.connect(str(db_path)) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT ended_at, completed FROM focus_blocks WHERE id = ?",
+            (data["id"],),
+        ) as cur:
+            row = await cur.fetchone()
+
+    assert row["ended_at"] is not None
+    assert row["completed"] == 1
 
 
 # ── Error handling ────────────────────────────────────────────────────────────

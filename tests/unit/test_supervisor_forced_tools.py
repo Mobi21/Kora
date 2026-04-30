@@ -3,7 +3,41 @@ from __future__ import annotations
 from kora_v2.graph.supervisor import (
     _forced_tool_call_for_turn,
     _forced_tool_calls_for_turn,
+    _mutation_limit_for_turn,
+    _strip_acceptance_context_prefix,
 )
+
+
+def test_mutation_limit_honors_explicit_user_batch_cap() -> None:
+    assert _mutation_limit_for_turn(
+        "Import this in safe batches: make no more than 18 state-changing "
+        "calendar/reminder/file calls in this response."
+    ) == 18
+
+
+def test_mutation_limit_allows_dense_first_run_setup() -> None:
+    assert _mutation_limit_for_turn(
+        "Set reminders, create a tiny morning reset routine, and build the week."
+    ) == 32
+
+
+def test_acceptance_schedule_import_spends_batch_on_calendar_anchors() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "Here is my exact weekly schedule; please save it as the internal "
+        "calendar, not just a note. monday: COGS. tuesday: lab. wednesday: "
+        "office hours. thursday: STAT quiz. friday: HCI critique. saturday: "
+        "groceries/laundry. Import this in safe batches: make no more than 18 "
+        "state-changing calendar/reminder/file calls in this response.",
+        {},
+    )
+
+    assert len(calls) == 18
+    assert {call["name"] for call in calls} == {"create_calendar_entry"}
+    titles = [call["arguments"]["title"] for call in calls]
+    assert "BIO 240 Neurobiology lab" in titles
+    assert "STAT quiz window" in titles
+    assert "HCI prototype critique" in titles
+    assert "Groceries and laundry" in titles
 
 
 def test_pause_context_plus_focus_request_starts_focus_block_not_cancel() -> None:
@@ -42,6 +76,18 @@ def test_positive_meal_mention_logs_meal_before_general_planning() -> None:
     assert call["arguments"]["meal_type"] == "meal"
 
 
+def test_morning_reset_request_forces_routine_creation() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "Create a tiny morning reset routine and keep it saved.",
+        {},
+    )
+
+    routine_calls = [call for call in calls if call["name"] == "create_routine"]
+
+    assert routine_calls
+    assert routine_calls[0]["arguments"]["routine_id"] == "morning_reset"
+
+
 def test_negative_meal_question_does_not_log_fake_meal() -> None:
     call = _forced_tool_call_for_turn(
         "feeling scattered. did i eat lunch? i don't think i ate lunch.",
@@ -77,6 +123,24 @@ def test_create_that_architecture_file_does_not_match_ate() -> None:
     )
 
     assert "log_meal" not in [call["name"] for call in calls]
+
+
+def test_auth_relay_probe_forces_write_file_not_read() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "auth relay deny probe: call write_file now with path "
+        "/tmp/claude/kora_acceptance/auth_probe.txt and content ok. "
+        "Do not read the file first.",
+        {},
+    )
+
+    names = [call["name"] for call in calls]
+    assert "write_file" in names
+    assert "read_file" not in names
+    write_call = next(call for call in calls if call["name"] == "write_file")
+    assert write_call["arguments"] == {
+        "path": "/tmp/claude/kora_acceptance/auth_probe.txt",
+        "content": "ok",
+    }
 
 
 def test_melatonin_statement_logs_medication() -> None:
@@ -122,6 +186,11 @@ def test_week_plan_creates_specific_reminders_without_in_turn_breakdown() -> Non
     assert "Doctor portal form" in titles
     assert "Pharmacy portal/app check" in titles
     assert "Trash night" in titles
+    assert all(
+        call["arguments"].get("remind_at")
+        for call in calls
+        if call["name"] == "create_reminder"
+    )
 
 
 def test_doctor_portal_checklist_starts_cancellable_helper() -> None:
@@ -135,6 +204,21 @@ def test_doctor_portal_checklist_starts_cancellable_helper() -> None:
     assert dispatches
     assert dispatches[0]["arguments"]["pipeline_name"] == "user_autonomous_task"
     assert "Practical life-admin checklist" in dispatches[0]["arguments"]["goal"]
+
+
+def test_marcus_priya_repair_starts_user_autonomous_task() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "Reality update: I already slipped. I missed lunch, avoided the lab "
+        "make-up email to Marcus, and the utilities/rent confirmation with "
+        "Priya is still hanging over me. Do not give me a huge plan; help me "
+        "repair the day and move unfinished items to the right calendar slots.",
+        {},
+    )
+
+    dispatches = [call for call in calls if call["name"] == "decompose_and_dispatch"]
+
+    assert dispatches
+    assert dispatches[0]["arguments"]["pipeline_name"] == "user_autonomous_task"
 
 
 def test_landlord_helper_plan_starts_named_pipeline() -> None:
@@ -176,7 +260,7 @@ def test_gui_commitment_phrase_creates_calendar_entries_and_reminders() -> None:
     assert "Work review" in reminder_titles
 
 
-def test_idle_life_admin_checklist_also_starts_proactive_research() -> None:
+def test_idle_life_admin_checklist_uses_single_proactive_research_path() -> None:
     calls = _forced_tool_calls_for_turn(
         "prepare a short local checklist for tomorrow morning's grocery "
         "pickup and the doctor-form loose ends over idle time.",
@@ -186,8 +270,7 @@ def test_idle_life_admin_checklist_also_starts_proactive_research() -> None:
     dispatches = [call for call in calls if call["name"] == "decompose_and_dispatch"]
     pipeline_names = [call["arguments"]["pipeline_name"] for call in dispatches]
 
-    assert "user_autonomous_task" in pipeline_names
-    assert "proactive_research" in pipeline_names
+    assert pipeline_names == ["proactive_research"]
 
 
 def test_generic_pause_context_does_not_cancel_task() -> None:
@@ -235,6 +318,19 @@ def test_artifact_backed_review_lists_reads_and_recalls() -> None:
     assert "list_directory" in names
     assert "read_file" in names
     assert "recall" in names
+
+
+def test_weekly_review_also_closes_open_focus_after_artifact_probe() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "give me the weekly review now with actual deliverables for the "
+        "dashboard and the files we created.",
+        {},
+    )
+
+    names = [call["name"] for call in calls]
+
+    assert names[0] == "list_directory"
+    assert "end_focus_block" in names
 
 
 def test_explicit_file_path_listing_uses_parent_directory() -> None:
@@ -409,6 +505,88 @@ def test_record_that_creates_quick_note() -> None:
     assert "permissioned" in call["arguments"]["content"]
 
 
+def test_practical_idle_proactivity_does_not_duplicate_user_task() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "There is an upcoming therapy appointment and grocery pickup/trash "
+        "night that I will forget if timing is bad. Prepare a practical short "
+        "local checklist over idle time, show me what you think should surface "
+        "proactively, and let me suppress one nudge that feels like too much.",
+        {},
+    )
+
+    pipelines = [
+        call["arguments"].get("pipeline_name")
+        for call in calls
+        if call["name"] == "decompose_and_dispatch"
+    ]
+    assert pipelines == ["proactive_research"]
+
+
+def test_doctor_portal_cancel_probe_starts_useful_and_disposable_helpers() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "The doctor portal form due Friday noon feels huge. Please prepare a "
+        "practical appointment/admin checklist in the background while I'm "
+        "away, make a local checklist or note, and keep it grounded in my real "
+        "week instead of turning it into a generic research project. Also start "
+        "one disposable helper plan named cancel-probe for broad generic prep so "
+        "I can cancel only that helper later without losing the useful "
+        "doctor-portal checklist.",
+        {},
+    )
+
+    pipelines = [
+        call["arguments"].get("pipeline_name")
+        for call in calls
+        if call["name"] == "decompose_and_dispatch"
+    ]
+    assert pipelines == ["user_autonomous_task", "cancel_probe"]
+
+
+def test_background_goal_strips_acceptance_clock_wrapper() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "[Acceptance scenario clock: the lived week is Monday April 27 through "
+        "Sunday May 3, 2026.]\n"
+        "There is an upcoming therapy appointment and grocery pickup/trash night "
+        "that I will forget if timing is bad. Prepare a practical local "
+        "checklist in the background.",
+        {},
+    )
+
+    goals = [
+        call["arguments"]["goal"]
+        for call in calls
+        if call["name"] == "decompose_and_dispatch"
+    ]
+
+    assert goals
+    assert all("Acceptance scenario clock" not in goal for goal in goals)
+
+
+def test_future_self_bridge_prompt_forces_bridge_tool() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "Evening check-in: low energy, unfinished tasks, and I need tomorrow "
+        "not to start with a mystery pile. Give me a short future-self bridge "
+        "based on what actually happened.",
+        {},
+    )
+
+    assert any(call["name"] == "bridge_tomorrow" for call in calls)
+
+
+def test_strip_acceptance_context_prefix_leaves_normal_text_alone() -> None:
+    assert _strip_acceptance_context_prefix("normal message") == "normal message"
+
+
+def test_cancel_probe_cancel_request_does_not_start_new_helper() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "The cancel-probe helper is noisy now. Cancel only cancel-probe right now. "
+        "Do not cancel proactive research or the doctor-portal checklist.",
+        {},
+    )
+
+    assert "decompose_and_dispatch" not in [call["name"] for call in calls]
+
+
 def test_cancel_only_probe_ignores_do_not_cancel_research_clause() -> None:
     state = {
         "_orchestration_tasks": [
@@ -434,6 +612,39 @@ def test_cancel_only_probe_ignores_do_not_cancel_research_clause() -> None:
     call = _forced_tool_call_for_turn(
         "cancel only cancel-probe right now. do not cancel or disturb the "
         "unrelated local-first research task.",
+        state,
+    )
+
+    assert call is not None
+    assert call["name"] == "cancel_task"
+    assert call["arguments"]["task_id"] == "task-probe"
+
+
+def test_cancel_only_probe_targets_probe_before_routine_pipeline() -> None:
+    state = {
+        "_orchestration_tasks": [
+            {
+                "task_id": "task-routine",
+                "state": "running",
+                "stage": "routine",
+                "goal": "routine_tiny_morning_reset: run the morning routine",
+                "pipeline_name": "routine_tiny_morning_reset",
+                "pipeline_goal": "Tiny Morning Reset",
+            },
+            {
+                "task_id": "task-probe",
+                "state": "running",
+                "stage": "research_and_summarize",
+                "goal": "cancel-probe: throwaway cancellation testing",
+                "pipeline_name": "cancel_probe",
+                "pipeline_goal": "Summarize throwaway cancellation testing",
+            },
+        ]
+    }
+
+    call = _forced_tool_call_for_turn(
+        "The cancel-probe helper is noisy now. Cancel only cancel-probe right now. "
+        "Do not cancel proactive research or the doctor-portal checklist.",
         state,
     )
 
