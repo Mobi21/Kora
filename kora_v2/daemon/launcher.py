@@ -392,6 +392,12 @@ def get_daemon_status(
         health = _fetch_health(host, port, token_path)
         if health:
             result.update(health)
+        api_status = _fetch_status(host, port, token_path)
+        if api_status:
+            result.update(api_status)
+
+    if result.get("status") in (None, "ok"):
+        result["status"] = "degraded" if result.get("state") == "degraded" else "running"
 
     return result
 
@@ -416,6 +422,32 @@ def _fetch_health(
         req = urllib.request.Request(url, method="GET")
         if token:
             req.add_header("Authorization", f"Bearer {token}")
+
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            if resp.status == 200:
+                return json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        pass
+    return None
+
+
+def _fetch_status(
+    host: str,
+    port: int,
+    token_path: Path | None = None,
+) -> dict[str, Any] | None:
+    """Fetch authenticated /api/v1/status for user-facing daemon state."""
+    import urllib.error
+    import urllib.request
+
+    token = _load_api_token(token_path)
+    if not token:
+        return None
+    url = f"http://{host}:{port}/api/v1/status"
+
+    try:
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {token}")
 
         with urllib.request.urlopen(req, timeout=3.0) as resp:
             if resp.status == 200:
@@ -631,7 +663,7 @@ async def _run_daemon(settings: Any) -> None:
 def main() -> None:
     """CLI entry point for ``kora`` command.
 
-    Handles subcommands (stop, status) and the hidden ``--_daemon_internal``
+    Handles subcommands and the hidden ``--_daemon_internal``
     flag used by ``spawn_daemon()`` to start the actual daemon process.
     """
     import argparse
@@ -639,10 +671,16 @@ def main() -> None:
 
     from kora_v2 import __version__
 
-    parser = argparse.ArgumentParser(prog="kora", description="Kora V2 AI Companion")
+    parser = argparse.ArgumentParser(prog="kora", description="Kora V2 local-first Life OS")
     parser.add_argument("--version", action="version", version=f"kora {__version__}")
     parser.add_argument("--_daemon_internal", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("command", nargs="?", choices=["stop", "status"], default=None)
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["start", "chat", "status", "setup", "doctor", "stop", "restart"],
+        default="start",
+        help="Command to run. Default: start.",
+    )
     args = parser.parse_args()
 
     if args._daemon_internal:
@@ -652,37 +690,134 @@ def main() -> None:
         asyncio.run(_run_daemon(settings))
         return
 
-    if args.command == "stop":
-        from kora_v2.core.settings import get_settings
+    from kora_v2.core.settings import get_settings
 
-        settings = get_settings()
-        lockfile_path = settings.data_dir / "kora.lock"
-        if stop_daemon(lockfile_path):
+    settings = get_settings()
+    lockfile_path = settings.data_dir / "kora.lock"
+    token_path = Path(settings.security.api_token_path)
+
+    if args.command == "start":
+        _command_start(lockfile_path, settings.data_dir / "logs", __version__)
+        return
+
+    if args.command == "chat":
+        _command_start(lockfile_path, settings.data_dir / "logs", __version__, quiet=True)
+        from kora_v2.cli.app import KoraCLI
+
+        asyncio.run(KoraCLI().run())
+        return
+
+    if args.command == "stop":
+        if stop_daemon(lockfile_path, token_path=token_path):
             print("Shutdown requested.")
         else:
             print("Daemon is not running.")
         return
 
     if args.command == "status":
-        from kora_v2.core.settings import get_settings
-
-        settings = get_settings()
-        lockfile_path = settings.data_dir / "kora.lock"
-        info = get_daemon_status(lockfile_path)
-        if info.get("running"):
-            print(f"Kora daemon running (pid={info.get('pid')}, port={info.get('port')}, state={info.get('state', 'unknown')})")
-        else:
-            print("Kora daemon is not running.")
+        _command_status(lockfile_path, token_path)
         return
 
-    # Default: ensure daemon is running and print connection info
-    from kora_v2.core.settings import get_settings
+    if args.command == "setup":
+        _command_setup(settings, lockfile_path, token_path)
+        return
 
-    settings = get_settings()
-    lockfile_path = settings.data_dir / "kora.lock"
+    if args.command == "doctor":
+        _command_start(lockfile_path, settings.data_dir / "logs", __version__, quiet=True)
+        _command_doctor(lockfile_path, token_path)
+        return
+
+    if args.command == "restart":
+        if stop_daemon(lockfile_path, token_path=token_path):
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline and Lockfile(lockfile_path).is_running():
+                time.sleep(0.5)
+        _command_start(lockfile_path, settings.data_dir / "logs", __version__)
+        return
+
+
+def _command_start(
+    lockfile_path: Path,
+    log_dir: Path,
+    version: str,
+    *,
+    quiet: bool = False,
+) -> tuple[str, int]:
+    """Ensure the daemon is running and print demo-friendly connection info."""
     try:
-        host, port = ensure_daemon_running(lockfile_path)
-        print(f"Kora V2 {__version__} — daemon ready at {host}:{port}")
+        host, port = ensure_daemon_running(lockfile_path, log_dir=log_dir)
     except TimeoutError as e:
         print(f"Error: {e}")
         sys.exit(1)
+
+    if not quiet:
+        print(f"Kora {version} daemon ready at {host}:{port}")
+        print("Run `kora chat` to open the terminal chat UI.")
+    return host, port
+
+
+def _command_status(lockfile_path: Path, token_path: Path) -> None:
+    """Print daemon status without exposing tokens."""
+    info = get_daemon_status(lockfile_path, token_path=token_path)
+    if not info.get("running"):
+        print("Kora daemon is not running.")
+        print(f"Lockfile: {lockfile_path}")
+        return
+
+    print("Kora daemon running")
+    print(f"  pid: {info.get('pid')}")
+    print(f"  port: {info.get('port')}")
+    print(f"  state: {info.get('state', 'unknown')}")
+    print(f"  status: {info.get('status', 'unknown')}")
+    failed = info.get("failed_subsystems") or []
+    if failed:
+        print(f"  degraded subsystems: {', '.join(str(x) for x in failed)}")
+    else:
+        print("  degraded subsystems: none")
+    print(f"  lockfile: {lockfile_path}")
+
+
+def _command_setup(settings: Any, lockfile_path: Path, token_path: Path) -> None:
+    """Print local setup facts and next commands."""
+    print("Kora local setup")
+    print(f"  python: {sys.executable}")
+    print(f"  data_dir: {settings.data_dir}")
+    print(f"  lockfile: {lockfile_path}")
+    print(f"  token_file_exists: {token_path.exists()}")
+    print(f"  memory_path: {settings.memory.kora_memory_path}")
+    print(f"  daemon_host: {settings.daemon.host}")
+    print(f"  daemon_port: {settings.daemon.port}")
+    print("  commands: kora start | kora chat | kora status | kora doctor | kora stop")
+
+
+def _command_doctor(lockfile_path: Path, token_path: Path) -> None:
+    """Fetch and print the runtime doctor report from the daemon."""
+    data = Lockfile(lockfile_path).read() or {}
+    host = data.get("api_host", data.get("host", "127.0.0.1"))
+    port = data.get("api_port", data.get("port"))
+    if not port:
+        print("Doctor unavailable: daemon port not found.")
+        return
+
+    token = _load_api_token(token_path)
+    if not token:
+        print("Doctor unavailable: API token file is missing.")
+        return
+
+    import urllib.error
+    import urllib.request
+
+    url = f"http://{host}:{port}/api/v1/inspect/doctor"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            report = json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as exc:
+        print(f"Doctor unavailable: {exc}")
+        return
+
+    from kora_v2.runtime.inspector import doctor_report_lines
+
+    for line in doctor_report_lines(report):
+        print(line)

@@ -1,0 +1,376 @@
+/* FullCalendar v6 overrides — calm, Cron/Notion-Calendar quality.
+   FullCalendar v6 ships its own scoped CSS via JS imports, so no @import needed
+   here. These rules are layered ON TOP of FC defaults. Theme-token only. */
+
+/* ── Root container ─────────────────────────────────────────────────── */
+.kora-calendar .fc {
+  font-family: var(--font-ui);
+  font-size: var(--fs-sm);
+  color: var(--fg);
+  background: var(--bg);
+  --fc-border-color: var(--border);
+  --fc-page-bg-color: var(--bg);
+  --fc-neutral-bg-color: transparent;
+  --fc-list-event-hover-bg-color: var(--surface-2);
+  --fc-today-bg-color: transparent;
+  --fc-now-indicator-color: var(--accent);
+  --fc-event-bg-color: transparent;
+  --fc-event-border-color: transparent;
+  --fc-event-text-color: var(--fg);
+  --fc-highlight-color: transparent;
+  --fc-non-business-color: transparent;
+  --fc-small-font-size: var(--fs-2xs);
+}
+
+/* ── Strip default borders, replace with hairlines ──────────────────── */
+.kora-calendar .fc-theme-standard td,
+.kora-calendar .fc-theme-standard th,
+.kora-calendar .fc-theme-standard .fc-scrollgrid {
+  border-color: var(--border);
+}
+.kora-calendar .fc-theme-standard .fc-scrollgrid {
+  border: none;
+}
+.kora-calendar .fc-scrollgrid-section > * {
+  border-bottom-width: 0;
+}
+.kora-calendar .fc-scrollgrid-section-header > th,
+.kora-calendar .fc-scrollgrid-section-body > td {
+  border-right: 1px solid var(--border);
+}
+.kora-calendar .fc-scrollgrid-section-header > th:last-child,
+.kora-calendar .fc-scrollgrid-section-body > td:last-child {
+  border-right: none;
+}
+.kora-calendar .fc-col-header,
+.kora-calendar .fc-col-header-cell {
+  border: none;
+  background: transparent;
+}
+
+/* ── Headers: Inter medium 11px uppercase tracking +0.02em fg-muted ─── */
+.kora-calendar .fc .fc-col-header-cell-cushion {
+  font-family: var(--font-ui);
+  font-weight: 500;
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--track-label);
+  color: var(--fg-muted);
+  padding: 10px 8px;
+  text-align: left;
+  text-decoration: none;
+}
+.kora-calendar .fc .fc-col-header-cell {
+  text-align: left;
+}
+.kora-calendar .fc .fc-scrollgrid-sync-inner {
+  text-align: left;
+}
+
+/* Today column: subtle accent-soft tint, NOT a colored fill. */
+.kora-calendar .fc .fc-col-header-cell.fc-day-today .fc-col-header-cell-cushion {
+  color: var(--fg);
+}
+.kora-calendar .fc .fc-day-today {
+  background: color-mix(in oklch, var(--accent-soft) 35%, transparent) !important;
+}
+
+/* ── Time grid slots: density-driven hour rows ──────────────────────── */
+[data-density='cozy'] .kora-calendar .fc-timegrid-slot {
+  height: 48px;
+}
+[data-density='balanced'] .kora-calendar .fc-timegrid-slot {
+  height: 40px;
+}
+[data-density='compact'] .kora-calendar .fc-timegrid-slot {
+  height: 32px;
+}
+.kora-calendar .fc-timegrid-slot {
+  border-color: var(--border);
+}
+
+/* Half-hour line at 30% border opacity. */
+.kora-calendar .fc-timegrid-slot.fc-timegrid-slot-minor {
+  border-top-color: color-mix(in oklch, var(--border) 30%, transparent);
+}
+
+/* Slot labels: tabular mono 11px fg-muted, right-aligned in rail. */
+.kora-calendar .fc .fc-timegrid-slot-label-cushion,
+.kora-calendar .fc .fc-timegrid-axis-cushion {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-2xs);
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--track-label);
+  padding: 0 8px;
+}
+.kora-calendar .fc-timegrid-axis,
+.kora-calendar .fc-timegrid-slot-label {
+  border-color: var(--border);
+}
+
+/* ── All-day row: surface-1 tint, no double border. ─────────────────── */
+.kora-calendar .fc-timegrid-divider,
+.kora-calendar .fc-scrollgrid-section-header.fc-scrollgrid-section-sticky > * {
+  background: var(--bg);
+}
+.kora-calendar .fc .fc-daygrid-body.fc-daygrid-body-natural {
+  background: color-mix(in oklch, var(--surface-1) 60%, transparent);
+}
+.kora-calendar .fc .fc-timegrid-divider {
+  padding: 0;
+  border: none;
+  height: 1px;
+  background: var(--border);
+}
+.kora-calendar .fc .fc-scrollgrid-section-body.fc-scrollgrid-section-liquid > td {
+  border-top: none;
+}
+/* Kill the FullCalendar-generated double line at all-day boundary. */
+.kora-calendar .fc .fc-timegrid-axis-frame,
+.kora-calendar .fc .fc-timegrid-axis {
+  border-bottom: none;
+}
+
+/* ── Now indicator: 1px sage line + 6px circle on rail edge. ────────── */
+.kora-calendar .fc .fc-timegrid-now-indicator-line {
+  border-color: var(--accent);
+  border-width: 1px;
+  transition: top var(--motion-slow) var(--ease-out);
+}
+.kora-calendar .fc .fc-timegrid-now-indicator-arrow {
+  border: none;
+  background: var(--accent);
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  margin-top: -3px;
+  margin-left: -3px;
+  transition: top var(--motion-slow) var(--ease-out);
+}
+
+/* ── Event chip styling (handled via React eventContent + class). ──── */
+.kora-calendar .fc .fc-event,
+.kora-calendar .fc .fc-event:focus {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  outline: none;
+}
+.kora-calendar .fc .fc-timegrid-event {
+  box-shadow: none;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  margin: 0;
+  padding: 0;
+}
+.kora-calendar .fc .fc-timegrid-event-harness > .fc-event {
+  inset: 0;
+}
+.kora-calendar .fc .fc-event:hover .kora-event-chip {
+  box-shadow: var(--shadow-1);
+}
+.kora-calendar .fc .fc-event-main {
+  padding: 0;
+  color: var(--fg);
+}
+.kora-calendar .fc .fc-event-main-frame {
+  padding: 0;
+}
+
+/* Day-grid (non-month) event chips inherit chip styling via React. */
+.kora-calendar .fc .fc-daygrid-event {
+  margin: 1px 4px;
+  padding: 0;
+  background: transparent;
+  border: none;
+}
+.kora-calendar .fc .fc-daygrid-event-dot {
+  display: none;
+}
+
+/* Multi-day events: rounded only at start/end columns. */
+.kora-calendar .fc .fc-event.fc-event-start .kora-event-chip {
+  border-top-left-radius: 6px;
+  border-bottom-left-radius: 6px;
+}
+.kora-calendar .fc .fc-event.fc-event-end .kora-event-chip {
+  border-top-right-radius: 6px;
+  border-bottom-right-radius: 6px;
+}
+.kora-calendar
+  .fc
+  .fc-event:not(.fc-event-start):not(.fc-event-end)
+  .kora-event-chip {
+  border-radius: 0;
+}
+
+/* ── Selection feedback (drag): outline only ─────────────────────────── */
+.kora-calendar .fc .fc-highlight,
+.kora-calendar .fc .fc-event-mirror {
+  background: transparent !important;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.kora-calendar .fc .fc-event-mirror .kora-event-chip {
+  background: color-mix(in oklch, var(--accent-soft) 40%, var(--surface-1));
+}
+
+/* Resizer handle */
+.kora-calendar .fc .fc-event-resizer {
+  border-radius: 0;
+}
+
+/* ── Medication background bands ─────────────────────────────────────── */
+/* FC's .fc-bg-event fills the harness; render the band as a 2px top rule
+   plus a soft accent-soft tint so the dose window reads as a sage strip
+   anchored at its start time. */
+.kora-calendar .fc .fc-bg-event.kora-medication-band {
+  position: relative;
+  background: color-mix(in oklch, var(--accent-soft) 28%, transparent);
+  opacity: 1;
+  border-top: 2px solid var(--accent);
+  border-bottom: 1px dashed
+    color-mix(in oklch, var(--accent) 40%, transparent);
+}
+.kora-calendar .fc .fc-bg-event.kora-medication-band::after {
+  content: '';
+  position: absolute;
+  top: -3px;
+  left: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+/* ── Month view: hide native chips; we render dots via dayCellContent ─ */
+.kora-calendar .fc .fc-daygrid-day-number {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  padding: 6px 8px;
+  text-decoration: none;
+}
+.kora-calendar .fc .fc-day-today .fc-daygrid-day-number {
+  color: var(--fg);
+  font-weight: 500;
+}
+.kora-calendar .fc .fc-daygrid-day-frame {
+  min-height: 88px;
+  padding: 0;
+}
+.kora-calendar .fc .fc-daygrid-day-events,
+.kora-calendar .fc .fc-daygrid-day-bottom {
+  display: none;
+}
+.kora-calendar .fc .fc-daygrid-day {
+  background: var(--bg);
+}
+.kora-calendar .fc .fc-day-other .fc-daygrid-day-number {
+  color: var(--fg-subtle);
+  opacity: 0.55;
+}
+
+/* ── List (agenda) view ─────────────────────────────────────────────── */
+.kora-calendar .fc .fc-list {
+  border: none;
+  background: transparent;
+}
+.kora-calendar .fc .fc-list-day-cushion {
+  background: transparent;
+  padding: 12px 8px 6px;
+}
+.kora-calendar .fc .fc-list-day-text,
+.kora-calendar .fc .fc-list-day-side-text {
+  font-family: var(--font-ui);
+  font-size: var(--fs-2xs);
+  font-weight: 500;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--track-label);
+  text-decoration: none;
+}
+.kora-calendar .fc .fc-list-event:hover td {
+  background: var(--surface-2);
+}
+.kora-calendar .fc .fc-list-event-graphic {
+  display: none;
+}
+.kora-calendar .fc .fc-list-event-time {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-2xs);
+  color: var(--fg-muted);
+}
+.kora-calendar .fc .fc-list-event-title {
+  font-size: var(--fs-sm);
+  color: var(--fg);
+}
+.kora-calendar .fc .fc-list-empty {
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-narrative);
+  font-size: var(--fs-md);
+}
+
+/* ── Scrollbars: thin, fg-subtle on hover only. ─────────────────────── */
+.kora-calendar .fc-scroller::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.kora-calendar .fc-scroller::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.kora-calendar .fc-scroller:hover::-webkit-scrollbar-thumb {
+  background: var(--fg-subtle);
+  background-clip: padding-box;
+}
+.kora-calendar .fc-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── Misc: focus rings, no-select on chrome, popover ─────────────────── */
+.kora-calendar .fc a,
+.kora-calendar .fc a:hover {
+  text-decoration: none;
+  color: inherit;
+}
+.kora-calendar .fc-popover {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  box-shadow: var(--shadow-2);
+}
+.kora-calendar .fc-popover-header {
+  background: transparent;
+  padding: 8px 10px;
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--track-label);
+  color: var(--fg-muted);
+}
+
+/* ── Hover-reveal action row inside chip ─────────────────────────────── */
+.kora-event-chip-actions {
+  opacity: 0;
+  transform: translateY(2px);
+  transition:
+    opacity var(--motion-fast) var(--ease-out),
+    transform var(--motion-fast) var(--ease-out);
+  pointer-events: none;
+}
+.kora-calendar .fc .fc-event:hover .kora-event-chip-actions,
+.kora-calendar .fc .fc-event:focus-within .kora-event-chip-actions {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}

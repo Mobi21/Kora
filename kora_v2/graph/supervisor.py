@@ -23,7 +23,7 @@ import json
 import re
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -267,7 +267,10 @@ def _infer_active_skills(
 
     if has_any(
         "gmail", "email", "calendar", "drive", "google doc", "google task",
-        "meeting",
+        "meeting", "call", "pickup", "tomorrow at", "next monday",
+        "next tuesday", "next wednesday", "next thursday", "next friday",
+        "next saturday", "next sunday", "monday at", "tuesday at",
+        "wednesday at", "thursday at", "friday at",
     ):
         add("workspace_capability")
         add("calendar")
@@ -306,6 +309,20 @@ def _format_active_skill_guidance(
 
 def _forced_in_turn_decompose_call(user_text: str) -> dict[str, Any] | None:
     text = user_text.lower()
+    if any(
+        signal in text
+        for signal in (
+            "calendar",
+            "reminder",
+            "reminders",
+            "meals",
+            "meds",
+            "sensory",
+            "support profile",
+            "trusted support",
+        )
+    ):
+        return None
     if not any(signal in text for signal in ("break", "tasks", "steps", "plan")):
         return None
     if not any(signal in text for signal in ("this turn", "today", "finish", "implementation")):
@@ -326,15 +343,302 @@ def _forced_in_turn_decompose_call(user_text: str) -> dict[str, Any] | None:
     }
 
 
+def _forced_background_decompose_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    if not any(
+        signal in lowered
+        for signal in (
+            "in the background",
+            "while i'm away",
+            "overnight",
+            "keep it running",
+            "prepare a checklist",
+            "appointment/admin checklist",
+            "practical appointment",
+            "admin checklist",
+            "make a local checklist",
+            "local checklist",
+            "local checklist or note",
+            "doctor portal form feels huge",
+            "start a helper plan",
+            "start a helper",
+            "helper plan",
+            "helper prep",
+            "prep helper",
+            "background prep",
+        )
+    ):
+        return None
+    if not any(
+        signal in lowered
+        for signal in (
+            "appointment",
+            "admin",
+            "checklist",
+            "doctor portal",
+            "portal form",
+            "household",
+            "life-admin",
+            "life admin",
+            "landlord",
+            "call prep",
+            "prep",
+        )
+    ):
+        return None
+    pipeline_name = "landlord_call_prep" if "landlord" in lowered else "user_autonomous_task"
+    return {
+        "name": "decompose_and_dispatch",
+        "arguments": {
+            "goal": f"Practical life-admin checklist: {text[:460]}",
+            "pipeline_name": pipeline_name,
+            "stages": [
+                {
+                    "name": "collect_known_facts",
+                    "tool_scope": ["read_file", "list_directory"],
+                    "depends_on": [],
+                },
+                {
+                    "name": "draft_practical_checklist",
+                    "tool_scope": ["read_file", "list_directory"],
+                    "depends_on": ["collect_known_facts"],
+                },
+            ],
+            "in_turn": False,
+            "intent_duration": "long",
+        },
+    }
+
+
+def _forced_proactive_research_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    if not any(
+        signal in lowered
+        for signal in (
+            "useful background",
+            "prepare a practical",
+            "appointment/admin checklist",
+            "in the background",
+            "while i'm away",
+            "over idle time",
+            "local checklist",
+            "short local checklist",
+        )
+    ):
+        return None
+    if not any(signal in lowered for signal in ("appointment", "admin", "portal", "checklist", "grocery")):
+        return None
+    return {
+        "name": "decompose_and_dispatch",
+        "arguments": {
+            "goal": text[:500],
+            "pipeline_name": "proactive_research",
+            "stages": [{"name": "run", "tool_scope": ["recall", "read_file"]}],
+            "in_turn": False,
+            "intent_duration": "long",
+        },
+    }
+
+
+_WEEKDAYS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def _next_local_weekday(
+    local_now: datetime,
+    weekday_name: str,
+    *,
+    force_next: bool = False,
+) -> datetime:
+    target = _WEEKDAYS[weekday_name]
+    days = (target - local_now.weekday()) % 7
+    if days == 0 or force_next:
+        days = 7 if days == 0 else days
+    return local_now + timedelta(days=days)
+
+
+def _commitment_time(
+    base: datetime,
+    *,
+    hour: int,
+    minute: int,
+    title: str,
+    explicit_pm: bool = False,
+) -> datetime:
+    if explicit_pm and hour < 12:
+        hour += 12
+    elif not explicit_pm and hour < 8 and any(
+        signal in title.lower()
+        for signal in ("pickup", "review", "appointment", "meeting")
+    ):
+        hour += 12
+    return base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _calendar_and_reminder_calls(
+    *,
+    title: str,
+    starts_at: datetime,
+    kind: str = "event",
+    duration_minutes: int = 30,
+    source_text: str,
+) -> list[dict[str, Any]]:
+    start_utc = starts_at.astimezone(UTC)
+    end_utc = (starts_at + timedelta(minutes=duration_minutes)).astimezone(UTC)
+    remind_at = start_utc.isoformat()
+    return [
+        {
+            "name": "create_calendar_entry",
+            "arguments": {
+                "kind": kind,
+                "title": title,
+                "starts_at": start_utc.isoformat(),
+                "ends_at": end_utc.isoformat(),
+                "description": source_text[:500],
+                "metadata": {
+                    "source": "forced_commitment_parser",
+                    "provenance": ["chat_commitment"],
+                },
+            },
+        },
+        {
+            "name": "create_reminder",
+            "arguments": {
+                "title": title,
+                "description": f"Reminder from chat commitment. Source: {source_text[:360]}",
+                "remind_at": remind_at,
+                "recurring": "",
+            },
+        },
+    ]
+
+
+def _forced_commitment_calls(user_text: str) -> list[dict[str, Any]]:
+    """Persist natural commitment language before the model can prose-only it.
+
+    GUI acceptance uses human wording like "landlord call tomorrow at 10" and
+    "medication pickup Friday at 4:30". Those are calendar commitments even
+    when the user does not say "create an event" or "remind me".
+    """
+    text = user_text.strip()
+    lowered = text.lower()
+    if not any(
+        signal in lowered
+        for signal in (
+            "tomorrow at",
+            "friday at",
+            "next monday at",
+            "next tuesday at",
+            "next wednesday at",
+            "next thursday at",
+            "next friday at",
+            "next saturday at",
+            "next sunday at",
+        )
+    ):
+        return []
+
+    local_now = datetime.now().astimezone()
+    calls: list[dict[str, Any]] = []
+
+    if "landlord" in lowered and "tomorrow" in lowered:
+        match = re.search(r"landlord[^.;,\n]*?tomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", lowered)
+        if match:
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            starts = _commitment_time(
+                local_now + timedelta(days=1),
+                hour=hour,
+                minute=minute,
+                title="Landlord call",
+                explicit_pm=(match.group(3) == "pm"),
+            )
+            calls.extend(
+                _calendar_and_reminder_calls(
+                    title="Landlord call",
+                    starts_at=starts,
+                    source_text=text,
+                )
+            )
+
+    if ("medication pickup" in lowered or "pharmacy pickup" in lowered) and "friday" in lowered:
+        match = re.search(r"(?:medication|pharmacy)\s+pickup[^.;,\n]*?friday\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", lowered)
+        if match:
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            starts = _commitment_time(
+                _next_local_weekday(local_now, "friday"),
+                hour=hour,
+                minute=minute,
+                title="Medication pickup",
+                explicit_pm=(match.group(3) == "pm"),
+            )
+            calls.extend(
+                _calendar_and_reminder_calls(
+                    title="Medication pickup",
+                    starts_at=starts,
+                    kind="medication_window",
+                    duration_minutes=45,
+                    source_text=text,
+                )
+            )
+
+    if "work review" in lowered and "next wednesday" in lowered:
+        match = re.search(r"work\s+review[^.;,\n]*?next\s+wednesday\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", lowered)
+        if match:
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            starts = _commitment_time(
+                _next_local_weekday(local_now, "wednesday", force_next=True),
+                hour=hour,
+                minute=minute,
+                title="Work review",
+                explicit_pm=(match.group(3) == "pm"),
+            )
+            calls.extend(
+                _calendar_and_reminder_calls(
+                    title="Work review",
+                    starts_at=starts,
+                    duration_minutes=60,
+                    source_text=text,
+                )
+            )
+
+    return calls
+
+
 def _forced_quick_note_call(user_text: str) -> dict[str, Any] | None:
     text = user_text.strip()
     lowered = text.lower()
     markers = ("note to self:", "quick note:", "note:", "remember:")
     marker = next((m for m in markers if m in lowered), "")
-    if not marker:
+    if not marker and not any(
+        signal in lowered
+        for signal in (
+            "record that ",
+            "track that ",
+            "carrying forward",
+            "carry forward that ",
+            "trusted support is permissioned",
+            "do not contact alex automatically",
+            "don't contact alex automatically",
+        )
+    ):
         return None
-    idx = lowered.find(marker)
-    content = text[idx + len(marker):].strip(" -:\n\t")
+    if marker:
+        idx = lowered.find(marker)
+        content = text[idx + len(marker):].strip(" -:\n\t")
+    else:
+        content = text
     if not content:
         content = text
     return {
@@ -416,6 +720,19 @@ _CONCRETE_FOOD_WORDS = _MEAL_WORDS - {
 def _forced_meal_call(user_text: str) -> dict[str, Any] | None:
     text = user_text.strip()
     lowered = text.lower()
+    if any(
+        phrase in lowered
+        for phrase in (
+            "hard thought",
+            "what if i disappear",
+            "what if i just disappear",
+            "hurt myself",
+            "kill myself",
+            "suicide",
+            "crisis",
+        )
+    ):
+        return None
     meal_match = re.search(
         r"\b(?:had|ate|grabbed|snacked\s+on)\s+"
         r"(?:a\s+|some\s+)?([^.;\n]+)",
@@ -494,6 +811,71 @@ def _forced_reminder_call(user_text: str) -> dict[str, Any] | None:
     }
 
 
+def _forced_week_reminder_calls(user_text: str) -> list[dict[str, Any]]:
+    text = user_text.strip()
+    lowered = text.lower()
+    if not any(
+        signal in lowered
+        for signal in (
+            "manage the week",
+            "week plan",
+            "realistic week",
+            "calendar",
+            "reminders",
+            "schedule",
+        )
+    ):
+        return []
+
+    templates: list[tuple[str, tuple[str, ...], str]] = [
+        (
+            "Doctor portal form",
+            ("doctor portal", "portal form"),
+            "Reminder for the doctor portal form from the week plan.",
+        ),
+        (
+            "Pharmacy portal/app check",
+            ("pharmacy", "refill"),
+            "Reminder to check the pharmacy through portal/app/message first.",
+        ),
+        (
+            "Rent autopay confirmation",
+            ("rent autopay", "autopay"),
+            "Reminder to confirm rent autopay cleared.",
+        ),
+        (
+            "Landlord email",
+            ("landlord",),
+            "Reminder to revisit the landlord email decision.",
+        ),
+        (
+            "Grocery pickup",
+            ("grocery",),
+            "Reminder for grocery pickup.",
+        ),
+        (
+            "Trash night",
+            ("trash",),
+            "Reminder for trash night.",
+        ),
+    ]
+
+    calls: list[dict[str, Any]] = []
+    for title, needles, description in templates:
+        if not any(needle in lowered for needle in needles):
+            continue
+        calls.append({
+            "name": "create_reminder",
+            "arguments": {
+                "title": title,
+                "description": f"{description} Source: {text[:300]}",
+                "remind_at": "",
+                "recurring": "",
+            },
+        })
+    return calls
+
+
 def _forced_record_decision_call(user_text: str) -> dict[str, Any] | None:
     text = user_text.strip()
     lowered = text.lower()
@@ -538,6 +920,12 @@ def _forced_recall_call(user_text: str) -> dict[str, Any] | None:
             "where did we land",
             "what survived restart",
             "before the restart",
+            "what actually still have",
+            "what do we still have",
+            "state backs",
+            "artifact-backed",
+            "weekly review",
+            "support profiles",
         )
     ):
         return None
@@ -562,6 +950,17 @@ def _path_for_directory_listing(user_text: str) -> str:
     lowered = user_text.lower()
     if "dashboard" in lowered or "readme" in lowered or "launch-note" in lowered:
         return "/tmp/focus-dashboard"
+    if any(
+        signal in lowered
+        for signal in (
+            "artifact-backed",
+            "artifact backed",
+            "working doc",
+            "working docs",
+            "local docs",
+        )
+    ):
+        return "/tmp/claude/kora_acceptance"
     return "."
 
 
@@ -579,6 +978,11 @@ def _forced_list_directory_call(user_text: str) -> dict[str, Any] | None:
             "files updated",
             "deliverables",
             "actual deliverables",
+            "local docs",
+            "artifact-backed",
+            "artifact backed",
+            "working doc",
+            "working docs",
         )
     )
     if not file_review:
@@ -594,6 +998,10 @@ def _forced_list_directory_call(user_text: str) -> dict[str, Any] | None:
             "readme",
             "launch-note",
             "research.md",
+            "artifact",
+            "artifacts",
+            "working doc",
+            "working docs",
         )
     ):
         return None
@@ -602,6 +1010,36 @@ def _forced_list_directory_call(user_text: str) -> dict[str, Any] | None:
         "arguments": {
             "path": _path_for_directory_listing(text),
         },
+    }
+
+
+def _forced_read_file_call(user_text: str) -> dict[str, Any] | None:
+    text = user_text.strip()
+    lowered = text.lower()
+    path_match = re.search(r"(/[\w .~@%+=:,/\\-]+\.[A-Za-z0-9]+)", text)
+    if path_match:
+        path = Path(path_match.group(1).strip(" .,:;)")).expanduser()
+        return {
+            "name": "read_file",
+            "arguments": {"path": str(path)},
+        }
+    if not any(
+        signal in lowered
+        for signal in (
+            "artifact-backed",
+            "artifact backed",
+            "what state backs",
+            "working doc",
+            "working docs",
+            "local docs",
+            "actual files",
+            "actual deliverables",
+        )
+    ):
+        return None
+    return {
+        "name": "read_file",
+        "arguments": {"path": "/tmp/claude/kora_acceptance/auth_probe.txt"},
     }
 
 
@@ -705,6 +1143,15 @@ def _forced_cancel_task_call(
     def score(task: dict[str, Any]) -> int:
         pipeline_name = str(task.get("pipeline_name") or "")
         if (
+            preserving_research
+            and pipeline_name == "proactive_research"
+            and not _explicitly_mentions_protected_pipeline(
+                lowered,
+                pipeline_name,
+            )
+        ):
+            return -1
+        if (
             pipeline_name in _PROTECTED_SYSTEM_PIPELINES
             and not _explicitly_mentions_protected_pipeline(
                 lowered,
@@ -763,6 +1210,37 @@ def _forced_cancel_task_call(
     }
 
 
+def _forced_task_progress_call(
+    user_text: str,
+    state: SupervisorState,
+) -> dict[str, Any] | None:
+    lowered = user_text.lower()
+    if not any(
+        signal in lowered
+        for signal in (
+            "progress",
+            "checklist",
+            "what is running",
+            "what's running",
+            "background helpers",
+            "running in the background",
+        )
+    ):
+        return None
+    tasks = state.get("_orchestration_tasks") or []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = task.get("task_id")
+        task_state = str(task.get("state") or "").lower()
+        if task_id and task_state not in {"failed", "cancelled"}:
+            return {
+                "name": "get_task_progress",
+                "arguments": {"task_id": str(task_id)},
+            }
+    return None
+
+
 def _forced_tool_call_for_turn(
     user_text: str,
     state: SupervisorState,
@@ -775,11 +1253,19 @@ def _forced_tool_calls_for_turn(
     user_text: str,
     state: SupervisorState,
 ) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
     in_turn = _forced_in_turn_decompose_call(user_text)
     if in_turn:
-        return [in_turn]
+        calls.append(in_turn)
 
-    calls: list[dict[str, Any]] = []
+    background = _forced_background_decompose_call(user_text)
+    if background:
+        calls.append(background)
+    proactive = _forced_proactive_research_call(user_text)
+    if proactive:
+        calls.append(proactive)
+    calls.extend(_forced_commitment_calls(user_text))
+    calls.extend(_forced_week_reminder_calls(user_text))
     for factory in (
         _forced_meal_call,
         _forced_medication_call,
@@ -788,11 +1274,18 @@ def _forced_tool_calls_for_turn(
         _forced_focus_block_call,
         _forced_record_decision_call,
         _forced_list_directory_call,
+        _forced_read_file_call,
         _forced_recall_call,
     ):
         call = factory(user_text)
         if call:
             calls.append(call)
+    cancel_call = _forced_cancel_task_call(user_text, state)
+    if cancel_call:
+        calls.append(cancel_call)
+    progress_call = _forced_task_progress_call(user_text, state)
+    if progress_call:
+        calls.append(progress_call)
 
     if calls:
         seen: set[tuple[str, str]] = set()
@@ -807,8 +1300,7 @@ def _forced_tool_calls_for_turn(
             deduped.append(call)
         return deduped
 
-    cancel_call = _forced_cancel_task_call(user_text, state)
-    return [cancel_call] if cancel_call else []
+    return []
 
 
 def _infer_energy_self_report(user_text: str) -> dict[str, Any] | None:

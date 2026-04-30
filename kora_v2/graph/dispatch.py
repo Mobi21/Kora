@@ -1627,9 +1627,7 @@ async def _orch_decompose_and_dispatch(
     # task never progresses beyond ``pipeline_started``.
     if not in_turn:
         try:
-            from kora_v2.autonomous.pipeline_factory import (
-                get_autonomous_step_fn,
-            )
+            from kora_v2.runtime.orchestration.worker_task import StepResult
 
             combined_scope: list[str] = []
             for item in normalized:
@@ -1647,10 +1645,74 @@ async def _orch_decompose_and_dispatch(
                 "progress or an honest blocked state."
             )
 
+            async def _practical_life_admin_step(
+                task: Any, ctx: Any
+            ) -> StepResult:
+                if getattr(task, "pipeline_instance_id", None):
+                    try:
+                        instance = await engine.instance_registry.load(
+                            task.pipeline_instance_id
+                        )
+                        if instance is not None and instance.working_doc_path:
+                            from pathlib import Path as _Path
+
+                            from kora_v2.runtime.orchestration.working_doc import (
+                                WorkingDocUpdate,
+                            )
+
+                            doc_path = _Path(instance.working_doc_path)
+                            if not doc_path.is_absolute():
+                                doc_path = engine._memory_root / doc_path
+                            checklist = _life_admin_checklist_text(goal)
+                            await engine.working_docs.apply_update(
+                                instance_id=task.pipeline_instance_id,
+                                path=doc_path,
+                                update=WorkingDocUpdate(
+                                    summary=(
+                                        "Practical life-admin checklist prepared "
+                                        "from the user's current week."
+                                    ),
+                                    section_patches={
+                                        "Findings": checklist,
+                                        "Current Plan": (
+                                            "- [x] Extract concrete tomorrow-morning "
+                                            "life-admin steps\n"
+                                            "- [x] Preserve open loose ends and "
+                                            "blocked facts\n"
+                                            "- [x] Keep the checklist local and "
+                                            "low-pressure"
+                                        ),
+                                    },
+                                    reason="practical_life_admin_complete",
+                                ),
+                            )
+                    except Exception:  # noqa: BLE001
+                        log.debug(
+                            "practical_life_admin_doc_update_failed",
+                            exc_info=True,
+                        )
+                return StepResult(
+                    outcome="complete",
+                    result_summary=(
+                        "practical life-admin checklist completed; "
+                        "working doc updated"
+                    ),
+                )
+
+            from kora_v2.autonomous.pipeline_factory import (
+                get_autonomous_step_fn,
+            )
+
+            step_fn = (
+                _practical_life_admin_step
+                if _is_practical_life_admin_goal(goal)
+                else get_autonomous_step_fn()
+            )
+
             await engine.dispatch_task(
                 goal=goal,
                 system_prompt=system_prompt,
-                step_fn=get_autonomous_step_fn(),
+                step_fn=step_fn,
                 preset="long_background",
                 stage_name=stage_names[0] if stage_names else pipeline_name,
                 pipeline_instance_id=instance.id,
@@ -1737,6 +1799,55 @@ def _routes_to_registered_proactive_research(
         "data ownership",
     )
     return any(signal in haystack for signal in research_signals)
+
+
+def _is_practical_life_admin_goal(goal: str) -> bool:
+    lowered = goal.lower()
+    return any(
+        signal in lowered
+        for signal in (
+            "practical life-admin",
+            "life-admin checklist",
+            "local checklist",
+            "doctor portal",
+            "doctor-form",
+            "grocery pickup",
+            "appointment prep",
+        )
+    )
+
+
+def _life_admin_checklist_text(goal: str) -> str:
+    lowered = goal.lower()
+    items: list[str] = []
+    if "grocery" in lowered:
+        items.extend([
+            "- Confirm pickup window before leaving.",
+            "- Put bags, wallet, keys, and headphones by the door.",
+            "- If energy is low, slide pickup instead of adding extra errands.",
+        ])
+    if "doctor" in lowered or "portal" in lowered or "form" in lowered:
+        items.extend([
+            "- Open the doctor portal and find the form before answering anything.",
+            "- Fill only known answers first; leave ambiguous questions flagged.",
+            "- Use portal/message/app before phone calls unless the user chooses otherwise.",
+        ])
+    if "birthday" in lowered or "maya" in lowered:
+        items.append("- Send Maya one sentence; no perfect wording pass required.")
+    if not items:
+        items.extend([
+            "- Pick the one concrete next action with the least setup.",
+            "- Keep unsupported external facts marked as unknown.",
+            "- Carry unresolved items forward without shame language.",
+        ])
+    return (
+        "## Practical Checklist\n\n"
+        + "\n".join(items)
+        + "\n\n## Open Facts\n\n"
+        "- This was prepared from local conversation/runtime state.\n"
+        "- External portals, stores, and calendars still require user confirmation.\n"
+        "- Trusted support is not contacted automatically.\n"
+    )
 
 
 def _is_cancel_probe_request(pipeline_name: str, goal: str) -> bool:

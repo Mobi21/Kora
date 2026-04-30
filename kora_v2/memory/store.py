@@ -332,6 +332,8 @@ class FilesystemMemoryStore:
         self,
         layer: str = "all",
         domain: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[NoteMetadata]:
         """List note metadata from the specified layer.
 
@@ -339,6 +341,8 @@ class FilesystemMemoryStore:
             layer: ``"long_term"``, ``"user_model"``, or ``"all"`` (default).
             domain: If *layer* is ``"user_model"``, restrict to this domain
                 subdirectory.
+            limit: Optional maximum number of notes to return.
+            newest_first: Return newest filename-sorted notes first.
 
         Returns:
             List of NoteMetadata (no body text — use read_note for full
@@ -358,7 +362,7 @@ class FilesystemMemoryStore:
 
         results: list[NoteMetadata] = []
         for d in dirs:
-            for md_file in sorted(d.rglob("*.md")):
+            for md_file in sorted(d.rglob("*.md"), reverse=newest_first):
                 try:
                     text = md_file.read_text(encoding="utf-8")
                     meta_dict, _body = _parse_frontmatter(text)
@@ -372,6 +376,8 @@ class FilesystemMemoryStore:
                         updated_at=_frontmatter_str(meta_dict.get("updated_at", "")),
                         source_path=str(md_file),
                     ))
+                    if limit is not None and len(results) >= limit:
+                        return results
                 except Exception:
                     logger.warning(
                         "note_parse_error",

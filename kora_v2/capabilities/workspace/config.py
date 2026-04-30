@@ -9,6 +9,7 @@ class WorkspaceConfig(BaseModel):
 
     mcp_server_name: str = "workspace"   # key in settings.mcp.servers
     account: str = "personal"            # "personal" | "work" | user-defined label
+    user_google_email: str = ""          # required by current workspace-mcp tools
     read_only: bool = False              # if True, force-deny all writes regardless of policy
     default_calendar_id: str = "primary"
     provenance_marker: str = "[Created by Kora]"
@@ -23,11 +24,12 @@ class WorkspaceConfig(BaseModel):
         "gmail.get_message":     "get_gmail_message",
         "gmail.draft":           "create_gmail_draft",
         "gmail.send":            "send_gmail_message",
-        "calendar.list":         "list_calendar_events",
-        "calendar.get_event":    "get_calendar_event",
-        "calendar.create_event": "create_calendar_event",
-        "calendar.update_event": "update_calendar_event",
-        "calendar.delete_event": "delete_calendar_event",
+        # Current taylorwilsdon/workspace-mcp calendar tools.
+        "calendar.list":         "get_events",
+        "calendar.get_event":    "get_events",
+        "calendar.create_event": "manage_event",
+        "calendar.update_event": "manage_event",
+        "calendar.delete_event": "manage_event",
         "drive.search":          "search_drive_files",
         "drive.get_file":        "get_drive_file_content",
         "drive.upload":          "upload_drive_file",

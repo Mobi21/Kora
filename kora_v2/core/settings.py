@@ -271,8 +271,8 @@ class VaultSettings(BaseModel):
 
 
 # ── Workspace config default factory ─────────────────────────────────────────
-# Imported lazily via a factory to keep settings.py free of capability imports
-# while still allowing WorkspaceConfig to be declared on Settings.
+# Imported lazily via a factory to avoid importing the capability package while
+# settings.py is still defining MCPSettings, which the MCP manager imports.
 
 def _workspace_config_default() -> Any:
     from kora_v2.capabilities.workspace.config import WorkspaceConfig  # noqa: PLC0415
@@ -343,6 +343,10 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def expand_home_paths(self) -> Self:
         """Expand ``~`` in every path-like field after loading."""
+        from kora_v2.capabilities.workspace.config import WorkspaceConfig  # noqa: PLC0415
+
+        if isinstance(self.workspace, dict):
+            self.workspace = WorkspaceConfig(**self.workspace)
         self.memory.kora_memory_path = str(
             Path(self.memory.kora_memory_path).expanduser()
         )

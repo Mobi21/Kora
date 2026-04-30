@@ -54,6 +54,7 @@ htmlcov/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+*.tsbuildinfo
 
 # --- PyInstaller ---
 *.manifest
@@ -179,6 +180,10 @@ AGENTS.md
 # =============================================================================
 
 src/
+apps/demo-site/
+apps/demo-video/
+!apps/desktop/src/
+!apps/desktop/src/**
 dashboard/
 
 # =============================================================================

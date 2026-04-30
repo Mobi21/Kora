@@ -242,6 +242,22 @@ class LifeLoadEngine:
 
     async def _load_inputs(self, db: aiosqlite.Connection, day: date) -> dict[str, Any]:
         start, end = _day_bounds(day)
+        energy_log = await _fetch_all_if_table(
+            db,
+            "energy_log",
+            "SELECT * FROM energy_log WHERE logged_at >= ? AND logged_at < ?",
+            (start, end),
+        )
+        if not energy_log:
+            # Local-day acceptance runs can straddle UTC midnight. A recent
+            # self-report is still relevant load evidence even when its UTC
+            # date is the next calendar day.
+            energy_log = await _fetch_all_if_table(
+                db,
+                "energy_log",
+                "SELECT * FROM energy_log ORDER BY logged_at DESC LIMIT 1",
+            )
+
         return {
             "calendar_entries": await _fetch_all_if_table(
                 db,
@@ -256,12 +272,7 @@ class LifeLoadEngine:
                 "SELECT * FROM items WHERE status NOT IN "
                 "('done', 'completed', 'cancelled', 'dropped')",
             ),
-            "energy_log": await _fetch_all_if_table(
-                db,
-                "energy_log",
-                "SELECT * FROM energy_log WHERE logged_at >= ? AND logged_at < ?",
-                (start, end),
-            ),
+            "energy_log": energy_log,
             "meal_log": await _fetch_all_if_table(
                 db,
                 "meal_log",

@@ -177,17 +177,33 @@ def _seed_projection_acceptance_fixtures() -> None:
                     "WHERE canonical_name='alex' AND entity_type='person' "
                     "LIMIT 1"
                 ).fetchone()
+                merged_metadata = json.dumps({
+                    "source": "acceptance_fixture",
+                    "merged_from": [
+                        {
+                            "id": "acceptance-alex-alias",
+                            "name": "my partner",
+                            "canonical_name": "partner",
+                            "entity_type": "person",
+                        }
+                    ],
+                })
                 if existing:
+                    db.execute(
+                        "UPDATE entities SET metadata = ? WHERE id = ?",
+                        (merged_metadata, existing[0]),
+                    )
+                else:
                     db.execute(
                         "INSERT OR IGNORE INTO entities "
                         "(id, name, canonical_name, entity_type, metadata) "
                         "VALUES (?, ?, ?, ?, ?)",
                         (
-                            "acceptance-alex-alias",
-                            "alex",
+                            "acceptance-alex",
+                            "Alex",
                             "alex",
                             "person",
-                            '{"source":"acceptance_fixture"}',
+                            merged_metadata,
                         ),
                     )
             memory_dir = ACCEPT_DIR / "memory" / "Long-Term"

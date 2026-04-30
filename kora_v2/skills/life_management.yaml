@@ -31,6 +31,8 @@ tools:
   - create_context_pack
   - bridge_tomorrow
   - set_support_profile_status
+  - enter_stabilization_mode
+  - export_trusted_support
 
 discovery_tools: []
 
@@ -53,6 +55,30 @@ guidance: |
   - create_context_pack prepares scripts, materials, first steps, and fallback plans.
   - bridge_tomorrow creates a shame-safe handoff into the next day.
   - set_support_profile_status activates/disables support profiles; suggested profiles do not affect runtime.
+  - enter_stabilization_mode suppresses optional productivity pressure during overload, burnout, shutdown, or crisis-adjacent moments.
+  - export_trusted_support creates a local draft for the user to review; it never contacts anyone.
+
+  When the user states durable support needs, activate each separate track with
+  set_support_profile_status, not just one umbrella profile:
+  - ADHD/time blindness/avoidance -> adhd
+  - sensory overload/routine disruption/transition load/communication fatigue -> autism_sensory
+  - anxiety/spiraling/dread -> anxiety
+  - burnout/shutdown/low capacity -> burnout
+  - low energy/exhausted/depleted -> low_energy
+
+  Strong Life OS cues:
+  - If the user asks for a day/week plan, create or refresh the day plan after
+    adding the relevant calendar entries/items, then assess_life_load.
+  - If the user says something did not happen, is partial, skipped, blocked,
+    or "actually...", call confirm_reality or correct_reality, then repair_day_plan.
+  - If the user asks for fewer decisions, predictable steps, scripts, appointment
+    prep, or communication help, create_context_pack.
+  - If the user says a nudge is too much, noisy, badly timed, or should stop,
+    call decide_life_nudge and record_nudge_feedback when a decision id is available.
+  - If the user discusses Alex or trusted support, use export_trusted_support
+    only for a user-reviewed draft and explicitly say no contact is made.
+  - If the user is burned out, anxious, shutdown, or planning makes it worse,
+    enter_stabilization_mode before making a normal productivity plan.
 
   Existing life logging tools still matter, but they should feed the Life Event
   Ledger when available:

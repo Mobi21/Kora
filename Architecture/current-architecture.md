@@ -1,6 +1,7 @@
 # Kora Current Architecture
 
 Last verified: 2026-04-28 against the dirty `main` worktree at `d056894`.
+GUI/client refresh: 2026-04-29 against the working desktop/browser dev surface.
 
 This is the public, source-backed architecture snapshot for Kora V2. It was checked against live `kora_v2/` code, recent acceptance artifacts under `/tmp/claude/kora_acceptance`, the Life OS manual probes run during the pivot implementation, and parallel subagent audits. The older deep-dive pages in this folder remain useful, but this file is the current entry point when a page disagrees with live code.
 
@@ -31,6 +32,7 @@ Three acceptance surfaces matter:
 - Life OS acceptance proof collector: `tests/acceptance/life_os.py`, rendered into `tests/acceptance/_report.py`. It is DB/event backed: tool calls alone do not make a scenario green.
 - Manual Life OS probe from the 2026-04-28 implementation pass proved fresh DB init, service resolution, tool registration, support profile bootstrap, day plan creation, reality correction, load assessment, repair actions (`shrink_task`, `add_transition_buffer`), stabilization, nudge suppression, context-pack artifact, future-bridge artifact, crisis preemption, and domain-event restart persistence.
 - Focused tests from the same pass reported `63 passed` across Life OS schema, service, tool, support/safety, and acceptance proof tests.
+- Desktop GUI smoke from 2026-04-29 proved the Vite/browser renderer can discover the local daemon, load the main screens without stuck loading or fetch/CORS failures, and send/receive chat through the actual global chat textarea and daemon WebSocket. The desktop API contract is covered by `tests/unit/test_desktop_api.py`.
 
 Historical/general acceptance surfaces still matter, but they should be read as pre-pivot capability evidence:
 
@@ -41,16 +43,19 @@ The public architecture should therefore say what is implemented and wired, but 
 
 ## System Shape
 
-Kora is a local-first daemon plus Rich CLI companion:
+Kora is a local-first daemon with two working clients: the Electron/React desktop GUI and the Rich CLI.
 
 ```text
-Rich CLI
+Desktop GUI (apps/desktop) or Rich CLI
   -> FastAPI daemon on 127.0.0.1
   -> per-session turn queue
   -> GraphTurnRunner
   -> LangGraph supervisor
   -> tools, memory, workers, capabilities, LLM provider
-  -> WebSocket stream back to CLI
+  -> WebSocket stream back to client
+
+Desktop GUI REST view-models:
+  apps/desktop -> /api/v1/desktop/* -> kora_v2/desktop/service.py
 
 OrchestrationEngine runs beside the turn path:
   TriggerEvaluator -> PipelineRegistry -> Dispatcher -> WorkerTask FSM
@@ -75,9 +80,12 @@ There are no current graph nodes named `plan`, `act`, `review`, or `emit`; those
 
 - launcher and lockfile/token handling,
 - FastAPI REST/WebSocket server,
+- authenticated desktop view-model router mounting `/api/v1/desktop/*`,
 - auth relay,
 - session manager/bridge,
 - daemon lifecycle wiring for memory, workers, phase 4 services, checkpointer, and orchestration.
+
+`kora_v2/desktop/` owns daemon-side desktop view-model assembly. It hides direct SQLite, memory, lockfile, and process details behind stable Pydantic contracts for Today, Calendar, Medication, Routines, Repair, Memory, Autonomous, Integrations, Settings, and Runtime-facing desktop screens.
 
 `kora_v2/runtime/` owns:
 
@@ -212,13 +220,15 @@ Current acceptance health shows the packs are visible, but workspace/browser/vau
 
 `kora_v2/routing/` has no Python files. Routing lives in the supervisor graph, autonomous graph/pipeline factory, worker resolution, tools, and capability bridge.
 
-## LLM, MCP, CLI, Emotion, Quality
+## LLM, MCP, Clients, Emotion, Quality
 
 `kora_v2/llm/` has one real provider abstraction implementation for MiniMax via Anthropic-compatible API. The default model string is `MiniMax-M2.7-highspeed`. `ClaudeCodeDelegate` is a subprocess shim for the `claude` CLI, not a provider subclass.
 
 `kora_v2/mcp/manager.py` supports server definitions, lazy startup, JSON-RPC handshakes, and tool calls. Automatic self-healing is overstated in older docs: `_restart_with_backoff()` exists, but `call_tool()` does not invoke it as the normal failure path.
 
 The CLI has a first-run wizard code path, but current acceptance defers first-run onboarding. Public docs should distinguish implemented code from acceptance-proven behavior.
+
+The desktop GUI lives in `apps/desktop/`. In Electron it discovers the daemon through preload-backed lockfile/token access; in browser dev mode Vite exposes local-only discovery endpoints so the renderer can run at `http://127.0.0.1:5173/`. Both GUI and CLI use the daemon WebSocket for chat.
 
 Emotion remains two-tier PAD assessment: fast rules plus LLM fallback/cache. Notification-related emotion handling should reference `runtime/orchestration/notifications.py`, not a nonexistent `notification_gate.py`.
 

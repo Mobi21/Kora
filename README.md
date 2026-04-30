@@ -32,8 +32,9 @@ Current Life OS pillars:
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  CLIENT                                                  │
-│  Rich CLI (python -m kora_v2.cli) — WebSocket + REST     │
+│  CLIENTS                                                 │
+│  Electron/React desktop GUI - REST view-models + WS chat │
+│  Rich CLI (python -m kora_v2.cli) - WebSocket + REST     │
 └──────────────────────┬───────────────────────────────────┘
                        │
 ┌──────────────────────┴───────────────────────────────────┐
@@ -60,7 +61,8 @@ Current Life OS pillars:
 - **Workers** (`kora_v2/agents/workers/`) — planner, executor, reviewer. Typed Pydantic I/O, shared harness, quality gates.
 - **Filesystem-canonical memory** (`kora_v2/memory/`, `_KoraMemory/`) — markdown notes with YAML frontmatter are the source of truth. SQLite (`projection.db`) is a derived index for fast recall via FTS5 + local embeddings.
 - **Life OS services** (`kora_v2/life/`, `kora_v2/support/`, `kora_v2/safety/`) — day plans, ledger, load meter, repair, proactivity policy, stabilization, context packs, future bridges, support profiles, trusted support exports, and crisis safety.
-- **Daemon + CLI** (`kora_v2/daemon/`, `kora_v2/cli/`) — FastAPI daemon bound to `127.0.0.1`, Rich terminal client over WebSocket.
+- **Desktop GUI** (`apps/desktop/`, `kora_v2/desktop/`) - Electron/React client with typed REST view-models for Life OS screens and global WebSocket chat.
+- **Daemon + CLI** (`kora_v2/daemon/`, `kora_v2/cli/`) - FastAPI daemon bound to `127.0.0.1`, Rich terminal client over WebSocket.
 - **MiniMax M2.7** is the primary LLM (205K context). Claude Code is available as a user-toggled delegate for deep planning and research.
 
 ## Quickstart
@@ -103,7 +105,17 @@ Kora runs as a local daemon. You start the daemon once, then connect a client to
 
 The daemon auto-detaches, writes a lockfile at `data/kora.lock`, and logs to `data/logs/daemon.log`.
 
-**Terminal 2 — chat with her:**
+**Terminal 2 - open the desktop GUI:**
+
+```bash
+cd apps/desktop
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173/` in a browser for renderer development, or run `npm run dev:all` from `apps/desktop/` to launch Vite and Electron together. The desktop GUI uses `/api/v1/desktop/*` REST view-model routes for Today, Calendar, Medication, Routines, Memory, Repair, Autonomous, Integrations, Settings, and Runtime, and keeps chat available globally through the same daemon WebSocket used by the CLI.
+
+**Or use the terminal CLI:**
 
 ```bash
 .venv/bin/python -m kora_v2.cli
@@ -137,6 +149,7 @@ kora_v2/
 ├── context/       # Working-memory loader, compaction, budget
 ├── core/          # DI container, settings, logging, events, DB helpers
 ├── daemon/        # FastAPI server, launcher, lockfile, session mgmt
+├── desktop/       # Desktop API service and view-model assembly
 ├── emotion/       # Two-tier PAD emotion assessment
 ├── graph/         # LangGraph supervisor graph
 ├── life/          # Life OS services: day plans, ledger, load, repair, bridge
@@ -152,6 +165,7 @@ kora_v2/
 └── tools/         # recall(), filesystem, life-management tools, registry
 
 tests/             # unit / integration / acceptance / fixtures
+apps/desktop/      # Electron + React desktop GUI
 _KoraMemory/       # canonical memory (markdown + YAML) — gitignored, created at runtime
 data/              # lockfile, token, logs, databases — gitignored, created at runtime
 ```
@@ -170,6 +184,16 @@ data/              # lockfile, token, logs, databases — gitignored, created at
 
 # Import sanity
 .venv/bin/python -c "import kora_v2"
+
+# Desktop API contract
+.venv/bin/python -m pytest tests/unit/test_desktop_api.py -q
+
+# Desktop GUI checks
+cd apps/desktop
+npm run typecheck
+npm run lint
+npm run test
+npm run build:renderer
 ```
 
 ## Acceptance focus

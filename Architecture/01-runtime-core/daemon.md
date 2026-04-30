@@ -99,6 +99,7 @@ async def run_server(container: Container, token: str) -> None:
 | POST | `/compact` | Token | Force working-memory compaction |
 | GET | `/permissions` | Token | List MCP permission grants |
 | POST | `/auth-mode` | Token | Flip `trust_all` / per-scope auth policy |
+| GET/POST/PATCH | `/desktop/*` | Token | Desktop GUI view-models and preview/apply actions, mounted under `/api/v1/desktop/*` |
 
 ### WebSocket Route
 
@@ -136,8 +137,8 @@ async def _handle_chat(ws, message, container, session_mgr, token):
 
 - Uses `graph.ainvoke()` (not `astream_events`) — MiniMax M2.7 does not support streaming event protocol
 - Checks `_overlap_score`/`_overlap_action` from `_check_autonomous_overlap()` before invoking graph
-- Sends `{"type": "thinking"}` immediately so CLI shows spinner
-- On completion, sends `{"type": "response", "content": ...}` then `{"type": "turn_complete"}`
+- Sends `{"type": "thinking"}` immediately so connected clients can show pending state
+- On completion, sends `{"type": "response", "content": ...}` then `{"type": "response_complete", "metadata": ...}`
 - Greeting is sent on a separate `thread_id` (format: `{session_id}__greeting`) to keep the checkpoint clean
 
 ### Session Greeting
@@ -489,6 +490,7 @@ The one piece of background-aware logic still in `server.py` is `_check_autonomo
 
 | Consumer | What | Transport |
 |----------|------|-----------|
+| `apps/desktop/` | Desktop REST view-models + WebSocket chat | HTTP over 127.0.0.1:{port} |
 | `kora_v2/cli/app.py` | REST + WebSocket API | HTTP over 127.0.0.1:{port} |
 | Lockfile readers | Port + state | `data/kora.lock` (JSON) |
 | `_KoraMemory/System/bridges/` | Bridge notes | Filesystem (YAML + JSON sidecar) |
@@ -508,6 +510,7 @@ The one piece of background-aware logic still in `server.py` is `_check_autonomo
 ```json
 {"type": "thinking"}
 {"type": "response", "content": "assistant message", "session_id": "..."}
+{"type": "response_complete", "session_id": "...", "turn_count": N}
 {"type": "turn_complete", "session_id": "...", "turn_count": N}
 {"type": "auth_request", "scope": "mcp.tool_name", "description": "..."}
 {"type": "pong"}
@@ -519,7 +522,7 @@ The one piece of background-aware logic still in `server.py` is `_check_autonomo
 ## Data Flow: Conversation Turn
 
 ```
-CLI sends {"type": "chat", "content": "..."}
+Desktop GUI or CLI sends {"type": "chat", "content": "..."}
   │
   ▼
 _websocket_handler()
@@ -531,7 +534,7 @@ _websocket_handler()
        ├─ graph.ainvoke(input, config={"thread_id": thread_id})
        │    └─ supervisor graph: receive → build_suffix → think → tool_loop → synthesize
        ├─ ws.send_json({"type": "response", "content": ...})
-       ├─ ws.send_json({"type": "turn_complete", ...})
+       ├─ ws.send_json({"type": "response_complete", ...})
        └─ busy=False → drain queued_messages
 ```
 

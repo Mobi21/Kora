@@ -54,7 +54,7 @@ All subsystems depend on `core/`. `daemon/` is the only subsystem that sees the 
 End-to-end path for a single conversation turn:
 
 ```
-User types in kora_v2/cli/app.py
+User types in apps/desktop global chat or kora_v2/cli/app.py
   │
   │  WebSocket {"type": "chat", "content": "..."}
   ▼
@@ -96,7 +96,7 @@ kora_v2/daemon/server.py  _websocket_handler()
        ├─ _write_trace_complete() → UPDATE turn_traces
        │
        ├─ send {"type": "response", "content": response_content}
-       ├─ send {"type": "turn_complete"}
+       ├─ send {"type": "response_complete"} / {"type": "turn_complete"}
        └─ busy=False → drain queued_messages
 ```
 

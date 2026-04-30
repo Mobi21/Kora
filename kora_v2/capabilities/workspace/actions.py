@@ -21,6 +21,7 @@ from kora_v2.mcp.manager import MCPManager
 log = structlog.get_logger(__name__)
 
 _CAP = "workspace"
+_CURRENT_CALENDAR_TOOLS = {"get_events", "manage_event", "list_calendars", "query_freebusy"}
 
 
 @dataclass
@@ -184,6 +185,31 @@ async def _call_action(
     return {"text": result.text}
 
 
+def _workspace_user_email(ctx: WorkspaceActionContext) -> str:
+    """Return the configured Google account email for current workspace-mcp."""
+    configured = (ctx.config.user_google_email or "").strip()
+    if configured:
+        return configured
+    import os
+
+    return os.environ.get("USER_GOOGLE_EMAIL", "").strip()
+
+
+def _missing_workspace_email(action_name: str) -> StructuredFailure:
+    return StructuredFailure(
+        capability=_CAP,
+        action=action_name,
+        path=f"mcp.workspace.{action_name}",
+        reason="missing_user_google_email",
+        user_message=(
+            "Google Calendar via workspace-mcp requires a configured Google "
+            "account email. Set workspace.user_google_email in ~/.kora/settings.toml "
+            "or export USER_GOOGLE_EMAIL."
+        ),
+        recoverable=True,
+    )
+
+
 # ── Gmail ─────────────────────────────────────────────────────────────────────
 
 
@@ -264,14 +290,19 @@ async def calendar_list(
     approved: bool = False,
 ) -> dict[str, Any] | StructuredFailure:
     """List calendar events."""
-    args: dict[str, Any] = {
-        "calendar_id": calendar_id or ctx.config.default_calendar_id,
-    }
+    action_name = "calendar.list"
+    tool_name = ctx.config.tool_map.get(action_name)
+    args: dict[str, Any] = {"calendar_id": calendar_id or ctx.config.default_calendar_id}
+    if tool_name == "get_events":
+        user_email = _workspace_user_email(ctx)
+        if not user_email:
+            return _missing_workspace_email(action_name)
+        args["user_google_email"] = user_email
     if time_min is not None:
         args["time_min"] = time_min
     if time_max is not None:
         args["time_max"] = time_max
-    return await _call_action(ctx, "calendar.list", args, approved=approved)
+    return await _call_action(ctx, action_name, args, approved=approved)
 
 
 async def calendar_get_event(
@@ -282,9 +313,25 @@ async def calendar_get_event(
     approved: bool = False,
 ) -> dict[str, Any] | StructuredFailure:
     """Get a single calendar event."""
+    action_name = "calendar.get_event"
+    tool_name = ctx.config.tool_map.get(action_name)
+    if tool_name == "get_events":
+        user_email = _workspace_user_email(ctx)
+        if not user_email:
+            return _missing_workspace_email(action_name)
+        return await _call_action(
+            ctx,
+            action_name,
+            {
+                "event_id": event_id,
+                "calendar_id": calendar_id or ctx.config.default_calendar_id,
+                "user_google_email": user_email,
+            },
+            approved=approved,
+        )
     return await _call_action(
         ctx,
-        "calendar.get_event",
+        action_name,
         {
             "event_id": event_id,
             "calendar_id": calendar_id or ctx.config.default_calendar_id,
@@ -305,6 +352,7 @@ async def calendar_create_event(
     approved: bool = False,
 ) -> dict[str, Any] | StructuredFailure:
     """Create a calendar event with Kora provenance markers injected."""
+    action_name = "calendar.create_event"
     raw_args: dict[str, Any] = {
         "summary": summary,
         "start": start,
@@ -319,9 +367,25 @@ async def calendar_create_event(
     # Inject provenance before the MCP call
     args_with_provenance = inject_calendar_create_provenance(raw_args, ctx.config)
 
-    return await _call_action(
-        ctx, "calendar.create_event", args_with_provenance, approved=approved
-    )
+    if ctx.config.tool_map.get(action_name) == "manage_event":
+        user_email = _workspace_user_email(ctx)
+        if not user_email:
+            return _missing_workspace_email(action_name)
+        current_args: dict[str, Any] = {
+            "action": "create",
+            "user_google_email": user_email,
+            "calendar_id": args_with_provenance["calendar_id"],
+            "summary": args_with_provenance["summary"],
+            "start_time": args_with_provenance["start"],
+            "end_time": args_with_provenance["end"],
+        }
+        if args_with_provenance.get("description") is not None:
+            current_args["description"] = args_with_provenance["description"]
+        if attendees is not None:
+            current_args["attendees"] = attendees
+        return await _call_action(ctx, action_name, current_args, approved=approved)
+
+    return await _call_action(ctx, action_name, args_with_provenance, approved=approved)
 
 
 async def calendar_update_event(
@@ -333,9 +397,28 @@ async def calendar_update_event(
     approved: bool = False,
 ) -> dict[str, Any] | StructuredFailure:
     """Update a calendar event (no provenance — spec: calendar edits need no extra marker)."""
+    action_name = "calendar.update_event"
+    if ctx.config.tool_map.get(action_name) == "manage_event":
+        user_email = _workspace_user_email(ctx)
+        if not user_email:
+            return _missing_workspace_email(action_name)
+        current_updates = dict(updates)
+        if "start" in current_updates and "start_time" not in current_updates:
+            current_updates["start_time"] = current_updates.pop("start")
+        if "end" in current_updates and "end_time" not in current_updates:
+            current_updates["end_time"] = current_updates.pop("end")
+        current_updates.update(
+            {
+                "action": "update",
+                "event_id": event_id,
+                "calendar_id": calendar_id or ctx.config.default_calendar_id,
+                "user_google_email": user_email,
+            }
+        )
+        return await _call_action(ctx, action_name, current_updates, approved=approved)
     return await _call_action(
         ctx,
-        "calendar.update_event",
+        action_name,
         {
             "event_id": event_id,
             "updates": updates,
@@ -353,9 +436,25 @@ async def calendar_delete_event(
     approved: bool = False,
 ) -> dict[str, Any] | StructuredFailure:
     """Delete a calendar event (ALWAYS_ASK policy)."""
+    action_name = "calendar.delete_event"
+    if ctx.config.tool_map.get(action_name) == "manage_event":
+        user_email = _workspace_user_email(ctx)
+        if not user_email:
+            return _missing_workspace_email(action_name)
+        return await _call_action(
+            ctx,
+            action_name,
+            {
+                "action": "delete",
+                "event_id": event_id,
+                "calendar_id": calendar_id or ctx.config.default_calendar_id,
+                "user_google_email": user_email,
+            },
+            approved=approved,
+        )
     return await _call_action(
         ctx,
-        "calendar.delete_event",
+        action_name,
         {
             "event_id": event_id,
             "calendar_id": calendar_id or ctx.config.default_calendar_id,

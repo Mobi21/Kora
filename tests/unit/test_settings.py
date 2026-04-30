@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from kora_v2.core.settings import (
     LLMSettings,
+    MCPSettings,
     Settings,
     get_settings,
 )
@@ -17,7 +18,7 @@ class TestDefaultSettings:
 
     def test_default_settings(self):
         """Create Settings() and verify all top-level section defaults."""
-        s = Settings()
+        s = Settings(mcp=MCPSettings(servers={}), vault={"enabled": True, "path": ""})
 
         # LLM defaults
         assert s.llm.provider == "minimax"
@@ -107,14 +108,14 @@ class TestPathExpansion:
 
     def test_kora_memory_path_expanded(self):
         """kora_memory_path should expand ~ to the user's home directory."""
-        s = Settings()
+        s = Settings(vault={"enabled": True, "path": ""})
         home = str(Path.home())
         assert s.memory.kora_memory_path.startswith(home)
         assert "~" not in s.memory.kora_memory_path
 
     def test_api_token_path_expanded(self):
         """api_token_path should not contain ~ after expansion."""
-        s = Settings()
+        s = Settings(vault={"enabled": True, "path": ""})
         # api_token_path defaults to "data/.api_token" (no ~), so no expansion
         # but the validator runs regardless
         assert "~" not in s.security.api_token_path
@@ -128,8 +129,19 @@ class TestPathExpansion:
 
     def test_vault_path_empty_not_expanded(self):
         """vault.path empty string should stay empty (falsy check in validator)."""
-        s = Settings()
+        s = Settings(vault={"enabled": True, "path": ""})
         assert s.vault.path == ""
+
+    def test_workspace_config_is_typed_when_overridden(self):
+        """workspace TOML/env overrides should still produce WorkspaceConfig."""
+        s = Settings(
+            workspace={
+                "mcp_server_name": "workspace",
+                "user_google_email": "user@example.com",
+            }
+        )
+        assert s.workspace.mcp_server_name == "workspace"
+        assert s.workspace.user_google_email == "user@example.com"
 
 
 class TestEnvOverride:

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en" data-theme="warm-neutral" data-density="balanced" data-motion="normal">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Baseline CSP. Authoritative CSP is enforced by the main process via
+      response headers (electron/main.ts installCsp()). The meta below is a
+      defense-in-depth layer for stray network-loaded HTML. Vite's dev plugin
+      replaces this with a permissive dev variant via vite.config.ts so HMR
+      and inline modules work in development.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="<!--CSP_PLACEHOLDER-->" />
+    <title>Kora</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

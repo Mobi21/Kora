@@ -187,6 +187,118 @@ class DayPlanService:
             updated_at=now,
         )
 
+    async def create_reduced_day_plan(self, payload: dict[str, object]) -> DayPlan:
+        """Create a stabilization-sized plan from explicit reduced-plan entries."""
+
+        await self.ensure_schema()
+        now = _now()
+        day = now.date()
+        existing = await self.get_active_day_plan(day)
+        plan_id = _new_id("dp")
+        revision = 1 if existing is None else existing.revision + 1
+        raw_entries = payload.get("entries") if isinstance(payload, dict) else None
+        if not isinstance(raw_entries, list) or not raw_entries:
+            raw_entries = [
+                {"title": "Medication or health basics", "kind": "essential"},
+                {"title": "Food and hydration", "kind": "essential"},
+                {"title": "One required obligation", "kind": "fixed"},
+                {"title": "One recovery action", "kind": "recovery"},
+            ]
+
+        entries: list[DayPlanEntry] = []
+        for raw in raw_entries:
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or "").strip()
+            if not title:
+                continue
+            entries.append(
+                DayPlanEntry(
+                    id=_new_id("dpe"),
+                    day_plan_id=plan_id,
+                    title=title,
+                    entry_type=str(raw.get("kind") or "stabilization"),
+                    support_tags=["stabilization", "low_energy"],
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        summary = _summarize_entries(entries)
+
+        async with aiosqlite.connect(str(self._db_path)) as db:
+            if existing is not None:
+                await db.execute(
+                    """
+                    UPDATE day_plans
+                    SET status = 'superseded', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now.isoformat(), existing.id),
+                )
+            await db.execute(
+                """
+                INSERT INTO day_plans
+                    (id, plan_date, revision, status, supersedes_day_plan_id,
+                     generated_from, load_assessment_id, summary, created_at,
+                     updated_at)
+                VALUES (?, ?, ?, 'active', ?, 'stabilization', NULL, ?, ?, ?)
+                """,
+                (
+                    plan_id,
+                    day.isoformat(),
+                    revision,
+                    existing.id if existing else None,
+                    summary,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            for entry in entries:
+                await _insert_day_plan_entry(db, entry)
+            await db.commit()
+
+        await self._domain_events.append(
+            "DAY_PLAN_CREATED",
+            aggregate_type="day_plan",
+            aggregate_id=plan_id,
+            source_service="DayPlanService",
+            payload={
+                "plan_date": day.isoformat(),
+                "revision": revision,
+                "source": "stabilization",
+                "entry_count": len(entries),
+                "supersedes_day_plan_id": existing.id if existing else None,
+            },
+        )
+        await self._ledger.record_event(
+            RecordLifeEventInput(
+                event_type="day_plan_created",
+                event_time=now,
+                source="tool",
+                title="Reduced day plan created",
+                details=summary,
+                metadata={
+                    "day_plan_id": plan_id,
+                    "plan_date": day.isoformat(),
+                    "revision": revision,
+                    "entry_count": len(entries),
+                    "mode": "stabilization",
+                },
+            )
+        )
+        return DayPlan(
+            id=plan_id,
+            plan_date=day,
+            revision=revision,
+            status=DayPlanStatus.ACTIVE,
+            supersedes_day_plan_id=existing.id if existing else None,
+            generated_from="stabilization",
+            summary=summary,
+            entries=entries,
+            created_at=now,
+            updated_at=now,
+        )
+
     async def mark_entry_reality(
         self,
         entry_id: str,
@@ -488,9 +600,23 @@ async def _calendar_entries_for_day(
         WHERE status != 'cancelled'
           AND starts_at >= ?
           AND starts_at <= ?
+          AND (
+              kind != 'buffer'
+              OR title != 'Transition buffer'
+              OR id IN (
+                  SELECT id FROM calendar_entries
+                  WHERE status != 'cancelled'
+                    AND kind = 'buffer'
+                    AND title = 'Transition buffer'
+                    AND starts_at >= ?
+                    AND starts_at <= ?
+                  ORDER BY starts_at ASC
+                  LIMIT 3
+              )
+          )
         ORDER BY starts_at ASC
         """,
-        (start.isoformat(), end.isoformat()),
+        (start.isoformat(), end.isoformat(), start.isoformat(), end.isoformat()),
     )
     return await cursor.fetchall()
 

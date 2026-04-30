@@ -30,9 +30,14 @@ def _make_ctx(
     account: str = "personal",
     read_only: bool = False,
     mock: MockWorkspaceMCPManager | None = None,
+    user_google_email: str = "user@example.com",
 ) -> tuple[WorkspaceActionContext, MockWorkspaceMCPManager]:
     mock = mock or MockWorkspaceMCPManager()
-    config = WorkspaceConfig(account=account, read_only=read_only)
+    config = WorkspaceConfig(
+        account=account,
+        read_only=read_only,
+        user_google_email=user_google_email,
+    )
     policy = build_default_policy(account=account, read_only=read_only)
     session = SessionState(session_id="test-session")
     task = TaskState(task_id="test-task")
@@ -104,7 +109,7 @@ async def test_calendar_create_event_without_approval() -> None:
 @pytest.mark.asyncio
 async def test_calendar_create_event_with_approval_injects_provenance() -> None:
     ctx, mock = _make_ctx()
-    mock.set_response("create_calendar_event", {"id": "evt-001", "status": "confirmed"})
+    mock.set_response("manage_event", {"id": "evt-001", "status": "confirmed"})
 
     result = await calendar_create_event(
         ctx,
@@ -117,16 +122,16 @@ async def test_calendar_create_event_with_approval_injects_provenance() -> None:
 
     assert not isinstance(result, StructuredFailure), f"Expected success, got: {result}"
     assert len(mock.calls) == 1
-    _server, _tool, call_args = mock.calls[0]
+    _server, tool, call_args = mock.calls[0]
+    assert tool == "manage_event"
+    assert call_args["action"] == "create"
+    assert call_args["user_google_email"] == "user@example.com"
+    assert call_args["start_time"] == "2026-04-10T09:00:00Z"
 
     # Provenance marker should be in the description
     assert "[Created by Kora]" in call_args.get("description", ""), (
         f"Provenance marker missing from description: {call_args.get('description')}"
     )
-    # extendedProperties.private.kora_origin should be set
-    ext = call_args.get("extendedProperties", {})
-    private = ext.get("private", {})
-    assert private.get("kora_origin") == "kora-v2"
 
 
 # ── 5. calendar_delete_event with approved=False returns approval_required ────
@@ -146,7 +151,7 @@ async def test_calendar_delete_event_without_approval() -> None:
 async def test_calendar_delete_event_always_asks_even_after_prior_approval() -> None:
     """ALWAYS_ASK means every call requires approval, not just the first."""
     ctx, mock = _make_ctx()
-    mock.set_response("delete_calendar_event", {"status": "deleted"})
+    mock.set_response("manage_event", {"status": "deleted"})
 
     # First call with approval succeeds
     result1 = await calendar_delete_event(ctx, event_id="evt-001", approved=True)

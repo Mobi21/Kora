@@ -15,11 +15,13 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import structlog
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.table import Table
 
 log = structlog.get_logger(__name__)
 
@@ -28,8 +30,17 @@ MAX_RECONNECT_ATTEMPTS = 5
 HEARTBEAT_INTERVAL = 30  # seconds
 
 # Default paths
-_DEFAULT_LOCKFILE = Path("data/.lockfile")
+_DEFAULT_LOCKFILE = Path("data/kora.lock")
+_LEGACY_LOCKFILE = Path("data/.lockfile")
 _DEFAULT_TOKEN_PATH = Path("data/.api_token")
+
+KORA_BANNER = r"""
+ _  __
+| |/ /___  _ __ __ _
+| ' // _ \| '__/ _` |
+| . \ (_) | | | (_| |
+|_|\_\___/|_|  \__,_|
+"""
 
 
 def calculate_backoff(attempt: int) -> int:
@@ -63,6 +74,14 @@ def format_streaming_token(token: str) -> str:
     reserved for future rendering enhancements.
     """
     return token
+
+
+def format_memory_preview(content: Any, max_chars: int = 240) -> str:
+    """Return a compact one-line memory preview for terminal display."""
+    text = " ".join(str(content).split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3]}..."
 
 
 class KoraCLI:
@@ -99,26 +118,45 @@ class KoraCLI:
 
         # Paths are attributes so tests can patch them easily
         self._lockfile_path: Path = _DEFAULT_LOCKFILE
+        self._legacy_lockfile_path: Path = _LEGACY_LOCKFILE
         self._token_path: Path = _DEFAULT_TOKEN_PATH
 
     # ── Discovery ────────────────────────────────────────────────────────
 
+    def _read_lockfile_data(self) -> dict[str, Any] | None:
+        """Read daemon discovery data from the current or legacy lockfile."""
+        for path in (self._lockfile_path, self._legacy_lockfile_path):
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text())
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
+
     def _discover_port(self) -> int | None:
         """Auto-discover daemon port from lockfile.
 
-        Reads the JSON lockfile written by the daemon launcher.
+        Reads the JSON lockfile written by the daemon launcher. Falls back
+        to the pre-rearchitecture ``data/.lockfile`` path for old dev state.
         Prefers ``api_port`` over ``port`` (legacy fallback).
 
         Returns:
             Port number, or None if lockfile is absent or unreadable.
         """
-        if not self._lockfile_path.exists():
+        data = self._read_lockfile_data()
+        if not data:
             return None
-        try:
-            data = json.loads(self._lockfile_path.read_text())
-            return data.get("api_port") or data.get("port") or None
-        except Exception:
+        return data.get("api_port") or data.get("port") or None
+
+    def _discover_host(self) -> str | None:
+        """Auto-discover daemon host from lockfile data."""
+        data = self._read_lockfile_data()
+        if not data:
             return None
+        return data.get("api_host") or data.get("host") or None
 
     def _read_token(self) -> str | None:
         """Read API token from standard location.
@@ -149,29 +187,38 @@ class KoraCLI:
 
         # Auto-discover if not explicitly set
         port = self.port or self._discover_port()
+        host = self._discover_host() or self.host
         token = self.token or self._read_token()
 
         if not port:
-            self._console.print("[red]Could not find daemon. Is it running?[/red]")
+            self._console.print(
+                "[red]Could not find a running Kora daemon.[/red]\n"
+                "[dim]Try `kora start` first, or use `kora chat` to auto-start it.[/dim]"
+            )
             return False
 
         if not token:
-            self._console.print("[red]Could not find API token.[/red]")
+            self._console.print(
+                "[red]Could not find the local API token.[/red]\n"
+                "[dim]Start the daemon once so Kora can create data/.api_token.[/dim]"
+            )
             return False
 
         # Persist resolved values so REST helpers can use them
+        self.host = host
         self._resolved_port: int = port
         self._resolved_token: str = token
 
-        uri = f"ws://{self.host}:{port}/api/v1/ws?token={token}"
+        uri = f"ws://{host}:{port}/api/v1/ws?token={token}"
 
         try:
             self._ws = await websockets.connect(uri)
-            self._console.print("[green]Connected to Kora[/green]")
-            log.info("cli_connected", host=self.host, port=port)
+            self._console.print(f"[green]Connected to Kora[/green] [dim]{host}:{port}[/dim]")
+            log.info("cli_connected", host=host, port=port)
             return True
         except Exception as e:
-            self._console.print(f"[red]Connection failed: {e}[/red]")
+            self._console.print(f"[red]Connection failed:[/red] {e}")
+            self._console.print("[dim]Run `kora status` or `kora doctor` for daemon details.[/dim]")
             log.warning("cli_connect_failed", error=str(e))
             return False
 
@@ -209,14 +256,7 @@ class KoraCLI:
         """
         self._running = True
 
-        self._console.print(
-            Panel(
-                "[bold]Kora V2[/bold] — ADHD-Aware AI Companion\n"
-                "Type a message or /help for commands.",
-                title="Welcome",
-                border_style="blue",
-            )
-        )
+        self._render_welcome()
 
         if not await self.connect():
             if not await self.reconnect():
@@ -249,6 +289,20 @@ class KoraCLI:
 
         finally:
             await self._cleanup()
+
+    def _render_welcome(self) -> None:
+        """Render the terminal-first welcome panel."""
+        self._console.print(
+            Panel(
+                f"[bold cyan]{KORA_BANNER}[/bold cyan]\n"
+                "[bold]Local-first Life OS CLI[/bold]\n"
+                "Type a message to chat. Use [bold]/help[/bold] for commands, "
+                "[bold]/status[/bold] for runtime state, or [bold]/doctor[/bold] for checks.",
+                title="Kora",
+                subtitle="127.0.0.1 only",
+                border_style="cyan",
+            )
+        )
 
     # ── First-run ────────────────────────────────────────────────────────
 
@@ -304,10 +358,11 @@ class KoraCLI:
 
             self._response_buffer = ""
             self._console.print("[bold green]Kora[/bold green]: ", end="")
+            wait_notice_count = 0
 
             while True:
                 try:
-                    raw = await asyncio.wait_for(self._ws.recv(), timeout=120)
+                    raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
                     data = json.loads(raw)
                     msg_type = data.get("type", "")
 
@@ -321,19 +376,53 @@ class KoraCLI:
 
                     elif msg_type == "tool_start":
                         tool = data.get("content", "")
-                        self._console.print(f"\n  [dim]→ using {tool}...[/dim]", end="")
+                        self._console.print(f"\n[cyan]tool[/cyan] {tool} [dim]started[/dim]")
 
                     elif msg_type == "tool_result":
-                        self._console.print(" [dim]done[/dim]", end="")
+                        tool = data.get("tool_name") or data.get("content") or "tool"
+                        status = data.get("content", "completed")
+                        style = "green" if status == "completed" else "yellow"
+                        self._console.print(f"[{style}]tool[/{style}] {tool} [dim]{status}[/dim]")
 
                     elif msg_type == "response_complete":
-                        self._console.print()  # Newline after streaming
+                        metadata = data.get("metadata", {}) or {}
+                        tool_count = metadata.get("tool_call_count", 0)
+                        turn_count = metadata.get("turn_count")
+                        details = []
+                        if turn_count:
+                            details.append(f"turn {turn_count}")
+                        if tool_count:
+                            details.append(f"{tool_count} tool call(s)")
+                        if metadata.get("compaction_tier"):
+                            details.append(f"memory {metadata['compaction_tier']}")
+                        if details:
+                            self._console.print(f"\n[dim]{' | '.join(details)}[/dim]")
+                        else:
+                            self._console.print()
                         break
 
                     elif msg_type == "error":
                         error = data.get("content", "Unknown error")
                         self._console.print(f"\n[red]Error: {error}[/red]")
+                        self._console.print("[dim]Try /status or /doctor if this looks like a runtime issue.[/dim]")
                         break
+
+                    elif msg_type == "info":
+                        content_msg = data.get("content", "")
+                        if content_msg:
+                            self._console.print(f"\n[blue]info[/blue] {content_msg}")
+
+                    elif msg_type == "notification":
+                        title = data.get("title") or data.get("content") or "Notification"
+                        self._console.print(f"\n[magenta]notice[/magenta] {title}")
+
+                    elif msg_type == "autonomous_checkpoint":
+                        steps = data.get("steps_completed", 0)
+                        self._console.print(f"\n[blue]plan[/blue] checkpoint saved ({steps} step(s) done)")
+
+                    elif msg_type == "autonomous_failed":
+                        reason = data.get("reason", "unknown")
+                        self._console.print(f"\n[yellow]plan paused[/yellow] {reason}")
 
                     elif msg_type == "ping":
                         # Respond to server heartbeat
@@ -384,7 +473,12 @@ class KoraCLI:
                             self._console.print("  [red]Denied[/red]")
 
                 except TimeoutError:
-                    self._console.print("\n[yellow]Response timed out.[/yellow]")
+                    wait_notice_count += 1
+                    if wait_notice_count <= 6:
+                        self._console.print("\n[dim]still working...[/dim]", end="")
+                        continue
+                    self._console.print("\n[yellow]Response timed out after 70s.[/yellow]")
+                    self._console.print("[dim]The daemon may still be busy; /status can confirm it is alive.[/dim]")
                     break
 
         except Exception as e:
@@ -422,6 +516,8 @@ class KoraCLI:
         import httpx
 
         try:
+            if not (getattr(self, "_resolved_port", None) or self.port or self._discover_port()):
+                return None
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     self._rest_url(path),
@@ -443,6 +539,8 @@ class KoraCLI:
         import httpx
 
         try:
+            if not (getattr(self, "_resolved_port", None) or self.port or self._discover_port()):
+                return None
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
                     self._rest_url(path),
@@ -469,20 +567,7 @@ class KoraCLI:
             return False
 
         elif command == "help":
-            self._console.print(
-                Panel(
-                    "/status      — system status\n"
-                    "/stop        — stop daemon\n"
-                    "/memory      — search memories\n"
-                    "/plan        — show active plan\n"
-                    "/compact     — force compaction\n"
-                    "/permissions — show granted permissions\n"
-                    "/quit        — exit CLI\n"
-                    "/help        — show this help",
-                    title="Commands",
-                    border_style="blue",
-                )
-            )
+            self._cmd_help()
 
         elif command == "status":
             await self._cmd_status()
@@ -503,6 +588,12 @@ class KoraCLI:
         elif command == "permissions":
             await self._cmd_permissions()
 
+        elif command == "doctor":
+            await self._cmd_doctor()
+
+        elif command == "setup":
+            await self._cmd_setup()
+
         else:
             self._console.print(f"[red]Unknown command: /{command}[/red]")
             self._console.print("[dim]Type /help for available commands.[/dim]")
@@ -511,22 +602,58 @@ class KoraCLI:
 
     # ── Command implementations ─────────────────────────────────────────
 
+    def _cmd_help(self) -> None:
+        """Display CLI commands grouped by use."""
+        self._console.print(
+            Panel(
+                "[bold]Chat[/bold]\n"
+                "  /status       Show daemon, session, tools, and orchestration state\n"
+                "  /doctor       Run runtime checks and separate core from optional issues\n"
+                "  /help         Show this help\n"
+                "  /quit         Exit the CLI\n\n"
+                "[bold]Life OS[/bold]\n"
+                "  /memory QUERY Search local memory metadata with a harmless query\n"
+                "  /plan         Show active autonomous plans or queued work\n"
+                "  /compact      Request conversation compaction on the next turn\n\n"
+                "[bold]Control[/bold]\n"
+                "  /permissions  Show recent permission grants\n"
+                "  /setup        Show local paths and setup hints\n"
+                "  /stop         Stop the daemon and exit",
+                title="Commands",
+                border_style="cyan",
+            )
+        )
+
     async def _cmd_status(self) -> None:
         """Fetch and display system status from the daemon."""
-        from rich.table import Table
-
-        data = await self._rest_get("/api/v1/status")
-        if not data:
-            self._console.print("[red]Cannot reach daemon[/red]")
+        status = await self._rest_get("/api/v1/status")
+        if not status:
+            self._console.print("[red]Cannot reach daemon.[/red]")
+            self._console.print("[dim]Run `kora start`, then retry /status.[/dim]")
             return
 
-        table = Table(title="Kora Status", show_header=True)
+        tools = await self._rest_get("/api/v1/inspect/tools") or {}
+        orchestration = await self._rest_get("/api/v1/orchestration/status") or {}
+        lock = self._read_lockfile_data() or {}
+
+        table = Table(title="Kora Status", show_header=True, header_style="bold cyan")
         table.add_column("Field", style="cyan")
         table.add_column("Value")
-        for key, val in data.items():
-            if isinstance(val, list):
-                val = ", ".join(str(v) for v in val) if val else "none"
-            table.add_row(str(key), str(val))
+        table.add_row("daemon", str(status.get("status", "unknown")))
+        table.add_row("pid", str(lock.get("pid", "unknown")))
+        table.add_row("endpoint", f"{self.host}:{getattr(self, '_resolved_port', None) or self.port or self._discover_port()}")
+        table.add_row("version", str(status.get("version", "unknown")))
+        table.add_row("session", "active" if status.get("session_active") else "not active")
+        table.add_row("turn_count", str(status.get("turn_count", 0)))
+        failed = status.get("failed_subsystems") or []
+        table.add_row("degraded_subsystems", ", ".join(failed) if failed else "none")
+        table.add_row("skill_loader", "ready" if tools.get("skill_loader_initialized") else "unavailable")
+        table.add_row("skills", str(tools.get("skill_count", 0)))
+        mcp = tools.get("mcp", {}) if isinstance(tools.get("mcp", {}), dict) else {}
+        table.add_row("mcp", "initialized" if mcp.get("initialized") else "not initialized or lazy")
+        table.add_row("pipelines", str(len(orchestration.get("pipelines", []))))
+        table.add_row("live_tasks", str(len(orchestration.get("live_tasks", []))))
+        table.add_row("open_decisions", str(orchestration.get("open_decisions_count", 0)))
         self._console.print(table)
 
     async def _cmd_stop(self) -> None:
@@ -548,17 +675,30 @@ class KoraCLI:
     async def _cmd_memory(self, query: str = "") -> None:
         """Search and display memory notes."""
         q = query.strip() or "recent"
-        data = await self._rest_get(f"/api/v1/memory/recall?q={q}")
+        data = await self._rest_get(f"/api/v1/memory/recall?{urlencode({'q': q})}")
         if not data:
             self._console.print("[dim]No memory results[/dim]")
+            return
+        if data.get("error"):
+            self._console.print(f"[yellow]Memory unavailable:[/yellow] {data['error']}")
             return
         results = data.get("results", [])
         if not results:
             self._console.print("[dim]No matching memories[/dim]")
             return
         for r in results:
+            preview = format_memory_preview(r.get("content", r))
+            note_id = str(r.get("id", ""))
+            tags = r.get("tags", [])
+            metadata = []
+            if note_id:
+                metadata.append(f"id={note_id[:12]}")
+            if tags:
+                metadata.append("tags=" + ", ".join(str(t) for t in tags[:4]))
+            if metadata:
+                preview = f"{preview}\n\n[dim]{' | '.join(metadata)}[/dim]"
             self._console.print(Panel(
-                str(r.get("content", r)),
+                preview,
                 title=str(r.get("source", "Memory")),
                 border_style="blue",
             ))
@@ -585,7 +725,10 @@ class KoraCLI:
         """Trigger manual conversation compaction."""
         data = await self._rest_post("/api/v1/compact")
         if data:
-            self._console.print(f"[green]Compaction: {data.get('status', 'done')}[/green]")
+            self._console.print(
+                f"[green]Compaction requested:[/green] {data.get('status', 'done')}\n"
+                "[dim]Kora will apply it on the next turn; no external files are touched here.[/dim]"
+            )
         else:
             self._console.print("[red]Compaction failed[/red]")
 
@@ -610,6 +753,71 @@ class KoraCLI:
                 g.get("decision", ""),
                 g.get("granted_at", ""),
             )
+        self._console.print(table)
+
+    async def _cmd_doctor(self) -> None:
+        """Run and display runtime doctor checks."""
+        data = await self._rest_get("/api/v1/inspect/doctor")
+        if not data:
+            self._console.print("[red]Doctor unavailable: cannot reach daemon.[/red]")
+            return
+
+        healthy = data.get("healthy", False)
+        style = "green" if healthy else "yellow"
+        self._console.print(
+            Panel(
+                data.get("summary", "no summary"),
+                title=f"Doctor {'OK' if healthy else 'Needs Attention'}",
+                border_style=style,
+            )
+        )
+
+        optional_markers = (
+            "agent_browser",
+            "vault_",
+            "mcp_",
+            "sentence_transformers",
+            "sqlite_vec",
+            "capability_browser",
+            "capability_vault",
+            "capability_workspace",
+        )
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Area")
+        table.add_column("Check")
+        table.add_column("Result")
+        table.add_column("Detail")
+        for check in data.get("checks", []):
+            name = str(check.get("name", "unknown"))
+            passed = bool(check.get("passed"))
+            optional = any(marker in name for marker in optional_markers)
+            area = "optional" if optional else "core"
+            result = "[green]pass[/green]" if passed else "[red]fail[/red]"
+            table.add_row(area, name, result, str(check.get("detail", "")))
+        self._console.print(table)
+
+    async def _cmd_setup(self) -> None:
+        """Show local setup paths without exposing secrets."""
+        data = await self._rest_get("/api/v1/inspect/setup")
+        lock = self._read_lockfile_data() or {}
+
+        table = Table(title="Local Setup", show_header=True, header_style="bold cyan")
+        table.add_column("Item", style="cyan")
+        table.add_column("Value")
+        table.add_row("lockfile", str(self._lockfile_path))
+        table.add_row("legacy_lockfile", str(self._legacy_lockfile_path))
+        table.add_row("api_token_file", str(self._token_path))
+        table.add_row("daemon_pid", str(lock.get("pid", "unknown")))
+        table.add_row("daemon_state", str(lock.get("state", "unknown")))
+        if data:
+            table.add_row("data_dir", str(data.get("data_dir", "")))
+            memory = data.get("memory", {}) if isinstance(data.get("memory"), dict) else {}
+            table.add_row("memory_path", str(memory.get("path", "")))
+            security = data.get("security", {}) if isinstance(data.get("security"), dict) else {}
+            table.add_row("token_file_exists", str(security.get("token_file_exists", False)))
+            table.add_row("auth_mode", str(security.get("auth_mode", "")))
+        else:
+            table.add_row("daemon_api", "unreachable")
         self._console.print(table)
 
     # ── Cleanup ──────────────────────────────────────────────────────────

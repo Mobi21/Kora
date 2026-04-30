@@ -19,18 +19,26 @@ LIFE_OS_TOOL_NAMES = {
     "create_day_plan",
     "record_life_event",
     "confirm_life_event",
+    "confirm_reality",
     "correct_life_event",
+    "correct_reality",
     "repair_day",
+    "repair_day_plan",
     "apply_repair_action",
     "assess_life_load",
     "decide_nudge",
+    "decide_life_nudge",
     "record_nudge_feedback",
     "build_context_pack",
+    "create_context_pack",
     "enter_stabilization_mode",
     "build_future_self_bridge",
+    "bridge_tomorrow",
     "activate_support_profile",
+    "set_support_profile_status",
     "export_trusted_support",
     "assess_crisis_safety",
+    "check_crisis_boundary",
 }
 
 
@@ -415,6 +423,7 @@ class LifeOSProofCollector:
                     "activate_support_profile",
                     "assess_life_load",
                     "repair_day",
+                    "repair_day_plan",
                     "create_reminder",
                     "start_focus_block",
                     "end_focus_block",
@@ -429,7 +438,9 @@ class LifeOSProofCollector:
                     table="life_events",
                     where=(
                         "event_type IN ('avoidance', 'missed_meal', 'missed_task', "
-                        "'medication', 'focus_block', 'time_blindness')"
+                        "'medication', 'medication_taken', 'meal_logged', "
+                        "'focus_block', 'focus_block_started', 'focus_block_ended', "
+                        "'quick_note_captured', 'low_energy', 'time_blindness')"
                     ),
                     columns=("event_type",),
                     source="life_events.event_type",
@@ -438,6 +449,7 @@ class LifeOSProofCollector:
                     conn,
                     "ADHD support events",
                     "SUPPORT_SIGNAL_DETECTED",
+                    "SUPPORT_PROFILE_SIGNAL_RECORDED",
                     "PLAN_REALITY_DIVERGED",
                     "DAY_PLAN_REPAIRED",
                 ),
@@ -457,6 +469,7 @@ class LifeOSProofCollector:
                     "assess_life_load",
                     "enter_stabilization_mode",
                     "build_context_pack",
+                    "create_context_pack",
                 },
             ),
             evidence=(
@@ -481,6 +494,7 @@ class LifeOSProofCollector:
                     conn,
                     "sensory support events",
                     "SUPPORT_SIGNAL_DETECTED",
+                    "SUPPORT_PROFILE_SIGNAL_RECORDED",
                     "STABILIZATION_MODE_ENTERED",
                     "CONTEXT_PACK_READY",
                 ),
@@ -500,6 +514,7 @@ class LifeOSProofCollector:
                     "assess_life_load",
                     "enter_stabilization_mode",
                     "repair_day",
+                    "repair_day_plan",
                 },
             ),
             evidence=(
@@ -531,6 +546,8 @@ class LifeOSProofCollector:
                     "STABILIZATION_MODE_ENTERED",
                     "DAY_PLAN_REPAIRED",
                     "SUPPORT_SIGNAL_DETECTED",
+                    "SUPPORT_PROFILE_SIGNAL_RECORDED",
+                    "SUPPORT_PROFILE_STATUS_CHANGED",
                 ),
             ),
         )
@@ -547,6 +564,8 @@ class LifeOSProofCollector:
                     "record_life_event",
                     "confirm_life_event",
                     "correct_life_event",
+                    "confirm_reality",
+                    "correct_reality",
                 },
             ),
             evidence=(
@@ -566,7 +585,9 @@ class LifeOSProofCollector:
                     where=(
                         "reality_state IS NOT NULL "
                         "AND reality_state IN ('done', 'partial', 'skipped', "
-                        "'blocked', 'corrected', 'rejected')"
+                        "'blocked', 'corrected', 'rejected', 'confirmed_done', "
+                        "'confirmed_partial', 'confirmed_skipped', "
+                        "'confirmed_blocked', 'rejected_inference')"
                     ),
                     columns=("reality_state",),
                     source="day_plan_entries.reality_state",
@@ -581,7 +602,7 @@ class LifeOSProofCollector:
             key="repair_day",
             title="Repair The Day",
             tool_calls=self._tool_evidence(
-                tool_calls, {"repair_day", "apply_repair_action"}
+                tool_calls, {"repair_day", "repair_day_plan", "apply_repair_action"}
             ),
             evidence=(
                 self._evidence_count(
@@ -625,7 +646,10 @@ class LifeOSProofCollector:
                     conn, label="future bridge row", table="future_self_bridges"
                 ),
                 self._event_evidence(
-                    conn, "future bridge domain event", "FUTURE_SELF_BRIDGE_READY"
+                    conn,
+                    "future bridge domain event",
+                    "FUTURE_SELF_BRIDGE_READY",
+                    "FUTURE_SELF_BRIDGE_CREATED",
                 ),
             ),
         )
@@ -637,7 +661,15 @@ class LifeOSProofCollector:
             key="wrong_inference_recovery",
             title="Wrong Inference Recovery",
             tool_calls=self._tool_evidence(
-                tool_calls, {"correct_life_event", "repair_day", "activate_support_profile"}
+                tool_calls,
+                {
+                    "correct_life_event",
+                    "correct_reality",
+                    "repair_day",
+                    "repair_day_plan",
+                    "activate_support_profile",
+                    "set_support_profile_status",
+                },
             ),
             evidence=(
                 self._event_evidence(
@@ -646,12 +678,13 @@ class LifeOSProofCollector:
                     "LIFE_EVENT_CORRECTED",
                     "WRONG_INFERENCE_REPAIRED",
                     "SUPPORT_PROFILE_CORRECTED",
+                    "SUPPORT_PROFILE_SIGNAL_RECORDED",
                 ),
                 self._evidence_count(
                     conn,
                     label="corrected reality state",
                     table="day_plan_entries",
-                    where="reality_state IN ('corrected', 'rejected')",
+                    where="reality_state IN ('corrected', 'rejected', 'rejected_inference')",
                     columns=("reality_state",),
                     source="day_plan_entries.reality_state",
                 ),
@@ -682,6 +715,8 @@ class LifeOSProofCollector:
                     "trusted support event",
                     "TRUSTED_SUPPORT_EXPORT_CREATED",
                     "TRUSTED_SUPPORT_CONSENT_RECORDED",
+                    "TRUSTED_SUPPORT_EXPORT_DRAFTED",
+                    "TRUSTED_SUPPORT_EXPORT_REVIEWED",
                 ),
             ),
         )
@@ -722,7 +757,9 @@ class LifeOSProofCollector:
                     conn,
                     "support domain event",
                     "SUPPORT_SIGNAL_DETECTED",
+                    "SUPPORT_PROFILE_SIGNAL_RECORDED",
                     "SUPPORT_PROFILE_ACTIVATED",
+                    "SUPPORT_PROFILE_STATUS_CHANGED",
                 ),
             ),
         )
@@ -736,7 +773,10 @@ class LifeOSProofCollector:
             tool_calls=self._tool_evidence(tool_calls, {"assess_crisis_safety"}),
             evidence=(
                 self._event_evidence(
-                    conn, "crisis boundary domain event", "SAFETY_BOUNDARY_TRIGGERED"
+                    conn,
+                    "crisis boundary domain event",
+                    "SAFETY_BOUNDARY_TRIGGERED",
+                    "CRISIS_SAFETY_PREEMPTED",
                 ),
                 self._crisis_no_normal_workflow_evidence(conn),
             ),
@@ -752,7 +792,12 @@ class LifeOSProofCollector:
                 source="domain_events",
                 detail="missing domain event surface",
             )
-        crisis_count = self._domain_event_count(conn, "SAFETY_BOUNDARY_TRIGGERED") or 0
+        crisis_count = (
+            self._domain_event_count(
+                conn, "SAFETY_BOUNDARY_TRIGGERED", "CRISIS_SAFETY_PREEMPTED"
+            )
+            or 0
+        )
         if crisis_count == 0:
             return LifeOSEvidence(
                 label="normal workflow suppressed",
@@ -805,6 +850,9 @@ class LifeOSProofCollector:
             )
             if result is None and self._has_table(table)
         ]
+        if "nudge_decisions" in missing_link_tables:
+            nudge_result = self._unlinked_non_suppressed_nudge_count(conn)
+            missing_link_tables.remove("nudge_decisions")
         if missing_link_tables:
             return LifeOSEvidence(
                 label="normal workflow suppressed",
@@ -828,6 +876,20 @@ class LifeOSProofCollector:
             ),
         )
 
+    def _unlinked_non_suppressed_nudge_count(self, conn: sqlite3.Connection) -> int:
+        if not self._has_table("nudge_decisions"):
+            return 0
+        if not self._has_columns("nudge_decisions", "decision"):
+            return 0
+        return self._count_where(
+            conn,
+            "nudge_decisions",
+            (
+                "decision NOT IN ('suppress', 'suppressed', 'defer', "
+                "'deferred', 'queue', 'queued')"
+            ),
+        )
+
     def _crisis_event_identifiers(
         self, conn: sqlite3.Connection
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -842,6 +904,11 @@ class LifeOSProofCollector:
             f"SELECT {', '.join(columns)} FROM domain_events WHERE event_type = ?",
             ("SAFETY_BOUNDARY_TRIGGERED",),
         ).fetchall()
+        if not rows:
+            rows = conn.execute(
+                f"SELECT {', '.join(columns)} FROM domain_events WHERE event_type = ?",
+                ("CRISIS_SAFETY_PREEMPTED",),
+            ).fetchall()
         event_ids = tuple(
             str(row["id"]) for row in rows if "id" in row.keys() and row["id"]
         )
@@ -886,7 +953,7 @@ class LifeOSProofCollector:
             key="proactivity_suppression",
             title="Proactivity Suppression",
             tool_calls=self._tool_evidence(
-                tool_calls, {"decide_nudge", "record_nudge_feedback"}
+                tool_calls, {"decide_nudge", "decide_life_nudge", "record_nudge_feedback"}
             ),
             evidence=(
                 self._evidence_count(
@@ -904,6 +971,7 @@ class LifeOSProofCollector:
                     "nudge decision domain event",
                     "NUDGE_DECISION_RECORDED",
                     "NUDGE_FEEDBACK_RECEIVED",
+                    "NUDGE_FEEDBACK_RECORDED",
                 ),
             ),
         )
@@ -914,7 +982,7 @@ class LifeOSProofCollector:
         return LifeOSScenarioProof(
             key="context_packs",
             title="Context Packs",
-            tool_calls=self._tool_evidence(tool_calls, {"build_context_pack"}),
+            tool_calls=self._tool_evidence(tool_calls, {"build_context_pack", "create_context_pack"}),
             evidence=(
                 self._evidence_count(conn, label="context pack row", table="context_packs"),
                 self._event_evidence(

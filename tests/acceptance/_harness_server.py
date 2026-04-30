@@ -137,6 +137,39 @@ def _rest_get(path: str, port: int, host: str, token: str) -> dict[str, Any] | N
         return {"error": str(e)}
 
 
+def _turn_trace_tool_counts(db_path: Path) -> dict[str, int]:
+    """Return persisted GUI/daemon tool counts from ``turn_traces``."""
+    if not db_path.exists():
+        return {}
+    try:
+        import sqlite3
+    except ImportError:
+        return {}
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT tools_invoked FROM turn_traces WHERE tools_invoked IS NOT NULL"
+            ).fetchall()
+    except Exception:
+        return {}
+    counts: dict[str, int] = {}
+    for (raw_tools,) in rows:
+        try:
+            tools = json.loads(raw_tools or "[]")
+        except Exception:
+            continue
+        if not isinstance(tools, list):
+            continue
+        for raw_name in tools:
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            if name.startswith("[auth:"):
+                name = name.split(":")[1].rstrip("]").split(":")[0]
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
 # ── Test data cleanup ────────────────────────────────────────────────────────
 
 # Tables that must be cleared between acceptance test runs.
@@ -2944,6 +2977,8 @@ class HarnessServer:
                 if name.startswith("[auth:"):
                     name = name.split(":")[1].rstrip("]").split(":")[0]
                 tool_counts[name] = tool_counts.get(name, 0) + 1
+        for name, count in _turn_trace_tool_counts(PROJECT_ROOT / "data" / "operational.db").items():
+            tool_counts[name] = tool_counts.get(name, 0) + count
 
         return {
             "total_tool_calls": sum(tool_counts.values()),

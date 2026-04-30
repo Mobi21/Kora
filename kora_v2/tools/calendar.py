@@ -293,7 +293,20 @@ async def _load_entries_between(
 
     merged = [*direct_entries, *expanded]
     merged.sort(key=lambda e: e.starts_at)
-    return merged
+    return _cap_transition_buffers(merged)
+
+
+def _cap_transition_buffers(entries: list[CalendarEntry]) -> list[CalendarEntry]:
+    """Keep repair-generated buffers from drowning real calendar state."""
+    result: list[CalendarEntry] = []
+    transition_buffers = 0
+    for entry in entries:
+        if entry.kind == "buffer" and entry.title == "Transition buffer":
+            transition_buffers += 1
+            if transition_buffers > 3:
+                continue
+        result.append(entry)
+    return result
 
 
 # ── Buffer auto-insertion ────────────────────────────────────────────────────
@@ -372,6 +385,7 @@ class CalendarSync:
 
     def __init__(self, container: Any):
         self._container = container
+        self.last_error: str | None = None
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -383,29 +397,57 @@ class CalendarSync:
         Returns the list of upserted entry dicts. No-op if the Google
         Calendar MCP server is not configured/available.
         """
+        self.last_error = None
         mcp = self._get_mcp()
         if mcp is None:
+            self.last_error = "Google Calendar MCP server is not configured."
             return []
+        server_name = self._server_name()
+        if server_name is None:
+            self.last_error = "Google Calendar MCP server is not configured."
+            return []
+        user_email = self._user_google_email()
         try:
-            result = await mcp.call_tool(
-                "google_calendar",
-                "list_events",
-                {
-                    "time_min": since.isoformat(),
-                    "time_max": until.isoformat(),
-                },
-            )
+            if server_name == "google_calendar":
+                result = await mcp.call_tool(
+                    server_name,
+                    "list_events",
+                    {
+                        "time_min": since.isoformat(),
+                        "time_max": until.isoformat(),
+                    },
+                )
+            else:
+                if not user_email:
+                    self.last_error = (
+                        "Google Calendar MCP requires workspace.user_google_email "
+                        "or USER_GOOGLE_EMAIL."
+                    )
+                    return []
+                result = await mcp.call_tool(
+                    server_name,
+                    "get_events",
+                    {
+                        "user_google_email": user_email,
+                        "calendar_id": self._default_calendar_id(),
+                        "time_min": since.isoformat(),
+                        "time_max": until.isoformat(),
+                    },
+                )
         except Exception as exc:
             log.debug("google_calendar_pull_failed", error=str(exc))
+            self.last_error = str(exc)
             return []
-        try:
-            payload = json.loads(result.text) if hasattr(result, "text") else []
-        except (json.JSONDecodeError, TypeError):
-            return []
+        payload = _mcp_payload(result)
         if isinstance(payload, list):
             items: list[Any] = payload
         elif isinstance(payload, dict):
-            items = payload.get("items", []) or []
+            items = (
+                payload.get("items")
+                or payload.get("events")
+                or payload.get("results")
+                or []
+            )
         else:
             items = []
 
@@ -435,25 +477,51 @@ class CalendarSync:
         """
         if entry.source == "google":
             return entry.google_event_id
+        self.last_error = None
         mcp = self._get_mcp()
         if mcp is None:
+            self.last_error = "Google Calendar MCP server is not configured."
             return None
-        payload = _entry_to_google_event(entry)
+        server_name = self._server_name()
+        if server_name is None:
+            self.last_error = "Google Calendar MCP server is not configured."
+            return None
+        if self._workspace_read_only():
+            self.last_error = "Google Calendar sync is configured read-only."
+            return None
+        user_email = self._user_google_email()
         try:
-            result = await mcp.call_tool(
-                "google_calendar", "create_event", payload
-            )
-            data = json.loads(result.text) if hasattr(result, "text") else {}
+            if server_name == "google_calendar":
+                result = await mcp.call_tool(
+                    server_name, "create_event", _entry_to_google_event(entry)
+                )
+            else:
+                if not user_email:
+                    self.last_error = (
+                        "Google Calendar MCP requires workspace.user_google_email "
+                        "or USER_GOOGLE_EMAIL."
+                    )
+                    return None
+                result = await mcp.call_tool(
+                    server_name,
+                    "manage_event",
+                    _entry_to_workspace_event(
+                        entry,
+                        user_email,
+                        self._default_calendar_id(),
+                    ),
+                )
+            data = _mcp_payload(result)
             return data.get("id") if isinstance(data, dict) else None
         except Exception as exc:
             log.debug("google_calendar_push_failed", error=str(exc))
+            self.last_error = str(exc)
             return None
 
     # ── Internal ──────────────────────────────────────────────────
 
     def _get_mcp(self):
-        """Return the MCP manager iff the google_calendar server is
-        configured and the overall sync is enabled."""
+        """Return the MCP manager iff a calendar-capable MCP server is configured."""
         settings = getattr(self._container, "settings", None)
         if settings is None:
             return None
@@ -461,9 +529,41 @@ class CalendarSync:
         if mcp_cfg is None:
             return None
         servers = getattr(mcp_cfg, "servers", {}) or {}
-        if "google_calendar" not in servers:
+        if self._server_name() not in servers:
             return None
         return getattr(self._container, "mcp_manager", None)
+
+    def _server_name(self) -> str | None:
+        settings = getattr(self._container, "settings", None)
+        mcp_cfg = getattr(settings, "mcp", None) if settings is not None else None
+        servers = getattr(mcp_cfg, "servers", {}) if mcp_cfg is not None else {}
+        workspace_cfg = getattr(settings, "workspace", None) if settings is not None else None
+        configured = getattr(workspace_cfg, "mcp_server_name", "workspace")
+        if configured in servers:
+            return configured
+        if "google_calendar" in servers:
+            return "google_calendar"
+        return None
+
+    def _user_google_email(self) -> str:
+        settings = getattr(self._container, "settings", None)
+        workspace_cfg = getattr(settings, "workspace", None) if settings is not None else None
+        configured = getattr(workspace_cfg, "user_google_email", "") or ""
+        if configured:
+            return str(configured).strip()
+        import os
+
+        return os.environ.get("USER_GOOGLE_EMAIL", "").strip()
+
+    def _default_calendar_id(self) -> str:
+        settings = getattr(self._container, "settings", None)
+        workspace_cfg = getattr(settings, "workspace", None) if settings is not None else None
+        return str(getattr(workspace_cfg, "default_calendar_id", "primary") or "primary")
+
+    def _workspace_read_only(self) -> bool:
+        settings = getattr(self._container, "settings", None)
+        workspace_cfg = getattr(settings, "workspace", None) if settings is not None else None
+        return bool(getattr(workspace_cfg, "read_only", False))
 
 
 def _google_event_to_entry(evt: dict[str, Any]) -> CalendarEntry | None:
@@ -530,6 +630,44 @@ def _entry_to_google_event(entry: CalendarEntry) -> dict[str, Any]:
     if entry.recurring_rule:
         payload["recurrence"] = [f"RRULE:{entry.recurring_rule}"]
     return payload
+
+
+def _entry_to_workspace_event(
+    entry: CalendarEntry, user_google_email: str, calendar_id: str = "primary"
+) -> dict[str, Any]:
+    """Build the current workspace-mcp ``manage_event`` create payload."""
+    google_payload = _entry_to_google_event(entry)
+    payload: dict[str, Any] = {
+        "action": "create",
+        "user_google_email": user_google_email,
+        "calendar_id": calendar_id,
+        "summary": google_payload["summary"],
+        "start_time": google_payload["start"]["dateTime"],
+    }
+    end = google_payload.get("end")
+    if isinstance(end, dict) and end.get("dateTime"):
+        payload["end_time"] = end["dateTime"]
+    if google_payload.get("description"):
+        payload["description"] = google_payload["description"]
+    if google_payload.get("location"):
+        payload["location"] = google_payload["location"]
+    if google_payload.get("recurrence"):
+        payload["recurrence"] = google_payload["recurrence"]
+    return payload
+
+
+def _mcp_payload(result: Any) -> Any:
+    """Return structured MCP data, falling back to JSON text when present."""
+    structured = getattr(result, "structured_data", None)
+    if structured is not None:
+        return structured
+    text = getattr(result, "text", "")
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 async def _upsert_google_entry(
@@ -953,16 +1091,15 @@ async def sync_google_calendar(
     since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     until = since + timedelta(days=max(1, input.days_ahead))
     upserted = await sync.pull_range(since, until)
+    message = f"Pulled {len(upserted)} event(s) from Google Calendar"
+    if not upserted:
+        message = sync.last_error or "Google Calendar returned no events"
     return _ok(
         {
             "pulled": len(upserted),
             "since": since.isoformat(),
             "until": until.isoformat(),
-            "message": (
-                f"Pulled {len(upserted)} event(s) from Google Calendar"
-                if upserted
-                else "Google Calendar sync is not configured or returned no events"
-            ),
+            "message": message,
         }
     )
 

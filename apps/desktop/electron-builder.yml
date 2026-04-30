@@ -1,0 +1,112 @@
+# electron-builder configuration for the Kora desktop app.
+# See: https://www.electron.build/configuration/configuration
+#
+# Strategy:
+#   - We do NOT bundle the Python kora_v2 daemon. The packaged app calls the
+#     system `kora` CLI on PATH. The first-run wizard guides users through
+#     installing it (see apps/desktop/docs/PACKAGING.md).
+#   - macOS is the primary target for v0.1. Windows + Linux blocks below are
+#     scaffolded for a future release; flip `mac.target` style for those when
+#     they are ready.
+
+appId: com.kora.desktop
+productName: Kora
+copyright: Copyright © 2026 Kora
+artifactName: ${productName}-${version}-${arch}.${ext}
+
+asar: true
+compression: maximum
+
+directories:
+  buildResources: build
+  output: release
+
+# What lands inside the .app bundle. We ship the renderer (vite output in
+# `dist/`), the compiled main + preload (`dist-electron/`), and the
+# package.json so Electron can resolve "main".
+files:
+  - dist/**
+  - dist-electron/**
+  - package.json
+  - "!**/*.map"
+  - "!**/*.ts"
+  - "!**/{.git,.github,.vscode,.idea,test,tests,__tests__,coverage}/**"
+  - "!**/{tsconfig*.json,eslint.config.*,vite.config.*,vitest.config.*,prettier*}"
+
+extraMetadata:
+  main: dist-electron/main.js
+
+# --- macOS ---------------------------------------------------------------
+mac:
+  category: public.app-category.productivity
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  icon: build/icon.icns
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  # Notarization is opt-in. Set CSC_LINK / CSC_KEY_PASSWORD and APPLE_ID /
+  # APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID in CI to enable. Without
+  # signing, users can still launch via right-click → Open in Finder.
+  identity: null
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    NSAppTransportSecurity:
+      NSAllowsLocalNetworking: true
+    NSHumanReadableCopyright: "Kora — local-first."
+    LSMinimumSystemVersion: "11.0"
+
+dmg:
+  title: ${productName} ${version}
+  icon: build/icon.icns
+  iconSize: 96
+  background: null
+  window:
+    width: 540
+    height: 380
+  contents:
+    - x: 140
+      y: 200
+      type: file
+    - x: 400
+      y: 200
+      type: link
+      path: /Applications
+
+# --- Windows (future) ----------------------------------------------------
+# When ready: replace `target: []` with the desired installer (nsis, msi).
+win:
+  target: []
+  icon: build/icon.ico
+  signingHashAlgorithms:
+    - sha256
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+
+# --- Linux (future) ------------------------------------------------------
+linux:
+  target: []
+  category: Utility
+  icon: build/icon.png
+  maintainer: Kora <maintainers@kora.local>
+
+# --- Auto-update (placeholder) -------------------------------------------
+# Uncomment + configure when wiring electron-updater. See PACKAGING.md.
+# publish:
+#   - provider: github
+#     owner: TODO
+#     repo: TODO
+#     releaseType: release
+publish: null

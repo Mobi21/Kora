@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from kora_v2.life.stabilization import _ensure_domain_events_schema, _record_domain_event
 
-ContextPackType = Literal["anxiety", "admin", "sensory"]
+ContextPackType = Literal["anxiety", "admin", "sensory", "appointment", "communication"]
 ContextPackFeedback = Literal["useful", "wrong", "too_much"]
 
 

@@ -13,15 +13,18 @@ from kora_v2.core.calendar_models import CalendarEntry
 from kora_v2.core.db import init_operational_db
 from kora_v2.tools.calendar import (
     SYNTHETIC_ID_SEP,
+    CalendarSync,
     CreateCalendarEntryInput,
     DeleteCalendarEntryInput,
     QueryCalendarInput,
+    SyncGoogleCalendarInput,
     UpdateCalendarEntryInput,
     _load_entries_between,
     create_calendar_entry,
     delete_calendar_entry,
     expand_recurring,
     query_calendar,
+    sync_google_calendar,
     update_calendar_entry,
 )
 
@@ -38,6 +41,14 @@ class _StubContainer:
             servers = {}
 
         self.settings.mcp = _MCP()
+
+        class _Workspace:
+            mcp_server_name = "workspace"
+            default_calendar_id = "primary"
+            user_google_email = ""
+
+        self.settings.workspace = _Workspace()
+        self.mcp_manager = None
 
 
 @pytest.fixture
@@ -263,3 +274,72 @@ async def test_query_calendar_uses_user_tz_for_day_window(container):
     assert "Standup PDT" in titles
     # Local bounds are also reported so callers see the asked-for frame.
     assert qdata["since_local"].startswith("2026-04-12T00:00:00")
+
+
+class _FakeMCP:
+    def __init__(self, response):
+        self.calls = []
+        self._response = response
+
+    async def call_tool(self, server, tool, args):
+        self.calls.append((server, tool, args))
+        return self._response
+
+
+class _FakeResult:
+    def __init__(self, data):
+        self.structured_data = data
+        self.text = json.dumps(data)
+        self.is_error = False
+
+
+async def test_calendar_sync_pulls_workspace_events_into_local_store(container):
+    container.settings.mcp.servers = {"workspace": object()}
+    container.settings.workspace.user_google_email = "user@example.com"
+    google_event = {
+        "id": "google-1",
+        "summary": "Google sync read",
+        "start": {"dateTime": "2026-04-29T15:00:00+00:00"},
+        "end": {"dateTime": "2026-04-29T15:30:00+00:00"},
+    }
+    container.mcp_manager = _FakeMCP(_FakeResult({"events": [google_event]}))
+
+    sync = CalendarSync(container)
+    pulled = await sync.pull_range(
+        datetime(2026, 4, 29, tzinfo=UTC),
+        datetime(2026, 4, 30, tzinfo=UTC),
+    )
+
+    assert len(pulled) == 1
+    assert pulled[0]["source"] == "google"
+    assert container.mcp_manager.calls == [
+        (
+            "workspace",
+            "get_events",
+            {
+                "user_google_email": "user@example.com",
+                "calendar_id": "primary",
+                "time_min": "2026-04-29T00:00:00+00:00",
+                "time_max": "2026-04-30T00:00:00+00:00",
+            },
+        )
+    ]
+
+    q = await query_calendar(
+        QueryCalendarInput(date="2026-04-29", days_ahead=1), container
+    )
+    titles = [e["title"] for e in json.loads(q)["entries"]]
+    assert "Google sync read" in titles
+
+
+async def test_sync_google_calendar_reports_missing_workspace_email(container):
+    container.settings.mcp.servers = {"workspace": object()}
+    container.mcp_manager = _FakeMCP(_FakeResult({"events": []}))
+
+    result = await sync_google_calendar(SyncGoogleCalendarInput(days_ahead=1), container)
+    data = json.loads(result)
+
+    assert data["success"] is True
+    assert data["pulled"] == 0
+    assert "user_google_email" in data["message"]
+    assert container.mcp_manager.calls == []

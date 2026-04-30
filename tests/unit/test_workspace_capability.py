@@ -27,7 +27,8 @@ def _settings_with_workspace_server() -> Settings:
 
 
 def _settings_without_workspace_server() -> Settings:
-    return Settings()
+    from kora_v2.core.settings import MCPSettings
+    return Settings(mcp=MCPSettings(servers={}))
 
 
 # ── 1. health_check() without bind → UNCONFIGURED ────────────────────────────
@@ -72,7 +73,7 @@ async def test_health_check_with_partial_tools_is_degraded() -> None:
     """If only some tools are present, status is DEGRADED."""
     cap = WorkspaceCapability()
     # Only expose a subset of the default tools
-    partial_tools = ["search_gmail_messages", "list_calendar_events"]
+    partial_tools = ["search_gmail_messages", "get_events"]
     mock = MockWorkspaceMCPManager(tools=partial_tools)
     settings = _settings_with_workspace_server()
     cap.bind(settings, mock)  # type: ignore[arg-type]

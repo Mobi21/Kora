@@ -48,13 +48,14 @@ Internal state:
 | `_console` | `rich.console.Console` | All terminal output |
 | `_running` | `bool` | Main loop sentinel |
 | `_response_buffer` | `str` | Accumulates streamed tokens |
-| `_lockfile_path` | `Path` | `data/.lockfile` — patchable in tests |
+| `_lockfile_path` | `Path` | `data/kora.lock` — patchable in tests |
+| `_legacy_lockfile_path` | `Path` | `data/.lockfile` — legacy fallback for old dev state |
 | `_token_path` | `Path` | `data/.api_token` — patchable in tests |
 
 ### Port and token discovery
 
-`_discover_port()` reads `data/.lockfile` as JSON and prefers `api_port` over
-the legacy `port` key.
+`_discover_port()` reads `data/kora.lock` as JSON, falls back to the legacy
+`data/.lockfile` path, and prefers `api_port` over the legacy `port` key.
 
 `_read_token()` reads `data/.api_token` (plain text, stripped).
 
@@ -290,8 +291,9 @@ read from `container.settings.memory.kora_memory_path`.
 
 - **Daemon** (`kora_v2/daemon/server.py`): exposes `ws://<host>:<port>/api/v1/ws`
   and REST endpoints consumed by the CLI.
-- **Lockfile** (`kora_v2/daemon/launcher.py`): writes `data/.lockfile` JSON
-  with `api_port`; read by `_discover_port()`.
+- **Lockfile** (`kora_v2/daemon/launcher.py`): writes `data/kora.lock` JSON
+  with `api_port`; read by `_discover_port()` with legacy `data/.lockfile`
+  fallback.
 - **Auth token** (`kora_v2/daemon/launcher.py`): writes `data/.api_token`;
   read by `_read_token()`.
 - **ADHD profile** (`kora_v2/adhd/profile.py`): `ADHDProfileLoader` is

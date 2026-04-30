@@ -156,6 +156,7 @@ def create_app(container: Container) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=container.settings.security.cors_origins,
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -231,7 +232,10 @@ def _build_router():
     """Build the API router with all endpoints."""
     from fastapi import APIRouter
 
+    from kora_v2.daemon.desktop_api import build_desktop_router
+
     router = APIRouter(prefix="/api/v1")
+    router.include_router(build_desktop_router(lambda: _container))
 
     # --- Health (no auth) ---
 
@@ -1024,12 +1028,12 @@ async def _handle_chat(ws: WebSocket, content: str) -> None:
         # Tool events already sent in real-time via _on_tool_event callback.
 
         if response_content:
-            await ws.send_json({
+            await _safe_send_json(ws, {
                 "type": "token",
                 "content": response_content,
             })
 
-        await ws.send_json({
+        await _safe_send_json(ws, {
             "type": "response_complete",
             "metadata": {
                 "turn_count": turn_count,
@@ -1041,7 +1045,7 @@ async def _handle_chat(ws: WebSocket, content: str) -> None:
 
     except Exception as e:
         log.exception("graph_invocation_error")
-        await ws.send_json({
+        await _safe_send_json(ws, {
             "type": "error",
             "content": f"Graph error: {e!s}",
         })

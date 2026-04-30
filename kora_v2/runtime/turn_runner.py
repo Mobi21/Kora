@@ -122,7 +122,7 @@ class GraphTurnRunner:
         )
 
         try:
-            result = await graph.ainvoke(graph_input, config=config)
+            result = await graph.ainvoke(graph_input, config)
             latency_ms = int(
                 (datetime.now(UTC) - started_at).total_seconds() * 1000,
             )

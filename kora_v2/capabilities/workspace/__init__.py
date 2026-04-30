@@ -253,6 +253,15 @@ class WorkspaceCapability(CapabilityPack):
         """Late-bind runtime dependencies. Called by the DI container."""
         self._settings = settings
         self._mcp_manager = mcp_manager
+        configured = getattr(settings, "workspace", None)
+        if isinstance(configured, WorkspaceConfig):
+            self._config = configured
+        elif isinstance(configured, dict):
+            self._config = WorkspaceConfig(**configured)
+        self._policy = build_default_policy(
+            account=self._config.account,
+            read_only=self._config.read_only,
+        )
 
     async def health_check(self) -> CapabilityHealth:
         if self._settings is None:

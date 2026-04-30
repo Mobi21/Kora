@@ -6,7 +6,7 @@ If you are new to this codebase, read [`current-architecture.md`](current-archit
 
 ## How this atlas is organized
 
-Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a Rich CLI front-end. The codebase factors into five clusters. Each cluster has its own folder with a `README.md` overview plus one deep-dive per module.
+Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a working Electron/React desktop GUI and a Rich CLI front-end. The codebase factors into five clusters. Each cluster has its own folder with a `README.md` overview plus one deep-dive per module.
 
 | # | Cluster | What lives here | Read when you want to understand… |
 |---|---------|-----------------|-----------------------------------|
@@ -14,7 +14,7 @@ Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a Rich C
 | 01 | [Runtime core](01-runtime-core/README.md) | `core/`, `daemon/`, `runtime/`, `runtime/orchestration/`, `graph/` | How a turn runs and how every non-conversation job is scheduled. The DI container, FastAPI server, WebSocket protocol, LangGraph supervisor, turn tracing, `TriggerEvaluator`, and the current `OrchestrationEngine`. |
 | 02 | [Memory & context](02-memory-context/README.md) | `memory/`, `context/`, `tools/` | How Kora remembers. Configurable filesystem-canonical memory, projection DB, hybrid retrieval, compaction, the `recall()` fast path, and the current 47 registered Python tools. |
 | 03 | [Agents & autonomous](03-agents-autonomous/README.md) | `agents/workers/`, `autonomous/`, `capabilities/`, `skills/`, `routing/` | How Kora *does* things. Worker harnesses (planner/executor/reviewer), multi-step autonomous plans, capability packs, YAML skills. |
-| 04 | [Conversation & LLM](04-conversation-llm/README.md) | `llm/`, `emotion/`, `cli/`, `mcp/`, `quality/` | How Kora talks. LLM providers (MiniMax via Anthropic SDK, Claude Code delegate), two-tier PAD emotion, Rich CLI, MCP manager, quality sampling. |
+| 04 | [Conversation, UI & LLM](04-conversation-llm/README.md) | `llm/`, `emotion/`, `cli/`, `mcp/`, `quality/`, `apps/desktop/` | How Kora talks. LLM providers (MiniMax via Anthropic SDK, Claude Code delegate), two-tier PAD emotion, desktop GUI, Rich CLI, MCP manager, quality sampling. |
 | 05 | [Life OS, support & ADHD](05-life-adhd/README.md) | `life/`, `support/`, `safety/`, `adhd/` | Kora's current product center: day plans, reality ledger, repair loop, load meter, proactivity policy, stabilization, context packs, future bridges, support profiles, crisis boundary, routines, reminders, and ADHD-aware behavior. |
 
 ## Navigation index
@@ -43,10 +43,11 @@ Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a Rich C
 - [routing.md](03-agents-autonomous/routing.md) — empty directory (aspirational); actual routing lives in `autonomous/graph.py` and the supervisor
 
 ### 04 — Conversation & LLM
-- [Cluster README](04-conversation-llm/README.md) — provider abstraction → model calls → emotion → quality
+- [Cluster README](04-conversation-llm/README.md) — provider abstraction → model calls → emotion → quality → UI clients
 - [llm.md](04-conversation-llm/llm.md) — `LLMProviderBase`, MiniMax (via `anthropic.AsyncAnthropic`), `ClaudeCodeDelegate` subprocess shim
 - [emotion.md](04-conversation-llm/emotion.md) — two-tier PAD model, LLM assessor with LRU cache, 40%-timeout history
 - [cli.md](04-conversation-llm/cli.md) — Rich CLI, WebSocket client, streaming display
+- [Desktop README](../apps/desktop/README.md) — Electron/React GUI, desktop API view-models, browser dev bridge, global chat
 - [mcp.md](04-conversation-llm/mcp.md) — MCP manager lifecycle, tool exposure, server config
 - [quality.md](04-conversation-llm/quality.md) — quality measurement, sampling, stub areas
 
@@ -75,4 +76,4 @@ The latest refresh pass was performed on 2026-04-28 against the dirty `main` wor
 - Canonical memory: `settings.memory.kora_memory_path`, default `~/.kora/memory` (acceptance can override it under `/tmp/claude/kora_acceptance/memory`).
 - Runtime state: `data/operational.db`, `data/projection.db`, and per-session SQLite checkpointers.
 - Entry point: `kora_v2.daemon.launcher:main` → `kora` console script.
-- Stack: Python 3.12+, FastAPI, LangGraph, `anthropic` SDK, `sqlite-vec`, Rich.
+- Stack: Python 3.12+, FastAPI, LangGraph, `anthropic` SDK, `sqlite-vec`, Rich, Electron, React, Vite.

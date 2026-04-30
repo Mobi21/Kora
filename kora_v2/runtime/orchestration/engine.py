@@ -311,6 +311,7 @@ class OrchestrationEngine:
             rate_limit_hook=self._notify_rate_limit_pause,
         )
         self._started = False
+        self._rate_limit_notice_until: datetime | None = None
         self._decision_aging_stop_event = asyncio.Event()
         self._decision_aging_task: asyncio.Task[None] | None = None
 
@@ -479,6 +480,10 @@ class OrchestrationEngine:
 
     async def _notify_rate_limit_pause(self, task: WorkerTask) -> None:
         """Persist a zero-provider notification when background work pauses."""
+        now = datetime.now(UTC)
+        if self._rate_limit_notice_until is not None and now < self._rate_limit_notice_until:
+            return
+        self._rate_limit_notice_until = now + timedelta(minutes=1)
         await self.notify(
             template_id="rate_limit_paused",
             template_vars={"minutes": 1},

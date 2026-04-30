@@ -1,0 +1,109 @@
+/* Shared design tokens — radii, shadows, motion, density, type scale.
+   Theme-specific OKLCH values live in themes.css. */
+:root {
+  /* Radii */
+  --r-1: 6px;
+  --r-2: 10px;
+  --r-3: 14px;
+  --r-pill: 999px;
+
+  /* Shadows */
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.04), 0 1px 1px rgb(0 0 0 / 0.02);
+  --shadow-2: 0 12px 32px rgb(0 0 0 / 0.08), 0 2px 6px rgb(0 0 0 / 0.04);
+
+  /* Type scale (rem) */
+  --fs-2xs: 0.6875rem; /* 11 */
+  --fs-xs: 0.75rem;    /* 12 */
+  --fs-sm: 0.8125rem;  /* 13 */
+  --fs-base: 0.875rem; /* 14 */
+  --fs-md: 1rem;       /* 16 */
+  --fs-lg: 1.125rem;   /* 18 */
+  --fs-xl: 1.25rem;    /* 20 */
+  --fs-2xl: 1.5rem;    /* 24 */
+  --fs-3xl: 1.875rem;  /* 30 */
+  --fs-4xl: 2.25rem;   /* 36 */
+
+  /* Line heights */
+  --lh-ui: 1.4;
+  --lh-narrative: 1.55;
+
+  /* Tracking */
+  --track-tight: -0.01em;
+  --track-label: 0.02em;
+
+  /* Font families (set via @font-face in fonts.css / globals.css) */
+  --font-ui: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-narrative: 'Fraunces Variable', ui-serif, Georgia, 'Times New Roman', serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* Motion (default 'normal') */
+  --motion-fast: 120ms;
+  --motion: 200ms;
+  --motion-slow: 320ms;
+  --ease-out: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  /* Density (default 'balanced') */
+  --space-y-card: 16px;
+  --row-h: 40px;
+  --pad: 14px;
+  --rail-w: 56px;
+  --rail-w-expanded: 240px;
+  --chat-panel-w: 380px;
+  --command-bar-h: 40px;
+
+  /* Workspace max widths (set on feature screen containers) */
+  --ws-today: 880px;
+  --ws-memory: 960px;
+  --ws-settings: 760px;
+  --ws-autonomous: 1040px;
+}
+
+[data-density='cozy'] {
+  --space-y-card: 20px;
+  --row-h: 48px;
+  --pad: 16px;
+}
+
+[data-density='balanced'] {
+  --space-y-card: 16px;
+  --row-h: 40px;
+  --pad: 14px;
+}
+
+[data-density='compact'] {
+  --space-y-card: 12px;
+  --row-h: 32px;
+  --pad: 12px;
+}
+
+[data-motion='normal'] {
+  --motion-fast: 120ms;
+  --motion: 200ms;
+  --motion-slow: 320ms;
+}
+
+[data-motion='reduced'] {
+  --motion-fast: 60ms;
+  --motion: 100ms;
+  --motion-slow: 160ms;
+}
+
+[data-motion='none'] {
+  --motion-fast: 0ms;
+  --motion: 0ms;
+  --motion-slow: 0ms;
+}
+
+[data-motion='reduced'] *,
+[data-motion='reduced'] *::before,
+[data-motion='reduced'] *::after {
+  animation-duration: var(--motion) !important;
+  transition-property: opacity !important;
+}
+
+[data-motion='none'] *,
+[data-motion='none'] *::before,
+[data-motion='none'] *::after {
+  animation: none !important;
+  transition: none !important;
+}

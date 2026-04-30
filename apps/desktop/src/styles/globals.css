@@ -1,0 +1,157 @@
+@import 'tailwindcss';
+@source "../**/*.{ts,tsx}";
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/fraunces';
+@import '@fontsource-variable/jetbrains-mono';
+@import './tokens.css';
+@import './themes.css';
+@import './calendar/theme.css';
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  border-color: var(--border);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: var(--lh-ui);
+  letter-spacing: 0;
+  font-feature-settings: 'cv11', 'ss01';
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* Tabular numerals on time/count surfaces (apply via class). */
+.num-tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Narrative type (chat assistant text, hero titles). */
+.font-narrative {
+  font-family: var(--font-narrative);
+  line-height: var(--lh-narrative);
+  letter-spacing: var(--track-tight);
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.text-label {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--track-label);
+  color: var(--fg-muted);
+}
+
+/* Headings up-tracking */
+h1,
+.h1 {
+  font-size: var(--fs-3xl);
+  letter-spacing: var(--track-tight);
+  font-family: var(--font-narrative);
+  line-height: var(--lh-narrative);
+}
+
+h2,
+.h2 {
+  font-size: var(--fs-2xl);
+  letter-spacing: var(--track-tight);
+  font-family: var(--font-narrative);
+  line-height: var(--lh-narrative);
+}
+
+h3,
+.h3 {
+  font-size: var(--fs-xl);
+  letter-spacing: var(--track-tight);
+}
+
+/* Focus ring — accent ring with bg offset */
+:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--bg),
+    0 0 0 4px var(--accent);
+  border-radius: var(--r-1);
+}
+
+/* Hide native scrollbar arrows but keep thumb visible */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--r-pill);
+  border: 2px solid var(--bg);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Skeleton shimmer (4% chroma) */
+@keyframes kora-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.kora-skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--surface-2) 0%,
+    var(--surface-3) 50%,
+    var(--surface-2) 100%
+  );
+  background-size: 200% 100%;
+  animation: kora-shimmer 1.6s var(--ease-out) infinite;
+}
+
+/* Prevent text selection on chrome surfaces */
+.no-select {
+  user-select: none;
+  -webkit-user-select: none;
+}

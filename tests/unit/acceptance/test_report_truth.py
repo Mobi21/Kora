@@ -110,6 +110,39 @@ def test_life_db_persistence_requires_medication_meal_and_reminder() -> None:
     assert marks[23] == "x"
 
 
+def test_wrong_inference_can_be_scored_from_durable_correction_events() -> None:
+    kwargs = _base_kwargs()
+    kwargs["life_data"] = {"correction_event_count": 1}
+
+    marks = _auto_mark_coverage(**kwargs)
+
+    assert marks[11] == "x"
+
+
+def test_external_capability_disclosure_satisfies_optional_web_item() -> None:
+    kwargs = _base_kwargs()
+    kwargs["cap_health"] = {
+        "browser": {
+            "status": "unconfigured",
+            "remediation": "set up browser connector",
+        }
+    }
+    kwargs["messages"] = [
+        {
+            "role": "assistant",
+            "content": (
+                "MCP web-search path failed because the browser is unconfigured; "
+                "I will use local state instead."
+            ),
+        }
+    ]
+
+    marks = _auto_mark_coverage(**kwargs)
+
+    assert marks[9] == "x"
+    assert marks[101] == "x"
+
+
 def test_decompose_with_user_pipeline_and_tasks_gets_dispatch_credit() -> None:
     kwargs = _base_kwargs()
     kwargs["tool_usage"]["tool_counts"] = {"decompose_and_dispatch": 1}
@@ -499,6 +532,41 @@ def test_restart_scorer_accepts_tomorrow_unfinished_wording(
     assert marks[13] == "x"
 
 
+def test_restart_scorer_accepts_durable_post_restart_state(
+    tmp_path: Path,
+) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    (snapshots / "pre_restart.json").write_text("{}", encoding="utf-8")
+    (snapshots / "post_restart.json").write_text(
+        json.dumps({
+            "status": {"status": "running"},
+            "vault_state": {
+                "working_docs": [
+                    {"pipeline_name": "routine_stabilization_basics"}
+                ]
+            },
+        }),
+        encoding="utf-8",
+    )
+    kwargs = _base_kwargs()
+    kwargs["snapshots_dir"] = snapshots
+    kwargs["life_data"] = {
+        "reminder_count": 3,
+        "support_profile_count": 2,
+        "routine_count": 1,
+    }
+    kwargs["orch_evidence"] = {
+        "open_decision_count": 1,
+        "worker_tasks": [],
+        "pipeline_instances": [],
+    }
+
+    marks = _auto_mark_coverage(**kwargs)
+
+    assert marks[13] == "x"
+
+
 def test_final_life_os_recap_marks_weekly_review() -> None:
     kwargs = _base_kwargs()
     kwargs["messages"] = [
@@ -548,6 +616,72 @@ def test_pattern_scan_requires_pattern_nudge_for_item_59() -> None:
     ]
     marks = _auto_mark_coverage(**kwargs)
     assert marks[59] == "x"
+
+
+def test_pattern_scan_accepts_current_context_triggers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["orch_evidence"] = {
+        "available": True,
+        "pipeline_instances": [
+            {"pipeline_name": "proactive_pattern_scan", "state": "completed"}
+        ],
+        "worker_tasks": [],
+        "ledger_events": [
+            {
+                "event_type": "trigger_fired",
+                "trigger_name": "proactive_pattern_scan.event.MEMORY_STORED",
+                "metadata_json": '{"event_names":["MEMORY_STORED"]}',
+            }
+        ],
+        "notifications": [],
+        "system_phases_observed": [],
+    }
+
+    marks = _auto_mark_coverage(**kwargs)
+
+    assert marks[42] == "x"
+    assert marks[58] == "x"
+
+
+def test_cancel_probe_accepts_phone_fallback_pipeline() -> None:
+    kwargs = _base_kwargs()
+    kwargs["orch_evidence"] = {
+        "available": True,
+        "pipeline_instances": [
+            {
+                "id": "pharmacy_phone_fallback-1",
+                "pipeline_name": "pharmacy_phone_fallback",
+                "goal": "Start a noisy helper for phone fallback only",
+                "state": "cancelled",
+            },
+            {
+                "id": "proactive_research-1",
+                "pipeline_name": "proactive_research",
+                "goal": "Doctor portal practical prep",
+                "state": "completed",
+            },
+        ],
+        "worker_tasks": [
+            {
+                "task_id": "task-phone",
+                "pipeline_instance_id": "pharmacy_phone_fallback-1",
+                "state": "cancelled",
+            }
+        ],
+        "ledger_events": [
+            {
+                "event_type": "task_cancelled",
+                "pipeline_instance_id": "pharmacy_phone_fallback-1",
+                "worker_task_id": "task-phone",
+            }
+        ],
+        "notifications": [],
+        "system_phases_observed": [],
+    }
+
+    marks = _auto_mark_coverage(**kwargs)
+
+    assert marks[30] == "x"
 
 
 def test_orchestration_evidence_counts_backdated_open_decisions(
@@ -882,6 +1016,87 @@ def test_cancel_probe_accepts_goal_alias_when_model_used_research_pipeline() -> 
             },
         ],
         "ledger_events": [{"event_type": "task_cancelled"}],
+        "system_phases_observed": [],
+    }
+
+    marks = report._derive_orchestration_markers(evidence)
+
+    assert marks[30] == "x"
+
+
+def test_cancel_probe_accepts_broad_helper_life_admin_pipeline() -> None:
+    evidence = {
+        "available": True,
+        "pipeline_instances": [
+            {
+                "id": "helper-1",
+                "pipeline_name": "user_autonomous_task",
+                "state": "running",
+                "goal": "Broad helper research task for practical life-admin checklist",
+            },
+            {
+                "id": "research-1",
+                "pipeline_name": "proactive_research",
+                "state": "completed",
+                "goal": "Doctor portal practical prep",
+            },
+        ],
+        "worker_tasks": [
+            {
+                "id": "helper-task",
+                "pipeline_instance_id": "helper-1",
+                "state": "cancelled",
+                "cancellation_requested": 1,
+            },
+            {
+                "id": "research-task",
+                "pipeline_instance_id": "research-1",
+                "state": "completed",
+                "cancellation_requested": 0,
+            },
+        ],
+        "ledger_events": [{"event_type": "task_cancelled"}],
+        "system_phases_observed": [],
+    }
+
+    marks = report._derive_orchestration_markers(evidence)
+
+    assert marks[30] == "x"
+
+
+def test_cancel_task_accepts_generic_isolated_cancelled_pipeline() -> None:
+    evidence = {
+        "available": True,
+        "pipeline_instances": [
+            {
+                "id": "continuity_check-1",
+                "pipeline_name": "continuity_check",
+                "state": "cancelled",
+                "completion_reason": "task_cancelled",
+                "working_doc_path": "/tmp/continuity.md",
+            },
+            {
+                "id": "research-1",
+                "pipeline_name": "proactive_research",
+                "state": "completed",
+                "goal": "Doctor portal practical prep",
+            },
+        ],
+        "worker_tasks": [
+            {
+                "id": "continuity-task",
+                "pipeline_instance_id": "continuity_check-1",
+                "state": "cancelled",
+                "cancellation_requested": 1,
+            }
+        ],
+        "ledger_events": [
+            {
+                "event_type": "task_cancelled",
+                "pipeline_instance_id": "continuity_check-1",
+                "worker_task_id": "continuity-task",
+            }
+        ],
         "system_phases_observed": [],
     }
 

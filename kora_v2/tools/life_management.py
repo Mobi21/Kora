@@ -181,6 +181,54 @@ async def _record_life_tool_event(
         log.debug("life_tool_ledger_event_failed", event_type=event_type, exc_info=True)
 
 
+async def _maybe_record_trusted_support_boundary(
+    container: Any,
+    *,
+    text: str,
+    source_id: str,
+) -> None:
+    normalized = (text or "").lower()
+    if not any(
+        marker in normalized
+        for marker in ("trusted support", "support person", "alex", "don't contact", "dont contact")
+    ):
+        return
+    registry = getattr(container, "support_registry", None)
+    if registry is not None:
+        try:
+            await registry.set_profile_status(
+                "trusted_support",
+                "active",
+                source="quick_note",
+                reason="user captured a trusted-support boundary",
+            )
+            await registry.record_signal(
+                "trusted_support",
+                "no_auto_contact_boundary",
+                weight=0.9,
+                source="quick_note",
+                confidence=1.0,
+                metadata={"quick_note_id": source_id, "auto_contact_allowed": False},
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("quick_note_trusted_support_profile_failed", exc_info=True)
+    domain_events = getattr(container, "domain_event_store", None)
+    if domain_events is not None:
+        try:
+            await domain_events.append(
+                "TRUSTED_SUPPORT_CONSENT_RECORDED",
+                aggregate_type="quick_note",
+                aggregate_id=source_id,
+                source_service="life_management.quick_note",
+                payload={
+                    "auto_contact_allowed": False,
+                    "boundary": "trusted support notes stay local until explicitly exported",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("quick_note_trusted_support_event_failed", exc_info=True)
+
+
 def _parse_reminder_due_at(input: "CreateReminderInput") -> datetime:
     """Resolve reminder due time from ISO input or common natural wording."""
     raw = (input.remind_at or "").strip()
@@ -622,6 +670,11 @@ async def quick_note(input: QuickNoteInput, container: Any) -> str:
             details=input.content,
             raw_text=input.content,
             metadata={"quick_note_id": row_id, "tags": input.tags or None},
+        )
+        await _maybe_record_trusted_support_boundary(
+            container,
+            text=f"{input.content} {input.tags}",
+            source_id=row_id,
         )
         return _ok({
             "id": row_id,

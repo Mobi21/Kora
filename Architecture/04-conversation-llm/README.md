@@ -3,15 +3,17 @@
 This cluster covers the full path from a user's typed message to Kora's reply:
 how the model is called, how the user's emotional state is inferred, how quality
 is measured on generated output, how external tools plug in via MCP, and how the
-whole thing is surfaced through the Rich terminal client.
+whole thing is surfaced through the desktop GUI and Rich terminal client.
 
-The cluster owns five subsystems inside `kora_v2/`:
+The cluster owns five subsystems inside `kora_v2/`, plus the desktop app under
+`apps/desktop/`:
 
 | Subsystem | Directory | Role |
 |---|---|---|
 | LLM providers | `llm/` | Abstraction layer over MiniMax M2.7-highspeed and Claude Code |
 | Emotion | `emotion/` | Two-tier PAD affect assessment per turn |
 | CLI | `cli/` | Rich WebSocket chat client and first-run wizard |
+| Desktop GUI | `../../apps/desktop/` | Electron/React Life OS screens, REST view-models, global WebSocket chat |
 | MCP | `mcp/` | Model Context Protocol subprocess manager |
 | Quality | `quality/` | Per-turn metrics, confidence scoring, and quality gates |
 
@@ -21,7 +23,7 @@ The cluster owns five subsystems inside `kora_v2/`:
 User types message
     │
     ▼
-KoraCLI (cli/app.py)
+Desktop chat panel or KoraCLI
   sends: {"type": "chat", "content": "..."}
   over WebSocket ws://<host>:<port>/api/v1/ws?token=<token>
     │
@@ -42,7 +44,7 @@ Daemon / supervisor graph (kora_v2/graph/)
        quality/gates.py  ──────── execute_with_quality_gates()
     │
     ▼
-KoraCLI streams back tokens
+Client streams back tokens
   {"type": "token"} ... {"type": "response_complete"}
 ```
 
@@ -74,5 +76,6 @@ configurable retry and confidence thresholds.
 | `llm.md` | Provider interface, MiniMax implementation, Claude Code delegate, streaming, tool calling, error handling |
 | `emotion.md` | PAD model, fast tier math, LLM tier prompts, trigger logic, state schema |
 | `cli.md` | Rich app structure, WebSocket protocol, slash commands, first-run wizard |
+| `../../apps/desktop/README.md` | Electron/React GUI, desktop view-model API, browser dev bridge, keyboard shortcuts |
 | `mcp.md` | Lifecycle, JSON-RPC handshake, tool registration, config format |
 | `quality.md` | Tier 1 metrics, confidence formula, quality gates, DB persistence |

@@ -501,24 +501,25 @@ class DayRepairEngine:
         if action_type == "add_transition_buffer" and await _table_exists(db, "calendar_entries"):
             start = now + timedelta(minutes=5)
             end = start + timedelta(minutes=int(changes.get("buffer_minutes", 15)))
-            await db.execute(
-                """
-                INSERT INTO calendar_entries
-                    (id, kind, title, description, starts_at, ends_at, source,
-                     metadata, status, created_at, updated_at)
-                VALUES (?, 'buffer', 'Transition buffer', ?, ?, ?, 'kora',
-                        ?, 'active', ?, ?)
-                """,
-                (
-                    _id("cal"),
-                    action["reason"],
-                    start.isoformat(),
-                    end.isoformat(),
-                    _json({"repair_action_id": action["id"]}),
-                    now.isoformat(),
-                    now.isoformat(),
-                ),
-            )
+            if not await _transition_buffer_exists(db, action["reason"], now):
+                await db.execute(
+                    """
+                    INSERT INTO calendar_entries
+                        (id, kind, title, description, starts_at, ends_at, source,
+                         metadata, status, created_at, updated_at)
+                    VALUES (?, 'buffer', 'Transition buffer', ?, ?, ?, 'kora',
+                            ?, 'active', ?, ?)
+                    """,
+                    (
+                        _id("cal"),
+                        action["reason"],
+                        start.isoformat(),
+                        end.isoformat(),
+                        _json({"repair_action_id": action["id"]}),
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
 
         if action_type == "enter_stabilization":
             await db.execute(
@@ -647,6 +648,45 @@ async def _ensure_schema(db: aiosqlite.Connection) -> None:
         );
         """
     )
+
+
+async def _transition_buffer_exists(
+    db: aiosqlite.Connection,
+    reason: str,
+    now: datetime,
+) -> bool:
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    async with db.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM calendar_entries
+        WHERE kind = 'buffer'
+          AND title = 'Transition buffer'
+          AND source = 'kora'
+          AND status = 'active'
+          AND created_at >= ?
+        """,
+        (day_start,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    today_count = int(row["count"] if row is not None else 0)
+    if today_count >= 3:
+        return True
+    async with db.execute(
+        """
+        SELECT 1
+        FROM calendar_entries
+        WHERE kind = 'buffer'
+          AND title = 'Transition buffer'
+          AND source = 'kora'
+          AND status = 'active'
+          AND description = ?
+          AND created_at >= ?
+        LIMIT 1
+        """,
+        (reason, day_start),
+    ) as cursor:
+        return await cursor.fetchone() is not None
 
 
 async def _active_day_plan(db: aiosqlite.Connection, day: date) -> aiosqlite.Row | None:

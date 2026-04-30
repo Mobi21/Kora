@@ -1,8 +1,8 @@
 """Phase 4 CLI client tests."""
 import json
+from unittest.mock import AsyncMock, patch
+
 import pytest
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 
 class TestParseCommand:
@@ -83,6 +83,11 @@ class TestConstants:
         from kora_v2.cli.app import HEARTBEAT_INTERVAL
         assert HEARTBEAT_INTERVAL == 30
 
+    def test_default_lockfile_matches_daemon(self):
+        from kora_v2.cli.app import _DEFAULT_LOCKFILE
+
+        assert str(_DEFAULT_LOCKFILE) == "data/kora.lock"
+
 
 class TestFormatToken:
     def test_passthrough(self):
@@ -100,6 +105,20 @@ class TestFormatToken:
     def test_newline(self):
         from kora_v2.cli.app import format_streaming_token
         assert format_streaming_token("\n") == "\n"
+
+
+class TestFormatMemoryPreview:
+    def test_collapses_whitespace(self):
+        from kora_v2.cli.app import format_memory_preview
+
+        assert format_memory_preview("hello\n\nworld") == "hello world"
+
+    def test_truncates_long_content(self):
+        from kora_v2.cli.app import format_memory_preview
+
+        preview = format_memory_preview("x" * 300, max_chars=20)
+
+        assert preview == "x" * 17 + "..."
 
 
 class TestKoraCLIInit:
@@ -174,6 +193,27 @@ class TestDiscoverPort:
         cli._lockfile_path = lockfile
         port = cli._discover_port()
         assert port == 7777
+
+    def test_discover_port_falls_back_to_legacy_lockfile(self, tmp_path):
+        from kora_v2.cli.app import KoraCLI
+
+        legacy = tmp_path / ".lockfile"
+        legacy.write_text(json.dumps({"api_port": 7654, "state": "ready"}))
+        cli = KoraCLI()
+        cli._lockfile_path = tmp_path / "missing-kora.lock"
+        cli._legacy_lockfile_path = legacy
+
+        assert cli._discover_port() == 7654
+
+    def test_discover_host_reads_api_host(self, tmp_path):
+        from kora_v2.cli.app import KoraCLI
+
+        lockfile = tmp_path / "kora.lock"
+        lockfile.write_text(json.dumps({"api_host": "127.0.0.1", "api_port": 8765}))
+        cli = KoraCLI()
+        cli._lockfile_path = lockfile
+
+        assert cli._discover_host() == "127.0.0.1"
 
 
 class TestReadToken:
@@ -266,6 +306,20 @@ class TestHandleCommand:
         cli = KoraCLI()
         result = await cli._handle_command("nonexistent", "")
         assert result is True  # Unknown commands don't exit
+
+    @pytest.mark.asyncio
+    async def test_handle_command_doctor(self):
+        from kora_v2.cli.app import KoraCLI
+        cli = KoraCLI()
+        result = await cli._handle_command("doctor", "")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_handle_command_setup(self):
+        from kora_v2.cli.app import KoraCLI
+        cli = KoraCLI()
+        result = await cli._handle_command("setup", "")
+        assert result is True
 
     @pytest.mark.asyncio
     async def test_handle_command_with_args(self):
@@ -379,7 +433,8 @@ class TestReconnect:
 
     @pytest.mark.asyncio
     async def test_reconnect_uses_backoff_delays(self):
-        from kora_v2.cli.app import KoraCLI, MAX_RECONNECT_ATTEMPTS
+        from kora_v2.cli.app import MAX_RECONNECT_ATTEMPTS, KoraCLI
+
         cli = KoraCLI()
         sleep_calls = []
 

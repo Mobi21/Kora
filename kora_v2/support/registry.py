@@ -204,7 +204,14 @@ class SupportRegistry:
     ) -> SupportProfile:
         profile = await self.get_profile(profile_key)
         if profile is None:
-            definition = DEFAULT_PROFILE_DEFINITIONS[profile_key]
+            definition = DEFAULT_PROFILE_DEFINITIONS.get(profile_key)
+            if definition is None:
+                definition = SupportProfileDefinition(
+                    profile_key=profile_key,
+                    display_name=profile_key.replace("_", " ").title(),
+                    default_status=status,
+                    settings={},
+                )
             profile = await self.upsert_profile(
                 profile_key,
                 definition.display_name,

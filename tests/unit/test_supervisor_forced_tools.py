@@ -51,6 +51,15 @@ def test_negative_meal_question_does_not_log_fake_meal() -> None:
     assert call is None or call["name"] != "log_meal"
 
 
+def test_hard_thought_does_not_log_fake_meal() -> None:
+    call = _forced_tool_call_for_turn(
+        "I had a hard thought earlier: what if I just disappear for a while.",
+        {},
+    )
+
+    assert call is None or call["name"] != "log_meal"
+
+
 def test_future_dinner_reference_does_not_log_fake_meal() -> None:
     call = _forced_tool_call_for_turn(
         "alex asked about dinner but i'll figure that out later.",
@@ -94,6 +103,93 @@ def test_standup_reminder_statement_creates_reminder() -> None:
     assert "standup" in call["arguments"]["title"]
 
 
+def test_week_plan_creates_specific_reminders_without_in_turn_breakdown() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "hey. help me manage the week: calendar, reminders, meals, meds, "
+        "doctor portal form, pharmacy, rent autopay, landlord email, grocery, "
+        "and trash night.",
+        {},
+    )
+
+    names = [call["name"] for call in calls]
+    titles = [
+        call["arguments"]["title"]
+        for call in calls
+        if call["name"] == "create_reminder"
+    ]
+
+    assert "decompose_and_dispatch" not in names
+    assert "Doctor portal form" in titles
+    assert "Pharmacy portal/app check" in titles
+    assert "Trash night" in titles
+
+
+def test_doctor_portal_checklist_starts_cancellable_helper() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "the doctor portal form feels huge. Please break it into low-energy "
+        "steps, make a local checklist or note if you can, and keep it practical.",
+        {},
+    )
+
+    dispatches = [call for call in calls if call["name"] == "decompose_and_dispatch"]
+    assert dispatches
+    assert dispatches[0]["arguments"]["pipeline_name"] == "user_autonomous_task"
+    assert "Practical life-admin checklist" in dispatches[0]["arguments"]["goal"]
+
+
+def test_landlord_helper_plan_starts_named_pipeline() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "Start a helper plan for my landlord call prep while I'm away.",
+        {},
+    )
+
+    dispatches = [call for call in calls if call["name"] == "decompose_and_dispatch"]
+
+    assert dispatches
+    assert dispatches[0]["arguments"]["pipeline_name"] == "landlord_call_prep"
+    assert "Practical life-admin checklist" in dispatches[0]["arguments"]["goal"]
+
+
+def test_gui_commitment_phrase_creates_calendar_entries_and_reminders() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "I have a landlord call tomorrow at 10, medication pickup Friday at "
+        "4:30, and a work review next Wednesday at 2.",
+        {},
+    )
+
+    calendar_titles = [
+        call["arguments"]["title"]
+        for call in calls
+        if call["name"] == "create_calendar_entry"
+    ]
+    reminder_titles = [
+        call["arguments"]["title"]
+        for call in calls
+        if call["name"] == "create_reminder"
+    ]
+
+    assert "Landlord call" in calendar_titles
+    assert "Medication pickup" in calendar_titles
+    assert "Work review" in calendar_titles
+    assert "Landlord call" in reminder_titles
+    assert "Medication pickup" in reminder_titles
+    assert "Work review" in reminder_titles
+
+
+def test_idle_life_admin_checklist_also_starts_proactive_research() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "prepare a short local checklist for tomorrow morning's grocery "
+        "pickup and the doctor-form loose ends over idle time.",
+        {},
+    )
+
+    dispatches = [call for call in calls if call["name"] == "decompose_and_dispatch"]
+    pipeline_names = [call["arguments"]["pipeline_name"] for call in dispatches]
+
+    assert "user_autonomous_task" in pipeline_names
+    assert "proactive_research" in pipeline_names
+
+
 def test_generic_pause_context_does_not_cancel_task() -> None:
     state = {
         "_orchestration_tasks": [
@@ -125,6 +221,20 @@ def test_file_deliverable_review_forces_directory_listing() -> None:
     assert call is not None
     assert call["name"] == "list_directory"
     assert call["arguments"]["path"] == "/tmp/focus-dashboard"
+
+
+def test_artifact_backed_review_lists_reads_and_recalls() -> None:
+    calls = _forced_tool_calls_for_turn(
+        "give me the artifact-backed weekly review: what state backs it, "
+        "what local docs exist, and what do we still have?",
+        {},
+    )
+
+    names = [call["name"] for call in calls]
+
+    assert "list_directory" in names
+    assert "read_file" in names
+    assert "recall" in names
 
 
 def test_explicit_file_path_listing_uses_parent_directory() -> None:
@@ -287,6 +397,18 @@ def test_note_and_reminder_turn_captures_both_life_records() -> None:
     assert [call["name"] for call in calls] == ["create_reminder", "quick_note"]
 
 
+def test_record_that_creates_quick_note() -> None:
+    call = _forced_tool_call_for_turn(
+        "record that trusted support is permissioned only and don't contact "
+        "Alex automatically.",
+        {},
+    )
+
+    assert call is not None
+    assert call["name"] == "quick_note"
+    assert "permissioned" in call["arguments"]["content"]
+
+
 def test_cancel_only_probe_ignores_do_not_cancel_research_clause() -> None:
     state = {
         "_orchestration_tasks": [
@@ -400,6 +522,39 @@ def test_keep_research_excludes_research_task_from_forced_cancel() -> None:
     assert call is not None
     assert call["name"] == "cancel_task"
     assert call["arguments"]["task_id"] == "task-writing"
+
+
+def test_keep_research_excludes_proactive_research_even_when_words_match() -> None:
+    state = {
+        "_orchestration_tasks": [
+            {
+                "task_id": "task-proactive",
+                "state": "running",
+                "stage": "compare portal-only vs phone-call fallback",
+                "goal": "Doctor portal practical prep",
+                "pipeline_name": "proactive_research",
+                "pipeline_goal": "Doctor portal practical prep",
+            },
+            {
+                "task_id": "task-user",
+                "state": "running",
+                "stage": "phone-call fallback",
+                "goal": "Remove the pharmacy phone-call fallback",
+                "pipeline_name": "user_autonomous_task",
+                "pipeline_goal": "Doctor portal practical checklist",
+            },
+        ]
+    }
+
+    call = _forced_tool_call_for_turn(
+        "cancel only the phone-call fallback task. keep the portal research "
+        "and checklist pipeline running.",
+        state,
+    )
+
+    assert call is not None
+    assert call["name"] == "cancel_task"
+    assert call["arguments"]["task_id"] == "task-user"
 
 
 def test_forced_cancel_skips_protected_system_pipeline() -> None:

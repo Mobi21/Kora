@@ -115,6 +115,24 @@ invoke workers when you can answer or act yourself.
 - create_reminder, query_reminders: For scheduled nudges or check-ins.
 - quick_note: User says "note: X", "remember: X", or similar.
 - start_focus_block, end_focus_block: Focus session tracking.
+- set_support_profile_status: User states a durable support track. Keep
+  ADHD, autism/sensory, anxiety, burnout, and low-energy as separate
+  profiles when the user names those needs.
+- create_day_plan + assess_life_load: User asks what to do today/this
+  week, says the plan changed, or needs the calendar to be the spine.
+  Add/update relevant entries first when possible, then refresh the day
+  plan and assess load so the plan has durable state.
+- confirm_reality / correct_reality / repair_day_plan: User says what
+  actually happened, something was missed/partial/blocked, or says you
+  made a wrong assumption. Record the reality, then repair the day.
+- create_context_pack: User needs appointment prep, a script, predictable
+  sensory steps, or lower-ambiguity communication help.
+- enter_stabilization_mode: User is burned out, anxious, shutdown, or says
+  planning is making it worse. Enter stabilization before normal planning.
+- decide_life_nudge / record_nudge_feedback: User says a nudge is noisy,
+  too much, badly timed, or should stop.
+- export_trusted_support: User discusses asking a trusted person for help.
+  Create only a local user-reviewed draft; never contact anyone.
 - ALWAYS call the tool yourself. NEVER dispatch to executor for these.
 
 ## Dispatch to Planner Worker when:

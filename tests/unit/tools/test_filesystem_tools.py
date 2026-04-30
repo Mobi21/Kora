@@ -27,6 +27,7 @@ def _reset_registry():
     from kora_v2.tools import filesystem as fs_mod
     from kora_v2.tools.registry import ToolRegistry as _TR
 
+    previous_tools = dict(_TR._tools)
     _TR.reset()
 
     # Re-register all 5 tools from the already-imported module objects.
@@ -36,7 +37,7 @@ def _reset_registry():
     # a dedicated helper.
     _register_filesystem_tools(fs_mod)
     yield
-    _TR.reset()
+    _TR._tools = previous_tools
 
 
 def _register_filesystem_tools(fs_mod) -> None:

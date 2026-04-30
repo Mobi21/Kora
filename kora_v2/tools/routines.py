@@ -11,7 +11,7 @@ and PEP 563 (stringified annotations) breaks issubclass(input_type, BaseModel).
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -71,6 +71,49 @@ async def _register_runtime_pipeline_for_routine(
     except Exception as exc:
         log.warning(
             "routine_pipeline_register_failed",
+            routine_id=routine_id,
+            error=str(exc),
+        )
+        return None
+
+
+async def _create_routine_reminder(
+    routine_id: str,
+    routine_name: str,
+    container: Any,
+) -> str | None:
+    mgr = _get_routine_manager(container)
+    if mgr is None:
+        return None
+    try:
+        from kora_v2.life.reminders import ReminderStore
+
+        reminder_store = ReminderStore(mgr.db_path)
+        due_at = datetime.now(UTC) + timedelta(minutes=1)
+        reminder_id = await reminder_store.create_reminder(
+            title=f"Routine check-in: {routine_name}",
+            description=(
+                "Routine reminder created with the routine so continuity_check "
+                "can surface the scheduled support."
+            ),
+            due_at=due_at,
+            source="routine",
+            metadata={"routine_id": routine_id},
+        )
+        engine = getattr(container, "orchestration_engine", None)
+        if engine is not None:
+            try:
+                await engine.start_triggered_pipeline(
+                    "continuity_check",
+                    goal=f"Routine reminder created: {routine_name}",
+                    trigger_id="create_routine",
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("routine_reminder_continuity_trigger_failed", exc_info=True)
+        return reminder_id
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "routine_reminder_create_failed",
             routine_id=routine_id,
             error=str(exc),
         )
@@ -198,6 +241,11 @@ async def create_routine(input: CreateRoutineInput, container: Any) -> str:
         pipeline_name = await _register_runtime_pipeline_for_routine(
             routine.id, container
         )
+        reminder_id = await _create_routine_reminder(
+            routine.id,
+            routine.name,
+            container,
+        )
         return _ok({
             "status": "created" if created_new else "existing",
             "routine_id": routine.id,
@@ -205,6 +253,8 @@ async def create_routine(input: CreateRoutineInput, container: Any) -> str:
             "step_count": len(routine.standard.steps),
             "runtime_pipeline": pipeline_name,
             "runtime_pipeline_registered": bool(pipeline_name),
+            "routine_reminder_id": reminder_id,
+            "routine_reminder_created": bool(reminder_id),
             "message": (
                 "Routine template ready and runtime pipeline registered: "
                 f"{pipeline_name}"
