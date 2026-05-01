@@ -59,7 +59,7 @@ Current Life OS pillars:
 
 - **Supervisor graph** (`kora_v2/graph/`) — the main conversation loop, built on LangGraph.
 - **Workers** (`kora_v2/agents/workers/`) — planner, executor, reviewer. Typed Pydantic I/O, shared harness, quality gates.
-- **Filesystem-canonical memory** (`kora_v2/memory/`, `_KoraMemory/`) — markdown notes with YAML frontmatter are the source of truth. SQLite (`projection.db`) is a derived index for fast recall via FTS5 + local embeddings.
+- **Filesystem-canonical memory** (`kora_v2/memory/`) — markdown notes with YAML frontmatter live under the configured memory root, defaulting to `~/.kora/memory`. SQLite (`projection.db`) is a derived index for fast recall via FTS5 + local embeddings.
 - **Life OS services** (`kora_v2/life/`, `kora_v2/support/`, `kora_v2/safety/`) — day plans, ledger, load meter, repair, proactivity policy, stabilization, context packs, future bridges, support profiles, trusted support exports, and crisis safety.
 - **Desktop GUI** (`apps/desktop/`, `kora_v2/desktop/`) - Electron/React client with typed REST view-models for Life OS screens and global WebSocket chat.
 - **Daemon + CLI** (`kora_v2/daemon/`, `kora_v2/cli/`) - FastAPI daemon bound to `127.0.0.1`, Rich terminal client over WebSocket.
@@ -67,8 +67,13 @@ Current Life OS pillars:
 
 ## Quickstart
 
-Requires Python 3.12+. On macOS, ensure your system sqlite3 is 3.38 or newer
-(`sqlite3 --version`); macOS Ventura+ ships 3.39+ which is sufficient.
+Requires Python 3.12+ and your own API key for the configured LLM provider.
+Kora defaults to MiniMax, so local chat requires `MINIMAX_API_KEY` (or
+`KORA_LLM__API_KEY`) in your environment or `.env`. Without a valid model API
+key, the daemon and UI can start, but Kora cannot generate chat responses.
+
+On macOS, ensure your system sqlite3 is 3.38 or newer (`sqlite3 --version`);
+macOS Ventura+ ships 3.39+ which is sufficient.
 
 ```bash
 git clone <this-repo> kora && cd kora
@@ -77,7 +82,7 @@ python3 -m venv .venv
 .venv/bin/python -c "import kora_v2; print('ok')"
 
 cp .env.example .env
-# Edit .env and set MINIMAX_API_KEY
+# Edit .env and set MINIMAX_API_KEY to your own MiniMax key
 ```
 
 Or use the automated bootstrap script (also prints non-Python prerequisites):
@@ -166,7 +171,7 @@ kora_v2/
 
 tests/             # unit / integration / acceptance / fixtures
 apps/desktop/      # Electron + React desktop GUI
-_KoraMemory/       # canonical memory (markdown + YAML) — gitignored, created at runtime
+~/.kora/memory/    # default canonical memory root outside the repo
 data/              # lockfile, token, logs, databases — gitignored, created at runtime
 ```
 

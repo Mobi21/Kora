@@ -11,6 +11,7 @@ and read_state(). The spawned daemon owns lockfile.acquire().
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -813,16 +814,50 @@ def _command_gui(settings: Any) -> None:
         sys.exit(1)
 
     cli_path = shutil.which("kora") or sys.argv[0]
+    vite_port = _find_free_local_port(preferred=5173)
+    dev_url = f"http://127.0.0.1:{vite_port}"
     env = os.environ.copy()
     env["KORA_DATA_DIR"] = str(settings.data_dir)
     env["KORA_CLI_PATH"] = str(Path(cli_path).resolve())
+    env["VITE_DEV_SERVER_URL"] = dev_url
     env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{env.get('PATH', '')}"
 
     try:
-        result = subprocess.run([npm, "run", "dev:all"], cwd=desktop_dir, env=env)
+        result = subprocess.run(
+            [
+                "npx",
+                "concurrently",
+                "-n",
+                "vite,electron",
+                "-c",
+                "blue,magenta",
+                f"npm run dev -- --host 127.0.0.1 --port {vite_port}",
+                f"npx wait-on tcp:{vite_port} && ELECTRON_RUN_AS_NODE= electron .",
+            ],
+            cwd=desktop_dir,
+            env=env,
+        )
     except KeyboardInterrupt:
         return
     sys.exit(result.returncode)
+
+
+def _find_free_local_port(*, preferred: int) -> int:
+    """Return preferred if free, otherwise ask the OS for a localhost port."""
+    if _can_bind_local_port(preferred):
+        return preferred
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _can_bind_local_port(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+        return True
 
 
 def _command_doctor(lockfile_path: Path, token_path: Path) -> None:

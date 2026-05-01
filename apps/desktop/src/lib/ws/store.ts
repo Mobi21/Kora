@@ -59,7 +59,7 @@ function uuid(): string {
 export const useChatStore = create<ChatState>((set, get) => ({
   client: null,
   connectionState: 'idle',
-  panelOpen: true,
+  panelOpen: false,
   panelWidth: 380,
   messages: [],
   artifacts: {},

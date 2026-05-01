@@ -60,7 +60,7 @@ Kora is a long-running local daemon (FastAPI + LangGraph + SQLite) with a workin
 
 This atlas started as a source-derived cluster map. It has since drifted in places as the worktree moved through Phase 8 memory, vault, proactive, reminder, trigger-evaluator, and capability work. Use [`current-architecture.md`](current-architecture.md) for the current checked facts, and treat older cluster pages as deep dives that may still contain stale local claims.
 
-The latest refresh pass was performed on 2026-04-28 against the dirty `main` worktree at `d056894`, using live code, `/tmp/claude/kora_acceptance` artifacts, Life OS manual probes, and parallel subagent audits. The current product center is now Life OS. The latest local `/tmp` general acceptance report is a short Day 1 run, not a full green proof; the latest remembered clean full pre-pivot run from 2026-04-26 reported `67/69` active items satisfied with deferred item `1` and still-red items `48` and `55`.
+The latest code refresh pass was performed on 2026-04-28 against the dirty `main` worktree at `d056894`, using live code, `/tmp/claude/kora_acceptance` artifacts, Life OS manual probes, and parallel subagent audits. The GUI/client surface was refreshed on 2026-04-29. The current product center is Life OS, and the latest exported public demo acceptance artifact was generated on 2026-04-30 with `70/70` active items satisfied, `0` partial, and `12/12` Life OS scenarios satisfied for the Maya Rivera lived-week run.
 
 ## Ground rules for reading
 

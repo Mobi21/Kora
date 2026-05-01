@@ -1356,7 +1356,7 @@ function getDemoSettings(snapshot: Snapshot): DesktopSettings {
     motion: 'reduced',
     support_mode_visuals: true,
     command_bar_behavior: 'enabled',
-    chat_panel_default_open: true,
+    chat_panel_default_open: false,
     chat_panel_width: 380,
     calendar_default_view: 'week',
     calendar_layers: {

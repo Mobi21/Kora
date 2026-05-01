@@ -5,16 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kora-v2"
 version = "2.0.0a1"
-description = "An autonomous AI companion with genuine personality, emotional states, and comprehensive memory"
+description = "A local-first Life OS agent for ADHD and neurodivergent day planning, reality repair, and durable memory"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.12"
 authors = [
     {name = "Kora Team"}
 ]
-keywords = ["ai", "companion", "llm", "local-first", "memory"]
+keywords = ["ai", "life-os", "adhd", "neurodivergent", "local-first", "memory"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",

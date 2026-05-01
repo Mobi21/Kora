@@ -2,8 +2,9 @@
 
 This page is now a short orientation layer. The full current architecture file is [`current-architecture.md`](current-architecture.md).
 
-Last verified: 2026-04-28 against the dirty `main` worktree at `d056894`.
+Code snapshot last verified: 2026-04-28 against the dirty `main` worktree at `d056894`.
 GUI/client refresh: 2026-04-29.
+Acceptance/demo evidence refresh: 2026-04-30.
 
 ## Mental Model
 
@@ -53,9 +54,9 @@ Older descriptions that use `plan`, `act`, `review`, or `emit` as graph node nam
 
 ## Acceptance Caveat
 
-The latest local `/tmp/claude/kora_acceptance/acceptance_output/acceptance_report.md` is a short Day 1 run generated on 2026-04-28 with `4` user turns and `44/69` active items satisfied plus `6` partial. It proves current wiring but is not a full green acceptance proof.
+The latest exported public demo acceptance artifact is `apps/desktop/public/demo/acceptance_report.md`, generated on 2026-04-30 with `70/70` active items satisfied, `0` partial, and `12/12` Life OS scenarios satisfied for the Maya Rivera lived-week run.
 
-The latest remembered clean full run from 2026-04-26 reported `67/69` active items satisfied, deferred item `1`, and still-red items `48` and `55`. Do not claim current full acceptance is green without running a fresh full harness.
+Older `/tmp/claude/kora_acceptance/acceptance_output/acceptance_report.md` and remembered pre-demo runs are historical evidence. Do not cite them as the latest public Life OS acceptance state.
 
 ## Read Next
 

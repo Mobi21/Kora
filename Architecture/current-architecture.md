@@ -1,9 +1,10 @@
 # Kora Current Architecture
 
-Last verified: 2026-04-28 against the dirty `main` worktree at `d056894`.
+Code snapshot last verified: 2026-04-28 against the dirty `main` worktree at `d056894`.
 GUI/client refresh: 2026-04-29 against the working desktop/browser dev surface.
+Acceptance/demo evidence refresh: 2026-04-30 from the exported Maya Rivera lived-week artifacts in `apps/desktop/public/demo/`.
 
-This is the public, source-backed architecture snapshot for Kora V2. It was checked against live `kora_v2/` code, recent acceptance artifacts under `/tmp/claude/kora_acceptance`, the Life OS manual probes run during the pivot implementation, and parallel subagent audits. The older deep-dive pages in this folder remain useful, but this file is the current entry point when a page disagrees with live code.
+This is the public, source-backed architecture snapshot for Kora V2. It was checked against live `kora_v2/` code, acceptance artifacts, the Life OS manual probes run during the pivot implementation, and parallel subagent audits. The older deep-dive pages in this folder remain useful, but this file is the current entry point when a page disagrees with live code.
 
 ## Verification Boundary
 
@@ -27,19 +28,19 @@ Coding, research, writing, browser, workspace, and vault behavior remain useful 
 
 ## Acceptance Evidence
 
-Three acceptance surfaces matter:
+These acceptance surfaces matter:
 
 - Life OS acceptance proof collector: `tests/acceptance/life_os.py`, rendered into `tests/acceptance/_report.py`. It is DB/event backed: tool calls alone do not make a scenario green.
+- Exported lived-week Life OS demo artifact: `apps/desktop/public/demo/acceptance_report.md`, generated `2026-04-30T20:26:43Z`, reports `70/70` active acceptance items satisfied, `0` partial, and `12/12` Life OS scenarios satisfied for the Maya Rivera first-run/week scenario.
 - Manual Life OS probe from the 2026-04-28 implementation pass proved fresh DB init, service resolution, tool registration, support profile bootstrap, day plan creation, reality correction, load assessment, repair actions (`shrink_task`, `add_transition_buffer`), stabilization, nudge suppression, context-pack artifact, future-bridge artifact, crisis preemption, and domain-event restart persistence.
 - Focused tests from the same pass reported `63 passed` across Life OS schema, service, tool, support/safety, and acceptance proof tests.
 - Desktop GUI smoke from 2026-04-29 proved the Vite/browser renderer can discover the local daemon, load the main screens without stuck loading or fetch/CORS failures, and send/receive chat through the actual global chat textarea and daemon WebSocket. The desktop API contract is covered by `tests/unit/test_desktop_api.py`.
 
-Historical/general acceptance surfaces still matter, but they should be read as pre-pivot capability evidence:
+Historical/general acceptance surfaces are now superseded by the April 30 lived-week export for public Life OS proof, but they can still help explain pre-pivot capability-pack history:
 
-- Latest local artifact: `/tmp/claude/kora_acceptance/acceptance_output/acceptance_report.md`, generated `2026-04-28T17:35:27Z`, is a short Day 1 run with `4` user turns, `44/69` active items satisfied, and `6` partial. It proves the current tool/pipeline shape but is not a full 3-day pass.
-- Latest remembered full clean run from 2026-04-26 reported `67/69` active items satisfied, deferred item `1`, and still-red items `48` and `55`. Treat that as prior full-run evidence, not proof that the current dirty worktree is fully green.
+- Older `/tmp` and remembered pre-demo acceptance reports are historical only. Do not cite them as the latest public acceptance state.
 
-The public architecture should therefore say what is implemented and wired, but it should not claim current full Life OS week acceptance is green until the harness is remade around the new Life OS product focus and run end-to-end.
+The public architecture can cite the April 30 lived-week Life OS export as the current demo acceptance proof. It should still avoid claiming that optional workspace/browser/vault/doctor capability packs are fully configured or production-ready.
 
 ## System Shape
 
@@ -216,7 +217,7 @@ Browser, workspace, and vault each include `__init__.py` plus implementation mod
 
 Capabilities are Python action packs with policy and structured failure surfaces. Skills are YAML guidance/tool-gating definitions. A skill can expose capability-style names, but capability execution happens through `graph/capability_bridge.py`.
 
-Current acceptance health shows the packs are visible, but workspace/browser/vault are unconfigured in the latest local run and doctor is unimplemented. Public docs should say visible/configurable, not production-ready.
+Current acceptance health shows the packs are visible, but workspace/browser/vault may require local configuration and doctor remains unimplemented. Public docs should say visible/configurable, not production-ready.
 
 `kora_v2/routing/` has no Python files. Routing lives in the supervisor graph, autonomous graph/pipeline factory, worker resolution, tools, and capability bridge.
 
@@ -272,7 +273,7 @@ The reminder schema has legacy columns plus Phase 8e additions: `due_at`, `repea
 
 The Life OS operational schema now includes `day_plans`, `day_plan_entries`, `life_events`, `domain_events`, `load_assessments`, `plan_repair_actions`, `nudge_decisions`, `nudge_feedback`, `support_mode_state`, `context_packs`, `future_self_bridges`, `support_profiles`, `support_profile_signals`, and `safety_boundary_records`.
 
-Latest local general acceptance proves life tool calls and several proactive pipelines, but it does not prove routine-created reminders: the short report has reminders count `0` and item `66` red. The new Life OS acceptance collector proves implementation surfaces independently, but the full week-long Life OS harness still needs to replace the old product-centered scenario.
+The latest exported Life OS acceptance report is the April 30 Maya Rivera lived-week run, which reports `70/70` active items satisfied, `0` partial, and `12/12` Life OS scenarios satisfied. Older `/tmp` general acceptance reports are historical pre-demo evidence, not the current public proof surface.
 
 ## Data Stores
 
@@ -288,9 +289,9 @@ Latest local general acceptance proves life tool calls and several proactive pip
 ## Public Documentation Rules
 
 - Prefer this file and live code over older Phase 7.5 language.
-- Do not claim all acceptance is green from the current `/tmp` report.
+- Do not cite stale `/tmp` acceptance reports as the latest public acceptance state; use the exported April 30 demo artifacts when discussing current Life OS proof.
 - Do not treat coding/research/writing checks as the Life OS product gate.
-- Do not claim the week-long Life OS harness is complete; the DB-backed collector exists, but the main scenario still needs to be remade around a real user's messy week.
+- Do not overextend the Life OS acceptance pass into production-readiness claims for optional capability packs.
 - Do not call Phase 8 memory/vault/proactive/reminder handlers stubs when real handler functions are wired.
 - Do not claim `_KoraMemory/` is the only runtime memory root.
 - Do not claim 23 or 36 tools, 10 supervisor tools, Python 3.11 support, or the `MiniMax-M2.7` default model.

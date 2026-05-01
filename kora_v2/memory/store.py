@@ -1,10 +1,10 @@
-"""Filesystem Memory Store — canonical markdown notes in _KoraMemory/.
+"""Filesystem Memory Store - canonical markdown notes under a configured root.
 
 The filesystem is the source of truth. Projection DB is derived from these
 notes. Each note is a markdown file with YAML frontmatter containing metadata.
 
 Directory structure:
-    _KoraMemory/
+    <memory_root>/
     ├── Long-Term/
     │   ├── {note_id}.md          # episodic, reflective, procedural memories
     │   └── ...
@@ -155,7 +155,7 @@ USER_MODEL_DOMAINS = frozenset({
 
 
 class FilesystemMemoryStore:
-    """Read/write canonical markdown notes under ``_KoraMemory/``.
+    """Read/write canonical markdown notes under the configured memory root.
 
     Each note is a ``.md`` file with YAML frontmatter for metadata.
     The store creates the directory structure on init if it doesn't
@@ -168,7 +168,7 @@ class FilesystemMemoryStore:
     """
 
     def __init__(self, base_path: Path) -> None:
-        """Initialise the store rooted at *base_path* (``_KoraMemory/``).
+        """Initialise the store rooted at *base_path*.
 
         Creates ``Long-Term/`` and ``User Model/`` directories if absent.
         """

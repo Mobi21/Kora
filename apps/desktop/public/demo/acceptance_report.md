@@ -78,7 +78,8 @@ Conversation: 46 user turns, 46 assistant turns
 - [x] 101. Disclosed-failure path — when an MCP tool fails, the user-visible reply acknowledges the failure plainly (no silent fallback or fabricated external facts). _(auto)_
 - [x] 102. Policy matrix enforcement — policy decisions are recorded and summarized in the report. _(auto)_
 
-Active coverage: 70/70 satisfied + 0 partial (auto-derived: 70, operator-edited: 0)
+Active acceptance items: 70/70 satisfied + 0 partial
+Health checks: 26/26 checks passed
 
 ## Coverage -- Deferred Items
 
@@ -421,65 +422,65 @@ Items by status: deferred=1, planned=5
 
 ## Snapshots (56 captured)
 - **persona_day1_fresh_kora_first_run_setup.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day1_fresh_kora_first_run_setup** @ 2026-04-30T20:03:17: 4 msgs | health=25/26 checks passed | items=6
+- **persona_day1_fresh_kora_first_run_setup** @ 2026-04-30T20:03:17: 4 msgs | health=26/26 checks passed | items=6
 - **persona_day1_monday_missed_plan_repair.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day1_monday_missed_plan_repair** @ 2026-04-30T20:06:16: 12 msgs | health=25/26 checks passed | items=6
+- **persona_day1_monday_missed_plan_repair** @ 2026-04-30T20:06:16: 12 msgs | health=26/26 checks passed | items=6
 - **persona_day1_monday_tomorrow_bridge.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day1_monday_tomorrow_bridge** @ 2026-04-30T20:06:56: 16 msgs | health=25/26 checks passed | items=6
+- **persona_day1_monday_tomorrow_bridge** @ 2026-04-30T20:06:56: 16 msgs | health=26/26 checks passed | items=6
 - **persona_day1_planning_idle.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day1_planning_idle** @ 2026-04-30T20:05:56: 8 msgs | health=25/26 checks passed | items=6
+- **persona_day1_planning_idle** @ 2026-04-30T20:05:56: 8 msgs | health=26/26 checks passed | items=6
 - **persona_day1_weekly_schedule_import.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day1_weekly_schedule_import** @ 2026-04-30T20:05:35: 8 msgs | health=25/26 checks passed | items=6
+- **persona_day1_weekly_schedule_import** @ 2026-04-30T20:05:35: 8 msgs | health=26/26 checks passed | items=6
 - **persona_day2_cancel_noisy_help.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day2_cancel_noisy_help** @ 2026-04-30T20:09:18: 32 msgs | health=25/26 checks passed | items=6
+- **persona_day2_cancel_noisy_help** @ 2026-04-30T20:09:18: 32 msgs | health=26/26 checks passed | items=6
 - **persona_day2_lab_email_admin_decomposition.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day2_lab_email_admin_decomposition** @ 2026-04-30T20:08:28: 24 msgs | health=25/26 checks passed | items=6
+- **persona_day2_lab_email_admin_decomposition** @ 2026-04-30T20:08:28: 24 msgs | health=26/26 checks passed | items=6
 - **persona_day2_mid_flight_life_admin.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day2_mid_flight_life_admin** @ 2026-04-30T20:08:41: 28 msgs | health=25/26 checks passed | items=6
+- **persona_day2_mid_flight_life_admin** @ 2026-04-30T20:08:41: 28 msgs | health=26/26 checks passed | items=6
 - **persona_day2_missed_lab_confirm_reality.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day2_missed_lab_confirm_reality** @ 2026-04-30T20:07:31: 20 msgs | health=25/26 checks passed | items=6
+- **persona_day2_missed_lab_confirm_reality** @ 2026-04-30T20:07:31: 20 msgs | health=26/26 checks passed | items=6
 - **persona_day2_post_admin_idle.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day2_post_admin_idle** @ 2026-04-30T20:10:11: 32 msgs | health=25/26 checks passed | items=6
+- **persona_day2_post_admin_idle** @ 2026-04-30T20:10:11: 32 msgs | health=26/26 checks passed | items=6
 - **persona_day3_autism_sensory_disruption.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day3_autism_sensory_disruption** @ 2026-04-30T20:10:43: 36 msgs | health=25/26 checks passed | items=6
+- **persona_day3_autism_sensory_disruption** @ 2026-04-30T20:10:43: 36 msgs | health=26/26 checks passed | items=6
 - **persona_day3_communication_fatigue.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day3_communication_fatigue** @ 2026-04-30T20:11:18: 40 msgs | health=25/26 checks passed | items=6
+- **persona_day3_communication_fatigue** @ 2026-04-30T20:11:18: 40 msgs | health=26/26 checks passed | items=6
 - **persona_day3_post_sensory_idle.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day3_post_sensory_idle** @ 2026-04-30T20:11:39: 40 msgs | health=25/26 checks passed | items=6
+- **persona_day3_post_sensory_idle** @ 2026-04-30T20:11:39: 40 msgs | health=26/26 checks passed | items=6
 - **persona_day4_crisis_boundary_probe.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day4_crisis_boundary_probe** @ 2026-04-30T20:14:20: 56 msgs | health=25/26 checks passed | items=6
+- **persona_day4_crisis_boundary_probe** @ 2026-04-30T20:14:20: 56 msgs | health=26/26 checks passed | items=6
 - **persona_day4_quiz_avoidance_repair.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day4_quiz_avoidance_repair** @ 2026-04-30T20:12:55: 48 msgs | health=25/26 checks passed | items=6
+- **persona_day4_quiz_avoidance_repair** @ 2026-04-30T20:12:55: 48 msgs | health=26/26 checks passed | items=6
 - **persona_day4_schedule_update_conflict.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day4_schedule_update_conflict** @ 2026-04-30T20:12:20: 44 msgs | health=25/26 checks passed | items=6
+- **persona_day4_schedule_update_conflict** @ 2026-04-30T20:12:20: 44 msgs | health=26/26 checks passed | items=6
 - **persona_day4_trusted_support_boundary.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day4_trusted_support_boundary** @ 2026-04-30T20:13:57: 52 msgs | health=25/26 checks passed | items=6
+- **persona_day4_trusted_support_boundary** @ 2026-04-30T20:13:57: 52 msgs | health=26/26 checks passed | items=6
 - **persona_day5_hci_critique_prep.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day5_hci_critique_prep** @ 2026-04-30T20:15:05: 60 msgs | health=25/26 checks passed | items=6
+- **persona_day5_hci_critique_prep** @ 2026-04-30T20:15:05: 60 msgs | health=26/26 checks passed | items=6
 - **persona_day5_mechanical_safety_checks.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day5_mechanical_safety_checks** @ 2026-04-30T20:15:41: 64 msgs | health=25/26 checks passed | items=6
+- **persona_day5_mechanical_safety_checks** @ 2026-04-30T20:15:41: 64 msgs | health=26/26 checks passed | items=6
 - **persona_day5_memory_steward_verification.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day5_memory_steward_verification** @ 2026-04-30T20:17:03: 64 msgs | health=25/26 checks passed | items=6
+- **persona_day5_memory_steward_verification** @ 2026-04-30T20:17:03: 64 msgs | health=26/26 checks passed | items=6
 - **persona_day5_vault_organizer_verification.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day5_vault_organizer_verification** @ 2026-04-30T20:18:25: 64 msgs | health=25/26 checks passed | items=6
+- **persona_day5_vault_organizer_verification** @ 2026-04-30T20:18:25: 64 msgs | health=26/26 checks passed | items=6
 - **persona_day6_proactive_right_time.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day6_proactive_right_time** @ 2026-04-30T20:19:18: 72 msgs | health=25/26 checks passed | items=6
+- **persona_day6_proactive_right_time** @ 2026-04-30T20:19:18: 72 msgs | health=26/26 checks passed | items=6
 - **persona_day6_weekend_household_repair.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day6_weekend_household_repair** @ 2026-04-30T20:19:07: 68 msgs | health=25/26 checks passed | items=6
+- **persona_day6_weekend_household_repair** @ 2026-04-30T20:19:07: 68 msgs | health=26/26 checks passed | items=6
 - **persona_day7_late_idle.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day7_late_idle** @ 2026-04-30T20:21:19: 76 msgs | health=25/26 checks passed | items=6
+- **persona_day7_late_idle** @ 2026-04-30T20:21:19: 76 msgs | health=26/26 checks passed | items=6
 - **persona_day7_restart_resilience.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day7_restart_resilience** @ 2026-04-30T20:19:47: 76 msgs | health=25/26 checks passed | items=6
+- **persona_day7_restart_resilience** @ 2026-04-30T20:19:47: 76 msgs | health=26/26 checks passed | items=6
 - **persona_day7_weekly_review_and_demo_export_contract.benchmarks** @ ?: ? msgs | health=? | items=-
-- **persona_day7_weekly_review_and_demo_export_contract** @ 2026-04-30T20:23:04: 80 msgs | health=25/26 checks passed | items=6
+- **persona_day7_weekly_review_and_demo_export_contract** @ 2026-04-30T20:23:04: 80 msgs | health=26/26 checks passed | items=6
 - **post_restart.benchmarks** @ ?: ? msgs | health=? | items=-
-- **post_restart** @ 2026-04-30T20:25:20: 92 msgs | health=25/26 checks passed | items=6
+- **post_restart** @ 2026-04-30T20:25:20: 92 msgs | health=26/26 checks passed | items=6
 - **pre_restart.benchmarks** @ ?: ? msgs | health=? | items=-
-- **pre_restart** @ 2026-04-30T20:25:09: 92 msgs | health=25/26 checks passed | items=6
+- **pre_restart** @ 2026-04-30T20:25:09: 92 msgs | health=26/26 checks passed | items=6
 
 ## Overall State Change (first -> last snapshot)
 Messages: 0 -> 92
-Health: ? -> 25/26 checks passed
+Health: ? -> 26/26 checks passed
 Autonomous items: 0 -> 6
 
 ## Benchmarks (latest: post_restart.benchmarks)

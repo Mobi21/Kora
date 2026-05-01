@@ -1,4 +1,4 @@
-"""Kora V2 — AI companion with genuine personality, emotional states, and comprehensive memory."""
+"""Kora V2 - local-first Life OS runtime."""
 
 import sys as _sys
 

@@ -14,7 +14,7 @@ const IS_DEV = !app.isPackaged;
 
 function isAllowedSender(senderUrl: string): boolean {
   if (IS_DEV) {
-    return senderUrl.startsWith('http://127.0.0.1:5173') || senderUrl.startsWith('http://localhost:5173');
+    return senderUrl.startsWith(new URL(DEV_URL).origin);
   }
   return senderUrl.startsWith('file://');
 }
